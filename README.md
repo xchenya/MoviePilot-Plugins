@@ -2,7 +2,7 @@
 
 xchenya 的 [MoviePilot](https://github.com/jxxghp/MoviePilot) 第三方插件库。
 
-本仓库基于官方 [jxxghp/MoviePilot-Plugins](https://github.com/jxxghp/MoviePilot-Plugins) 初始化，并参考 [JinxJie/MoviePilot-Plugins](https://github.com/JinxJie/MoviePilot-Plugins) 的个人插件仓库组织方式，仅用于维护本人开发、重构或长期维护的插件。
+本仓库基于官方 [jxxghp/MoviePilot-Plugins](https://github.com/jxxghp/MoviePilot-Plugins) 初始化，仅用于维护本人开发、重构或长期维护的插件。
 
 ## 插件列表
 
