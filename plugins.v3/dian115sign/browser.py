@@ -123,6 +123,24 @@ def seed_cookies(token: str = "", cookie: str = "") -> list[dict[str, Any]]:
             for key, value in result.items()]
 
 
+def initial_cookies(options: Options) -> tuple[list[dict[str, Any]], bool]:
+    """Build optional seed cookies without blocking password login.
+
+    Legacy/stale Token or Cookie values may survive an upgrade. When a complete
+    email/password pair is configured, an unparsable seed is ignored and the
+    browser proceeds to the normal login form. Without password credentials,
+    the same malformed seed remains a configuration error.
+    """
+    if not options.token and not options.cookie:
+        return [], False
+    try:
+        return seed_cookies(options.token, options.cookie), False
+    except PortalError as error:
+        if error.code == "cookie_invalid" and options.email and options.password:
+            return [], True
+        raise
+
+
 def same_origin(url: str) -> bool:
     """Never fill credentials or accept account responses on a redirected site."""
     target = urlsplit(url)
@@ -498,7 +516,12 @@ class BrowserRunner:
                 kwargs["storage_state"] = state
             context = self.launch(**kwargs)
             if not state:
-                cookies = seed_cookies(self.options.token, self.options.cookie)
+                cookies, ignored_seed = initial_cookies(self.options)
+                if ignored_seed:
+                    self.trace.rows.append({
+                        "path": "browser.credentials", "status": 0,
+                        "code": "cookie_seed_ignored", "content_type": "other",
+                    })
                 if cookies:
                     context.add_cookies(cookies)
             self.guard = SubmissionGuard(self.options.mode, diagnose, self.cancel, self.mark_pending)

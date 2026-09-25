@@ -3,12 +3,13 @@
     "name": "癫影自动签到（浏览器重写版）",
     "description": "V3 浏览器重写测试版：普通签/运气签、登录会话、登录诊断、错误分类及结果通知。",
     "labels": "签到,测试版",
-    "version": "2.0.0",
+    "version": "2.0.1",
     "icon": "Moviepilot_A.png",
     "author": "xchenya",
     "level": 2,
     "system_version": ">=3.0.0",
     "history": {
+      "v2.0.1": "修复邮箱+密码独立登录：无效旧 Token/Cookie 不再提前中断；配置页恢复卡片双栏布局，详情页改为紧凑仪表板。",
       "v2.0.0": "V3 浏览器原生重写测试版；默认诊断；不手工拼浏览器签名；限制提交次数；未完成真实站点联调。"
     },
     "release": false

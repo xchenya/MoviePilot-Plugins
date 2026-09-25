@@ -61,7 +61,7 @@ class Dian115Sign(_PluginBase):
     plugin_name = "癫影自动签到（浏览器重写版）"
     plugin_desc = "V3 浏览器重写测试版：普通签/运气签、登录会话、登录诊断、错误分类及结果通知。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "2.0.0"
+    plugin_version = "2.0.1"
     plugin_author = "xchenya"
     author_url = "https://github.com/xchenya/MoviePilot-Plugins"
     plugin_config_prefix = "dian115sign_"
@@ -368,69 +368,145 @@ class Dian115Sign(_PluginBase):
             self._run_lock.release()
 
     def get_form(self) -> tuple[list[dict], dict]:
-        """Use lightweight JSON controls; first use defaults to diagnosis only."""
-        def field(model: str, label: str, kind: str = "VTextField", **props: Any) -> dict:
-            """Build one full-width form field."""
-            return {"component": kind, "props": {"model": model, "label": label, **props}}
-
-        controls = [
-            {"component": "VAlert", "props": {"type": "info", "variant": "tonal",
-             "text": "首次保留“仅诊断”，勾选“立即执行一次”并保存。诊断正常后关闭“仅诊断”。"
-                     "403 不会自动重试；网页登录和人机验证仍受站点规则约束。"}},
-            field("enabled", "启用定时任务", "VSwitch"),
-            field("onlyonce", "保存后立即执行一次", "VSwitch"),
-            field("diagnose_only", "仅诊断：允许登录和读取账号，不提交签到", "VSwitch"),
-            field("lucky_mode", "运气签（可能扣分；关闭为普通签）", "VSwitch"),
-            field("notify", "发送执行结果通知", "VSwitch"),
-            field("email", "登录邮箱"),
-            field("password", "登录密码（可选；只填在自己的 MoviePilot 中）", type="password"),
-            field("token", "登录 Token 或旧配置中的 Cookie", type="password"),
-            field("cookie", "完整 Cookie（推荐；不要发到聊天或公开仓库）", type="password"),
-            field("cron", "Cron（默认每天 09:30）"),
-            field("timezone", "站点时区（默认 Asia/Shanghai）"),
-            field("timeout", "单次页面/响应超时，10–60 秒", type="number"),
-            field("use_system_proxy", "使用 MoviePilot 系统代理", "VSwitch"),
-            field("proxy", "自定义代理（关闭系统代理后生效）", type="password"),
-            {"component": "VAlert", "props": {"type": "warning", "variant": "tonal",
-             "text": "下面选择器默认留空。仅在提示页面变化时调整；不会自动改用另一种签到模式。"
-                     "清除待确认标记前，必须人工核对网站，防止重复提交。"}},
-            field("normal_selector", "普通签按钮 CSS 选择器（可选）"),
-            field("lucky_selector", "运气签按钮 CSS 选择器（可选）"),
-            field("submit_selector", "最终提交按钮 CSS 选择器（可选）"),
-            field("login_selector", "登录按钮 CSS 选择器（可选）"),
-            field("reset_session", "保存后清除浏览器会话，下次使用配置中的 Cookie", "VSwitch"),
-            field("clear_pending", "已人工核对：清除签到结果待确认标记", "VSwitch"),
-        ]
-        return [{"component": "VForm", "content": controls}], self._defaults()
+        """Return the compact card-based configuration UI."""
+        from .config_form import build_form
+        return build_form()
 
     def get_page(self) -> list[dict]:
-        """Cache-only page: never log in, launch a browser or call the site here."""
+        """Render cached account/run data in a compact dashboard; never access the site."""
         result = self.get_data("last_result") or {}
-        message = self._config_error or result.get("message") or "尚未执行；请先保存配置并运行一次诊断。"
-        rows = [
-            ("检查时间", result.get("checked_at", "—")),
-            ("结果代码", result.get("code", "not_started")),
-            ("模式", result.get("mode", "normal")),
-            ("积分余额", result.get("balance")),
-            ("连续签到", result.get("streak")),
-            ("本次积分变化", result.get("award")),
-            ("提交过签到", result.get("submitted", False)),
-            ("结果待确认", result.get("uncertain", False)),
-        ]
-        content = [{"component": "VAlert", "props": {
-            "type": "success" if result.get("ok") else "info", "variant": "tonal", "text": message}}]
-        for label, value in rows:
-            content.append({"component": "div", "text": f"{label}：{value if value is not None else '未取得'}"})
-        diagnostics = result.get("diagnostics") or []
-        if diagnostics:
-            content.append({"component": "pre", "props": {"style": "white-space:pre-wrap;word-break:break-all"},
-                            "text": json.dumps(diagnostics, ensure_ascii=False, indent=2)})
         history = self.get_data("run_history") or []
-        if isinstance(history, list) and history:
-            content.append({"component": "h3", "text": "最近 10 次执行（本地缓存）"})
-            for item in reversed(history[-10:]):
-                if isinstance(item, dict):
-                    content.append({"component": "div", "text":
-                        f"{item.get('checked_at', '')} | {item.get('mode', '')} | "
-                        f"{item.get('code', '')} | {item.get('message', '')}"})
-        return content
+        history = history if isinstance(history, list) else []
+        message = self._config_error or result.get("message") or "尚未执行；请先运行一次诊断。"
+
+        def metric(icon: str, label: str, value: str, color: str) -> dict:
+            return {
+                "component": "VCard",
+                "props": {"variant": "tonal", "class": "h-100"},
+                "content": [{
+                    "component": "VCardText",
+                    "props": {"class": "text-center pa-3"},
+                    "content": [
+                        {"component": "VIcon", "props": {"color": color, "size": "28", "class": "mb-2"}, "text": icon},
+                        {"component": "div", "props": {"class": f"text-h6 font-weight-bold text-{color}"}, "text": value},
+                        {"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-1"}, "text": label},
+                    ],
+                }],
+            }
+
+        code = str(result.get("code") or "not_started")
+        ok = bool(result.get("ok"))
+        balance = result.get("balance")
+        streak = result.get("streak")
+        award = result.get("award")
+        checked = str(result.get("checked_at") or "—")
+        today_state = (
+            "已签到" if result.get("already") else
+            "签到成功" if code == "signed" else
+            "诊断正常" if code == "diagnostic_ok" else
+            "待确认" if result.get("uncertain") else
+            "未完成"
+        )
+
+        page: list[dict] = [
+            {"component": "VAlert", "props": {
+                "type": "success" if ok else ("warning" if result.get("uncertain") else "info"),
+                "variant": "tonal", "class": "mb-3", "text": message,
+            }},
+            {"component": "VRow", "props": {"dense": True}, "content": [
+                {"component": "VCol", "props": {"cols": 6, "md": 3},
+                 "content": [metric("mdi-wallet-outline", "当前积分",
+                                    str(balance if balance is not None else "—"), "info")]},
+                {"component": "VCol", "props": {"cols": 6, "md": 3},
+                 "content": [metric("mdi-fire", "连续签到",
+                                    f"{streak} 天" if streak is not None else "—", "success")]},
+                {"component": "VCol", "props": {"cols": 6, "md": 3},
+                 "content": [metric("mdi-calendar-check", "今日状态", today_state,
+                                    "success" if ok else "warning")]},
+                {"component": "VCol", "props": {"cols": 6, "md": 3},
+                 "content": [metric("mdi-clock-outline", "最近执行",
+                                    checked.replace("T", " "), "primary")]},
+            ]},
+        ]
+
+        rows = []
+        for item in reversed(history[-10:]):
+            if not isinstance(item, dict):
+                continue
+            item_award = item.get("award")
+            rows.append({
+                "component": "tr",
+                "content": [
+                    {"component": "td", "text": str(item.get("checked_at") or "—").replace("T", " ")},
+                    {"component": "td", "props": {"class": "text-center"},
+                     "text": "运气签" if item.get("mode") == "lucky" else "普通签"},
+                    {"component": "td", "props": {"class": "text-center"},
+                     "text": str(item.get("code") or "—")},
+                    {"component": "td", "props": {"class": "text-center"},
+                     "text": (f"{item_award:+g}" if isinstance(item_award, (int, float)) else "—")},
+                    {"component": "td", "props": {"class": "text-center"},
+                     "text": str(item.get("balance") if item.get("balance") is not None else "—")},
+                ],
+            })
+
+        table_body = rows or [{
+            "component": "tr",
+            "content": [{"component": "td", "props": {"colspan": 5, "class": "text-center text-medium-emphasis"},
+                         "text": "暂无执行记录"}],
+        }]
+        page.append({
+            "component": "VCard",
+            "props": {"class": "mt-3", "variant": "tonal"},
+            "content": [
+                {"component": "VCardTitle", "props": {"class": "d-flex align-center"}, "content": [
+                    {"component": "VIcon", "props": {"color": "primary", "class": "mr-2"}, "text": "mdi-history"},
+                    {"component": "span", "text": "最近执行"},
+                ]},
+                {"component": "VDivider"},
+                {"component": "VCardText", "props": {"class": "pa-2"}, "content": [{
+                    "component": "VTable", "props": {"density": "comfortable"}, "content": [
+                        {"component": "thead", "content": [{"component": "tr", "content": [
+                            {"component": "th", "text": "时间"},
+                            {"component": "th", "props": {"class": "text-center"}, "text": "模式"},
+                            {"component": "th", "props": {"class": "text-center"}, "text": "结果"},
+                            {"component": "th", "props": {"class": "text-center"}, "text": "积分"},
+                            {"component": "th", "props": {"class": "text-center"}, "text": "余额"},
+                        ]}]},
+                        {"component": "tbody", "content": table_body},
+                    ],
+                }]},
+            ],
+        })
+
+        diagnostics = result.get("diagnostics") or []
+        if isinstance(diagnostics, list) and diagnostics:
+            diagnostic_rows = []
+            for row in diagnostics[-8:]:
+                if not isinstance(row, dict):
+                    continue
+                diagnostic_rows.append({
+                    "component": "tr",
+                    "content": [
+                        {"component": "td", "text": str(row.get("path") or "—")},
+                        {"component": "td", "props": {"class": "text-center"}, "text": str(row.get("status") or "—")},
+                        {"component": "td", "text": str(row.get("code") or "—")},
+                    ],
+                })
+            page.append({
+                "component": "VCard",
+                "props": {"class": "mt-3", "variant": "outlined"},
+                "content": [
+                    {"component": "VCardTitle", "props": {"class": "text-subtitle-1"}, "text": "诊断信息"},
+                    {"component": "VCardText", "props": {"class": "pa-2"}, "content": [{
+                        "component": "VTable", "props": {"density": "compact"}, "content": [
+                            {"component": "thead", "content": [{"component": "tr", "content": [
+                                {"component": "th", "text": "接口"},
+                                {"component": "th", "props": {"class": "text-center"}, "text": "HTTP"},
+                                {"component": "th", "text": "代码"},
+                            ]}]},
+                            {"component": "tbody", "content": diagnostic_rows},
+                        ],
+                    }]},
+                ],
+            })
+        return page

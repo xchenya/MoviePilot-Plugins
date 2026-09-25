@@ -7,7 +7,7 @@ import pytest
 from app.plugins.dian115sign import Dian115Sign
 from app.plugins.dian115sign.browser import (
     API, ORIGIN, BrowserRunner, Options, Outcome, PortalError, SubmissionGuard,
-    Trace, number, safe_code, same_origin, seed_cookies,
+    Trace, initial_cookies, number, safe_code, same_origin, seed_cookies,
 )
 
 @pytest.mark.parametrize("raw", ["abc.def.ghi", "Bearer abc.def.ghi", "Authorization: Bearer abc.def.ghi"])
@@ -29,6 +29,19 @@ def test_cookie_attributes_are_not_cookies():
 def test_bad_cookie_rejected():
     with pytest.raises(PortalError):
         seed_cookies(cookie="token=secret\r\nInjected: x")
+
+
+def test_password_login_ignores_stale_invalid_seed():
+    cookies, ignored = initial_cookies(Options(
+        email="user@example.com", password="secret", token="stale-invalid-token"
+    ))
+    assert cookies == [] and ignored is True
+
+
+def test_invalid_seed_without_password_still_fails():
+    with pytest.raises(PortalError) as error:
+        initial_cookies(Options(token="stale-invalid-token"))
+    assert error.value.code == "cookie_invalid"
 
 @pytest.mark.parametrize("url", ["https://www.baidu.com", "https://m.dian115.com.evil.test/", "http://m.dian115.com", "https://user:pass@m.dian115.com", "https://m.dian115.com:8443/"])
 def test_off_origin_rejected(url):
