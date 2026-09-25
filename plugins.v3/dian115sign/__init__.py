@@ -1,4 +1,4 @@
-"""Dian115Sign 2.0.2: MoviePilot V3 browser-native, fail-closed rewrite.
+"""Dian115Sign 2.0.3: MoviePilot V3 browser-native, fail-closed rewrite.
 
 Independent rewrite maintained by xchenya; original feature reference: JinxJie's
 plugins.v2/dian115sign. This is not an official release from that author.
@@ -55,13 +55,21 @@ class RunData(BaseModel):
     diagnostics: list[DiagnosticData] = Field(default_factory=list)
 
 
+class _LocalCompleted(Exception):
+    """Internal control flow for an identity-matched same-day completed sign-in."""
+
+    def __init__(self, outcome: Outcome):
+        super().__init__("completed")
+        self.outcome = outcome
+
+
 class Dian115Sign(_PluginBase):
     """Single-account plugin; use V3 virtual instances for additional accounts."""
 
     plugin_name = "癫影自动签到"
     plugin_desc = "V3 浏览器重写测试版：普通签/运气签、登录会话、登录诊断、错误分类及结果通知。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "2.0.2"
+    plugin_version = "2.0.3"
     plugin_author = "xchenya"
     author_url = "https://github.com/xchenya/MoviePilot-Plugins"
     plugin_config_prefix = "dian115sign_"
@@ -254,6 +262,73 @@ class Dian115Sign(_PluginBase):
         except Exception:
             raise PortalError("proxy_invalid", "代理格式无效；应为 http(s)://主机:端口 或 socks5://主机:端口。") from None
 
+    @staticmethod
+    def _number_text(value: float | int | None, signed: bool = False) -> str:
+        """Format score values without trailing .0."""
+        if value is None:
+            return "未取得"
+        numeric = float(value)
+        text = str(int(numeric)) if numeric.is_integer() else f"{numeric:g}"
+        if signed and numeric > 0:
+            return "+" + text
+        return text
+
+    def _send_result_notification(self, result: Outcome, diagnostic: bool) -> None:
+        """Send a status-oriented notification with unambiguous score labels."""
+        mode = "运气签" if result.mode == "lucky" else "普通签"
+        checked = str(result.checked_at or "").replace("T", " ")
+        if "+" in checked:
+            checked = checked.rsplit("+", 1)[0]
+        elif checked.endswith("Z"):
+            checked = checked[:-1]
+
+        if diagnostic:
+            title = "癫影诊断正常" if result.ok else "癫影诊断失败"
+            status = ("今日已签到" if result.ok and result.already else
+                      "登录与账号状态正常" if result.ok else result.message)
+            lines = [
+                f"🔎 状态：{status}",
+                f"📅 日期：{result.date or '未取得'}",
+                f"💰 当前积分：{self._number_text(result.balance)}",
+                f"🔥 连续签到：{self._number_text(result.streak)}"
+                    + (" 天" if result.streak is not None else ""),
+            ]
+        elif result.ok and result.already:
+            title = "癫影今日已签到"
+            lines = [
+                "ℹ️ 状态：今日已签到，无需重复操作",
+                f"📅 日期：{result.date or '未取得'}",
+                f"💰 当前积分：{self._number_text(result.balance)}",
+                f"🔥 连续签到：{self._number_text(result.streak)}"
+                    + (" 天" if result.streak is not None else ""),
+            ]
+        elif result.ok:
+            title = "癫影签到成功"
+            lines = [
+                "✅ 状态：签到成功",
+                f"📅 日期：{result.date or '未取得'}",
+                f"🎯 模式：{mode}",
+                f"🎁 本次积分：{self._number_text(result.award, signed=True)}",
+                f"💰 当前积分：{self._number_text(result.balance)}",
+                f"🔥 连续签到：{self._number_text(result.streak)}"
+                    + (" 天" if result.streak is not None else ""),
+            ]
+        else:
+            title = "癫影签到失败"
+            lines = [
+                f"❌ 状态：{result.message or '未知错误'}",
+                f"📅 日期：{result.date or '未取得'}",
+                f"🎯 模式：{mode}",
+                f"🧩 代码：{result.code or 'unknown'}",
+            ]
+        if checked:
+            lines.append(f"🕒 时间：{checked}")
+        self.post_message(
+            mtype=NotificationType.Plugin,
+            title=title,
+            text="\n".join(lines),
+        )
+
     def _run(self, manual: bool = False, diagnose: bool | None = None) -> dict:
         """One shared execution entry for services, commands and POST APIs."""
         if not self._run_lock.acquire(blocking=False):
@@ -275,6 +350,25 @@ class Dian115Sign(_PluginBase):
                 raw_proxy, proxy = self._proxy(config)
                 identity = options.identity(raw_proxy)
                 state_file = self._session_file()
+                completed = self.get_data("completed_day") or {}
+                if (not diagnostic and isinstance(completed, dict)
+                        and completed.get("date") == options.today()
+                        and completed.get("identity") == identity):
+                    result = Outcome(
+                        ok=True,
+                        code="already_signed",
+                        message="本地记录确认今日已完成签到，无需重复提交",
+                        date=options.today(),
+                        mode=options.mode,
+                        already=True,
+                        balance=completed.get("balance"),
+                        streak=completed.get("streak"),
+                        checked_at=datetime.now(
+                            ZoneInfo(options.timezone)
+                        ).isoformat(timespec="seconds"),
+                    )
+                    logger.info("癫影：本地记录确认今日已签到，跳过站点签到请求")
+                    raise _LocalCompleted(result)
 
                 def current() -> bool:
                     """Never publish old-generation results after a configuration reload."""
@@ -338,6 +432,13 @@ class Dian115Sign(_PluginBase):
                                 self.del_data("pending_submission")
                             elif result.submitted and not result.uncertain:
                                 self.del_data("pending_submission")
+                            if result.ok and (result.already or result.code == "signed"):
+                                self.save_data("completed_day", {
+                                    "date": result.date,
+                                    "identity": identity,
+                                    "balance": result.balance,
+                                    "streak": result.streak,
+                                })
                             history = self.get_data("run_history") or []
                             history = history if isinstance(history, list) else []
                             self.save_data("run_history", (history + [result.to_dict()])[-100:])
@@ -345,6 +446,8 @@ class Dian115Sign(_PluginBase):
                             result.diagnostics.append({"path": "plugin.storage", "status": 0,
                                                        "code": "storage_failed", "content_type": "other"})
                             logger.warning("癫影：执行结果写入本地缓存失败；不会因此重做签到。")
+            except _LocalCompleted as completed:
+                result = completed.outcome
             except PortalError as error:
                 result = Outcome(code=error.code, message=str(error))
             except Exception as error:
@@ -360,11 +463,7 @@ class Dian115Sign(_PluginBase):
                     f"癫影：[{result.code}] {result.message}")
                 if config.get("notify"):
                     try:
-                        text = (f"{result.message}\n模式：{result.mode}\n"
-                                f"积分：{result.balance if result.balance is not None else '未取得'}\n"
-                                f"连续签到：{result.streak if result.streak is not None else '未取得'}")
-                        self.post_message(mtype=NotificationType.Plugin,
-                                          title="癫影" + ("诊断结果" if diagnostic else "签到结果"), text=text)
+                        self._send_result_notification(result, diagnostic)
                     except Exception:
                         logger.warning("癫影：通知发送失败；不会因此重新签到。")
             return result.to_dict()

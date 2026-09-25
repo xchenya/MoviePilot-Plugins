@@ -158,6 +158,27 @@ def test_instance_specific_ids():
     assert p.get_service()[0]["id"].startswith("Dian115SignSecond.")
     assert p.get_command()[0]["data"]["action"] == "Dian115SignSecond.run"
 
+def test_same_day_completed_identity_skips_browser(monkeypatch):
+    p = Dian115Sign()
+    p.init_plugin({"enabled": True, "use_system_proxy": False})
+    identity = p._options.identity("")
+    p.save_data("completed_day", {
+        "date": p._options.today(),
+        "identity": identity,
+        "balance": 610,
+        "streak": 4,
+    })
+    monkeypatch.setattr(
+        __import__("app.sdk.browser", fromlist=["launch_browser_context"]),
+        "launch_browser_context",
+        lambda **kwargs: pytest.fail("same-day duplicate launched browser"),
+    )
+    result = p._run(manual=True, diagnose=False)
+    assert result["ok"] and result["already"]
+    assert result["code"] == "already_signed"
+    assert result["balance"] == 610 and result["streak"] == 4
+
+
 def test_parallel_run_rejected():
     p = Dian115Sign(); p.init_plugin({"enabled": True})
     with p._run_lock:

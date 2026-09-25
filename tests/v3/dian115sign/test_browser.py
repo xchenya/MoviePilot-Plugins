@@ -96,9 +96,10 @@ class Context:
 def exercise(chromium, *, diagnose=False, lucky=False, style="direct", gate_status=200,
              authenticated=True, already=False, sign_status=200, sign_code="ok",
              lost_response=False, pending=False, redirect=False, auto_sign=False,
-             save_fails=False, seed=False):
+             save_fails=False, seed=False, conflict_marks_signed=False):
     state = {"sign_calls": 0, "login_calls": 0, "closed": 0, "saved": 0,
-             "pending": pending, "auth": authenticated, "gate_calls": 0, "cookies_seen": ""}
+             "pending": pending, "auth": authenticated, "gate_calls": 0,
+             "cookies_seen": "", "signed": already, "points": 100, "streak": 3}
     options = Options(email="example@example.invalid", password="PRIVATE_PASSWORD",
                       token="header.payload.signature" if seed else "",
                       lucky_mode=lucky, timeout=2)
@@ -115,8 +116,9 @@ def exercise(chromium, *, diagnose=False, lucky=False, style="direct", gate_stat
             route.fulfill(status=gate_status, content_type="application/json",
                           body=json.dumps({"code": "ok" if gate_status == 200 else "access_denied", "msg": "PRIVATE_PASSWORD"}))
         elif path == f"{API}/me":
-            data = {"code": "ok", "user": {"points": 100, "consecutive_signin": 3,
-                    "last_signin_date": options.today() if already else "2020-01-01"}}
+            data = {"code": "ok", "user": {"points": state["points"],
+                    "consecutive_signin": state["streak"],
+                    "last_signin_date": options.today() if state["signed"] else "2020-01-01"}}
             if not state["auth"]: data = {"code": "invalid_token"}
             route.fulfill(status=200 if state["auth"] else 401, content_type="application/json", body=json.dumps(data))
         elif path == f"{API}/auth/login":
@@ -126,6 +128,11 @@ def exercise(chromium, *, diagnose=False, lucky=False, style="direct", gate_stat
                           headers={"set-cookie": "__Host-portal_token=renewed; Secure; HttpOnly; Path=/"})
         elif path == f"{API}/signin":
             state["sign_calls"] += 1
+            if sign_code in {"ok", "already_signed"} or conflict_marks_signed:
+                state["signed"] = True
+            if sign_code == "ok" and 200 <= sign_status < 300:
+                state["points"] = 105
+                state["streak"] = 4
             if lost_response:
                 route.abort("failed")
             else:
@@ -173,7 +180,7 @@ def test_real_browser_modes(chromium, style, lucky):
     assert result.ok, result.to_dict()
     assert result.code == "signed" and state["sign_calls"] == 1
     assert result.mode == ("lucky" if lucky else "normal")
-    assert result.balance == 105 and result.streak is None
+    assert result.balance == 105 and result.streak == 4
 
 
 def test_real_browser_403_no_login_and_no_retries(chromium):
@@ -209,6 +216,22 @@ def test_real_browser_409_is_not_always_success(chromium):
 def test_real_browser_explicit_already_signed(chromium):
     result, state = exercise(chromium, sign_status=409, sign_code="already_signed")
     assert result.ok and result.already and state["sign_calls"] == 1
+    assert result.streak == 3
+
+
+def test_real_browser_unknown_conflict_not_misclassified(chromium):
+    result, state = exercise(chromium, sign_status=409, sign_code="conflict_other")
+    assert not result.ok and result.code == "signin_rejected"
+
+
+def test_real_browser_unknown_conflict_rechecked_by_account(chromium):
+    result, state = exercise(
+        chromium, sign_status=409, sign_code="conflict_other",
+        conflict_marks_signed=True,
+    )
+    assert result.ok and result.already
+    assert result.code == "already_signed"
+    assert state["sign_calls"] == 1
 
 
 def test_real_browser_uncertain_post_never_retries(chromium):

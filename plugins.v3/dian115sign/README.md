@@ -3,12 +3,12 @@
 | 项目 | 内容 |
 | --- | --- |
 | 插件 ID | `Dian115Sign` |
-| 插件版本 | `2.0.2` |
+| 插件版本 | `2.0.3` |
 | 维护者 | [xchenya](https://github.com/xchenya) |
 | 宿主要求 | MoviePilot V3（`>=3.0.0`） |
-| 发布状态 | 测试版；默认仅诊断；未完成真实站点联调 |
+| 发布状态 | 测试版；普通签到已实测；重复签到与运气签继续验证 |
 
-**插件版本 2.0.2 不代表支持 MoviePilot V2。** 本版是独立重写，不是 JinxJie 发布的官方更新，也不保证已解决所有 HTTP 403。
+**插件版本 2.0.3 不代表支持 MoviePilot V2。** 本版是独立重写，不是 JinxJie 发布的官方更新，也不保证已解决所有 HTTP 403。
 
 ## 安装
 
@@ -25,6 +25,8 @@ https://github.com/xchenya/MoviePilot-Plugins
 手工部署时必须复制整个 `dian115sign` 目录，包括 `__init__.py` 与 `browser.py`。插件不自行安装 Python 包；依赖宿主已有的 SDK、Pydantic、APScheduler 与可用浏览器环境。
 
 ## 功能与变化
+
+**2.0.3 优化：** 成功通知区分“本次积分”和“当前积分”，补充日期、状态、连续签到与执行时间；成功后刷新账号信息补齐 streak。重复签到采用“本地当日完成记录 → 账号 last_signin_date → 接口重复码/失败后账号复核”三层识别，避免重复提交。
 
 **2.0.2 修复：** 登录按钮不再依赖固定文案，按“按钮文本 → submit 控件 → 表单 requestSubmit → Enter”自动提交；配置页删除重复的完整 Cookie 输入框，统一为“Token / Cookie”，并恢复为接近原插件的紧凑卡片布局。
 
@@ -87,6 +89,6 @@ HTTP 403 不会直接视为 Token 过期，也不会每分钟循环重试。详�
 
 ## 验证边界与来源
 
-2026-09-25 离线回归：40 项通过，16 项浏览器用例因测试环境导航策略跳过；跳过不代表通过。**尚未验证真实 MoviePilot 加载、当前站点 DOM、用户账号登录及实际签到**。内置页面路径、按钮标签和响应字段仍以旧版实现为兼容假设。详见[测试说明](../../tests/v3/dian115sign/README.md)。
+2026-09-25 已在用户真实 MoviePilot 环境完成普通签到验证并收到站点成功结果；离线浏览器用例在托管测试环境仍受导航策略限制。真实验证不代表未来站点页面或验证策略不会变化。内置页面路径、按钮标签和响应字段仍以旧版实现为兼容假设。详见[测试说明](../../tests/v3/dian115sign/README.md)。
 
 原功能参考：[JinxJie / dian115sign](https://github.com/JinxJie/MoviePilot-Plugins/tree/main/plugins.v2/dian115sign)。本仓库维护独立 V3 重写版，保留来源说明；使用与分发遵循仓库 [LICENSE](../../LICENSE)。

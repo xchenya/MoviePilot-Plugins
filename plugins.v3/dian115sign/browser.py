@@ -499,6 +499,38 @@ class BrowserRunner:
         return self._one(self.page.get_by_role("button", name=re.compile(
             r"^\s*(?:立即签到|今日签到|签到|开始签到)\s*$")))
 
+    def _refresh_account_snapshot(self) -> dict[str, Any] | None:
+        """Best-effort refresh after a write; never downgrade a confirmed result."""
+        try:
+            self.trace.user = None
+            self.trace.latest.pop(f"{API}/me", None)
+            self.page.reload(wait_until="domcontentloaded",
+                             timeout=min(self.options.timeout, 10) * 1000)
+            stop = min(self.deadline, time.monotonic() + min(self.options.timeout, 8))
+            while time.monotonic() < stop:
+                try:
+                    self._check()
+                except PortalError:
+                    return None
+                if self.trace.user:
+                    return self.trace.user
+                self.page.wait_for_timeout(200)
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _apply_account(outcome: Outcome, user: dict[str, Any] | None) -> None:
+        """Apply only verified account fields from /me."""
+        if not user:
+            return
+        balance = number(user.get("points"))
+        streak = number(user.get("consecutive_signin"))
+        if balance is not None:
+            outcome.balance = balance
+        if streak is not None:
+            outcome.streak = int(streak)
+
     def _sign(self, outcome: Outcome) -> None:
         """Use the actual UI, observe its response, never replay an uncertain POST."""
         if self.pending():
@@ -533,18 +565,29 @@ class BrowserRunner:
         if not self.guard.sent:
             raise PortalError("untracked_submission", "未确认签到请求经过提交保护；不将响应计为成功。")
         status, code = sign["status"], sign["code"]
-        if code == "already_signed" and status in {200, 409}:
+        already_codes = {"already_signed", "already_signin", "already_checked_in", "signed_today"}
+        if code in already_codes and status in {200, 400, 409}:
             outcome.ok, outcome.already = True, True
             outcome.code, outcome.message = "already_signed", "站点确认今日已签到"
+            self._apply_account(outcome, self._refresh_account_snapshot())
         elif 200 <= status < 300 and code == "ok":
             if sign.get("mode") not in {None, "", self.options.mode}:
                 raise PortalError("response_mode_mismatch", "站点返回的签到模式不符；请人工核对结果。")
             outcome.ok, outcome.code, outcome.message = True, "signed", "站点确认签到成功"
-            outcome.streak = None  # Do not invent or reuse the pre-sign-in streak.
             outcome.award = number(sign.get("award"))
             outcome.balance = number(sign.get("new_balance"))
+            self._apply_account(outcome, self._refresh_account_snapshot())
         else:
-            raise PortalError("signin_rejected", f"签到未成功：HTTP {status}，业务码 {code or '未提供'}。")
+            # Conflict/error wording may drift. Re-check the account state before
+            # reporting a failure; last_signin_date is the authoritative duplicate signal.
+            account = self._refresh_account_snapshot()
+            if account and str(account.get("last_signin_date") or "") == outcome.date:
+                outcome.ok, outcome.already = True, True
+                outcome.code = "already_signed"
+                outcome.message = "账号复核确认今日已签到，无需重复提交"
+                self._apply_account(outcome, account)
+            else:
+                raise PortalError("signin_rejected", f"签到未成功：HTTP {status}，业务码 {code or '未提供'}。")
 
     def run(self, diagnose: bool = False) -> Outcome:
         """Run and close the browser in its owning thread, including failures."""
@@ -577,9 +620,7 @@ class BrowserRunner:
             self.page.on("response", self.trace.response)
             self._goto("/me/signin")
             user = self._account()
-            outcome.balance = number(user.get("points"))
-            streak = number(user.get("consecutive_signin"))
-            outcome.streak = int(streak) if streak is not None else None
+            self._apply_account(outcome, user)
             signed_today = str(user.get("last_signin_date") or "") == outcome.date
             if diagnose:
                 outcome.ok, outcome.code = True, "diagnostic_ok"
