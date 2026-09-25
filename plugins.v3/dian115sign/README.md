@@ -1,0 +1,89 @@
+# 癫影自动签到（V3 浏览器重写测试版）
+
+| 项目 | 内容 |
+| --- | --- |
+| 插件 ID | `Dian115Sign` |
+| 插件版本 | `2.0.0` |
+| 维护者 | [xchenya](https://github.com/xchenya) |
+| 宿主要求 | MoviePilot V3（`>=3.0.0`） |
+| 发布状态 | 测试版；默认仅诊断；未完成真实站点联调 |
+
+**插件版本 2.0.0 不代表支持 MoviePilot V2。** 本版是独立重写，不是 JinxJie 发布的官方更新，也不保证已解决所有 HTTP 403。
+
+## 安装
+
+在 MoviePilot 第三方插件市场中添加仓库，刷新插件列表，选择本仓库的“癫影自动签到（浏览器重写版）”：
+
+```text
+https://github.com/xchenya/MoviePilot-Plugins
+```
+
+源码通过 `main` 分支的 `package.v3.json` 发布，`release: false`；无需单独下载 GitHub Release。
+
+已安装其他仓库的同名旧插件时，先保存原配置、停用旧插件，再选择本仓库作为插件来源并重新安装或更新。新旧实现使用相同 ID，不能作为两个独立插件同时运行；请确认插件卡片的来源、维护者和版本，避免更新回旧实现。切换来源的具体操作以所用 MoviePilot 界面为准。
+
+手工部署时必须复制整个 `dian115sign` 目录，包括 `__init__.py` 与 `browser.py`。插件不自行安装 Python 包；依赖宿主已有的 SDK、Pydantic、APScheduler 与可用浏览器环境。
+
+## 功能与变化
+
+使用 `app.sdk.browser.launch_browser_context` 打开站点自己的网页，由网页处理其浏览器验证和签名，不再由插件手工拼接 proof 或 ECDSA 签名。保留普通签/运气签、定时任务、立即执行、登录会话、积分信息、执行记录及通知。
+
+HTTP 403 不会直接视为 Token 过期，也不会每分钟循环重试。详情页只读取本地缓存，不会因打开页面而访问站点。每轮最多放行一次登录、一次签到提交；实际请求模式必须匹配配置，结果不明则保存待确认标记，避免盲目重复提交。
+
+站点仍可能拒绝当前网络出口或浏览器环境。人机验证需要人工处理；跳转其他域名、按钮定位不唯一、模式不匹配时停止，不猜测点击。
+
+## 首次配置
+
+| 配置项 | 首次建议 |
+| --- | --- |
+| 启用定时任务 | 关闭，先单次验证 |
+| 仅诊断 | 开启：允许必要的登录与账号读取，但不提交签到 |
+| 保存后立即执行一次 | 开启，保存后自动复位 |
+| 运气签 | 关闭，先验证普通签；运气签可能扣分 |
+| Token / 完整 Cookie | 仅在自己的 MoviePilot 中填写；有完整 Cookie 时优先填写完整 Cookie |
+| 邮箱 / 密码 | 需要自动登录时填写；已有有效 Cookie 可留空 |
+| 系统代理 | 按自己的实际网络设置；自定义代理在关闭系统代理后生效 |
+| Cron / 时区 | 默认 `30 9 * * *` / `Asia/Shanghai` |
+| CSS 选择器 | 先留空，仅在页面适配失败时调整 |
+
+查看插件详情页的本地结果：`diagnostic_ok` 仅表示登录与账号读取正常，**不是签到成功**。诊断正常后关闭“仅诊断”，手动执行一次普通签；出现 `signed` 或 `already_signed` 后再开启定时任务。
+
+## 常见结果
+
+| 结果代码 | 含义与处理 |
+| --- | --- |
+| `diagnostic_ok` | 本次诊断正常，未提交签到 |
+| `signed` / `already_signed` | 站点明确确认成功 / 今日已签 |
+| `access_denied` / `page_rejected` | HTTP 403 等访问拒绝；核对网络与诊断，不要反复重置密码 |
+| `login_required` / `login_failed` | 需要登录 / 站点拒绝登录，核对凭据 |
+| `human_required` | 需要人工完成站点验证 |
+| `rate_limited` | 站点限流，本轮停止 |
+| `browser_missing` / `browser_dependency_missing` | 宿主浏览器环境不完整 |
+| `proxy_failed` / `dns_failed` / `tls_failed` | 代理、DNS 或 TLS 问题；不会关闭证书校验 |
+| `account_unconfirmed` / `signin_ui_changed` | 账号接口或页面需要继续适配 |
+| `selector_ambiguous` / `mode_mismatch` | 选择器不唯一 / 请求模式不匹配，已阻止提交 |
+| `outcome_unknown` / `previous_outcome_unknown` | 提交结果待确认；先在网站核对，不要直接重复提交 |
+
+待确认标记不会因更换 Cookie 或代理而绕过。同一天再次执行时，账号若明确显示已签即可解除；否则先人工核对网站，再使用配置中的“清除签到结果待确认标记”。
+
+## 数据与安全
+
+配置通过插件基类保存。浏览器 Cookie/localStorage 位于插件独立数据目录的 `browser-state.json`，采用 0600 文件权限；**其中包含登录凭据，不要提交 Git、截图或发送到聊天**。需要重新使用配置中的 Cookie 时使用“清除浏览器会话”。
+
+新执行历史保留最近 100 次，详情显示最近 10 次。旧版 `dian115_records` 不主动删除，也不自动迁移。日志与诊断仅保留必要的接口路径、HTTP 状态和业务码，不保存完整响应正文、Cookie 或密码。
+
+## API 与命令
+
+所有接口使用 MoviePilot Bearer 鉴权，返回 `success / message / data`：
+
+- `POST /api/v1/plugin/Dian115Sign/signin`：按配置执行，不忽略“仅诊断”。
+- `POST /api/v1/plugin/Dian115Sign/diagnose`：强制诊断，不签到。
+- `GET /api/v1/plugin/Dian115Sign/status`：读取缓存，不访问站点。
+
+远程命令 `/dian115_sign` 仅在插件启用时执行；V3 分身使用实例专属命令。旧版以 GET 触发签到的接口不再保留。停用或重载发出取消信号，浏览器在原工作线程的 `finally` 中关闭。
+
+## 验证边界与来源
+
+2026-09-25 离线回归：40 项通过，16 项浏览器用例因测试环境导航策略跳过；跳过不代表通过。**尚未验证真实 MoviePilot 加载、当前站点 DOM、用户账号登录及实际签到**。内置页面路径、按钮标签和响应字段仍以旧版实现为兼容假设。详见[测试说明](../../tests/v3/dian115sign/README.md)。
+
+原功能参考：[JinxJie / dian115sign](https://github.com/JinxJie/MoviePilot-Plugins/tree/main/plugins.v2/dian115sign)。本仓库维护独立 V3 重写版，保留来源说明；使用与分发遵循仓库 [LICENSE](../../LICENSE)。

@@ -6,11 +6,11 @@ xchenya 的 [MoviePilot](https://github.com/jxxghp/MoviePilot) 第三方插件�
 
 ## 插件列表
 
-当前仓库已完成初始化，插件将按需加入。
-
 | 插件 | 目录 | 版本 | 状态 |
 |---|---|---|---|
-| 暂无 | - | - | 待发布 |
+| [癫影自动签到（浏览器重写版）](./plugins.v3/dian115sign/README.md) | `plugins.v3/dian115sign` | `2.0.0` | V3 测试版；默认仅诊断 |
+
+癫影签到为独立重写测试版，要求 **MoviePilot V3**；插件版本 `2.0.0` 不代表支持 MoviePilot V2。真实站点登录及签到尚未验证，首次请先运行诊断。详见插件说明与[测试说明](./tests/v3/dian115sign/README.md)。
 
 ## 使用方法
 
