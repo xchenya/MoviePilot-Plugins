@@ -81,6 +81,15 @@ def build_form() -> tuple[list[dict], dict[str, Any]]:
                                   hint="使用 MoviePilot 系统代理", persistent_hint=True)),
                 ]),
                 row([
+                    col(4, switch("retry_enabled", "失败自动重试", "warning",
+                                  hint="仅对超时、网络等可恢复失败重试；403、密码错误、人机验证等不会重试",
+                                  persistent_hint=True)),
+                    col(4, text("retry_count", "重试次数", type="number",
+                                hint="默认 1 次，最大 10 次", persistent_hint=True)),
+                    col(4, text("retry_interval", "重试间隔（秒）", type="number",
+                                hint="默认 60 秒", persistent_hint=True)),
+                ]),
+                row([
                     col(12, text("proxy", "自定义代理（可选）",
                                  placeholder="http://10.0.0.2:7890",
                                  hint="关闭系统代理后生效", persistent_hint=True,
@@ -89,11 +98,14 @@ def build_form() -> tuple[list[dict], dict[str, Any]]:
             ]),
             card("mdi-bug", "info", "调试与恢复", [
                 row([
-                    col(4, switch("onlyonce", "立即运行一次", "info",
+                    col(3, switch("onlyonce", "立即运行一次", "info",
                                   hint="保存后执行一次并自动复位", persistent_hint=True)),
-                    col(4, switch("reset_session", "清除浏览器会话", "warning",
+                    col(3, switch("force_once", "强制重新签到一次", "warning",
+                                  hint="保存后立即访问站点并点击签到，忽略本地重复状态；随后自动复位",
+                                  persistent_hint=True)),
+                    col(3, switch("reset_session", "清除浏览器会话", "warning",
                                   hint="下次重新建立登录态", persistent_hint=True)),
-                    col(4, switch("clear_pending", "清除待确认标记", "error",
+                    col(3, switch("clear_pending", "清除待确认标记", "error",
                                   hint="仅在已人工确认网站签到状态后使用",
                                   persistent_hint=True)),
                 ]),
@@ -129,4 +141,8 @@ def build_form() -> tuple[list[dict], dict[str, Any]]:
         "login_selector": "",
         "reset_session": False,
         "clear_pending": False,
+        "force_once": False,
+        "retry_enabled": False,
+        "retry_count": 1,
+        "retry_interval": 60,
     }

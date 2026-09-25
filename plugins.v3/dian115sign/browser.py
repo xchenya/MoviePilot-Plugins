@@ -83,6 +83,7 @@ class Outcome:
     balance: float | None = None
     streak: int | None = None
     local_streak: int | None = None
+    retry_count: int = 0
     uncertain: bool = False
     submitted: bool = False
     checked_at: str = ""
@@ -620,7 +621,8 @@ class BrowserRunner:
             else:
                 raise PortalError("signin_rejected", f"签到未成功：HTTP {status}，业务码 {code or '未提供'}。")
 
-    def run(self, diagnose: bool = False) -> Outcome:
+    def run(self, diagnose: bool = False,
+            verify_duplicate: bool = False) -> Outcome:
         """Run and close the browser in its owning thread, including failures."""
         outcome = Outcome(date=self.options.today(), mode=self.options.mode,
                           checked_at=datetime.now(ZoneInfo(self.options.timezone)).isoformat(timespec="seconds"))
@@ -657,7 +659,7 @@ class BrowserRunner:
                 outcome.ok, outcome.code = True, "diagnostic_ok"
                 outcome.already = signed_today
                 outcome.message = "登录与账号读取正常；诊断模式未提交签到"
-            elif signed_today:
+            elif signed_today and not verify_duplicate:
                 outcome.ok, outcome.already = True, True
                 outcome.code, outcome.message = "already_signed", "账号确认今日已签到，无需重复提交"
             else:

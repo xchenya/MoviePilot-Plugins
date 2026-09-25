@@ -105,7 +105,7 @@ def exercise(chromium, *, diagnose=False, lucky=False, style="direct", gate_stat
              authenticated=True, already=False, sign_status=200, sign_code="ok",
              lost_response=False, pending=False, redirect=False, auto_sign=False,
              save_fails=False, seed=False, conflict_marks_signed=False,
-             client_already=False):
+             client_already=False, verify_duplicate=False):
     state = {"sign_calls": 0, "login_calls": 0, "closed": 0, "saved": 0,
              "pending": pending, "auth": authenticated, "gate_calls": 0,
              "cookies_seen": "", "signed": already, "points": 100, "streak": 3}
@@ -172,7 +172,7 @@ def exercise(chromium, *, diagnose=False, lucky=False, style="direct", gate_stat
 
     runner = BrowserRunner(options, launch, Event(), lambda: None, save,
                            lambda: state["pending"], mark_pending)
-    result = runner.run(diagnose=diagnose)
+    result = runner.run(diagnose=diagnose, verify_duplicate=verify_duplicate)
     assert state["closed"] == 1
     assert "PRIVATE_PASSWORD" not in json.dumps(result.to_dict())
     return result, state
@@ -195,7 +195,9 @@ def test_real_browser_modes(chromium, style, lucky):
 
 
 def test_real_browser_duplicate_toast_without_post(chromium):
-    result, state = exercise(chromium, client_already=True)
+    result, state = exercise(
+        chromium, already=True, client_already=True, verify_duplicate=True
+    )
     assert result.ok and result.already
     assert result.code == "already_signed"
     assert state["sign_calls"] == 0

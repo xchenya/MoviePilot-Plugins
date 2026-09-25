@@ -1,4 +1,4 @@
-"""Dian115Sign 2.0.4: MoviePilot V3 browser-native, fail-closed rewrite.
+"""Dian115Sign 2.0.5: MoviePilot V3 browser-native, fail-closed rewrite.
 
 Independent rewrite maintained by xchenya; original feature reference: JinxJie's
 plugins.v2/dian115sign. This is not an official release from that author.
@@ -50,6 +50,7 @@ class RunData(BaseModel):
     balance: float | None = None
     streak: int | None = None
     local_streak: int | None = None
+    retry_count: int = 0
     uncertain: bool = False
     submitted: bool = False
     checked_at: str = ""
@@ -70,7 +71,7 @@ class Dian115Sign(_PluginBase):
     plugin_name = "癫影自动签到"
     plugin_desc = "V3 浏览器重写测试版：普通签/运气签、登录会话、登录诊断、错误分类及结果通知。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "2.0.4"
+    plugin_version = "2.0.5"
     plugin_author = "xchenya"
     author_url = "https://github.com/xchenya/MoviePilot-Plugins"
     plugin_config_prefix = "dian115sign_"
@@ -88,6 +89,7 @@ class Dian115Sign(_PluginBase):
         self._options = Options()
         self._enabled = False
         self._pending_once = False
+        self._force_once = False
         self._config_error = ""
         self._trigger = None
 
@@ -102,6 +104,8 @@ class Dian115Sign(_PluginBase):
             "timeout": 30, "normal_selector": "", "lucky_selector": "",
             "submit_selector": "", "login_selector": "",
             "reset_session": False, "clear_pending": False,
+            "force_once": False, "retry_enabled": False,
+            "retry_count": 1, "retry_interval": 60,
         }
 
     def init_plugin(self, config: dict | None = None) -> None:
@@ -112,10 +116,13 @@ class Dian115Sign(_PluginBase):
             merged = {**self._defaults(), **(config or {})}
             self._enabled = bool(merged.get("enabled"))
             self._pending_once = bool(merged.get("onlyonce"))
+            self._force_once = bool(merged.get("force_once"))
             self._config_error = ""
             try:
                 timeout = max(10, min(60, int(merged.get("timeout") or 30)))
                 merged["timeout"] = timeout
+                merged["retry_count"] = max(0, min(10, int(merged.get("retry_count") or 1)))
+                merged["retry_interval"] = max(10, min(3600, int(merged.get("retry_interval") or 60)))
                 merged["timezone"] = str(merged.get("timezone") or "Asia/Shanghai")
                 ZoneInfo(merged["timezone"])
                 merged["cron"] = str(merged.get("cron") or "30 9 * * *")
@@ -144,19 +151,20 @@ class Dian115Sign(_PluginBase):
                     self.del_data("pending_submission")
             except Exception:
                 self._config_error = "插件数据目录或状态清理失败；请检查目录权限。"
-            changed = any(merged.get(k) for k in ("onlyonce", "reset_session", "clear_pending"))
-            for name in ("onlyonce", "reset_session", "clear_pending"):
+            changed = any(merged.get(k) for k in ("onlyonce", "force_once", "reset_session", "clear_pending"))
+            for name in ("onlyonce", "force_once", "reset_session", "clear_pending"):
                 self._config[name] = False
             if changed:
                 if self.update_config(dict(self._config)) is False:
                     self._config_error = "配置保存失败；为避免重复执行，已取消一次性任务。"
                     self._pending_once = False
+                    self._force_once = False
             if self._config_error:
                 logger.error("癫影：" + self._config_error)
 
     def get_state(self) -> bool:
         """A requested one-shot task may run while periodic execution is disabled."""
-        return (self._enabled or self._pending_once) and not bool(self._config_error)
+        return (self._enabled or self._pending_once or self._force_once) and not bool(self._config_error)
 
     def get_service(self) -> list[dict[str, Any]]:
         """Both periodic and one-shot scheduling are owned by MoviePilot."""
@@ -168,11 +176,16 @@ class Dian115Sign(_PluginBase):
             jobs.append({"id": prefix + ".Daily", "name": "癫影每日签到/诊断",
                          "trigger": self._trigger, "func": self._run,
                          "kwargs": {"manual": False}})
-        if self._pending_once:
-            jobs.append({"id": prefix + ".Once", "name": "癫影立即执行一次",
-                         "trigger": DateTrigger(run_date=datetime.now(
-                             ZoneInfo(self._options.timezone)) + timedelta(seconds=3)),
-                         "func": self._run, "kwargs": {"manual": True}})
+        if self._pending_once or self._force_once:
+            force = bool(self._force_once)
+            jobs.append({
+                "id": prefix + ".Once",
+                "name": "癫影强制重新签到一次" if force else "癫影立即执行一次",
+                "trigger": DateTrigger(run_date=datetime.now(
+                    ZoneInfo(self._options.timezone)) + timedelta(seconds=3)),
+                "func": self._run,
+                "kwargs": {"manual": True, "force": force},
+            })
         return jobs
 
     def stop_service(self) -> None:
@@ -184,6 +197,7 @@ class Dian115Sign(_PluginBase):
         with self._state_lock:
             self._enabled = False
             self._pending_once = False
+            self._force_once = False
             self._cancel.set()
 
     def get_command(self) -> list[dict[str, Any]]:
@@ -302,8 +316,8 @@ class Dian115Sign(_PluginBase):
         })
 
     def _send_result_notification(self, result: Outcome, diagnostic: bool) -> None:
-        """Send a status-oriented notification with unambiguous score labels."""
-        mode = "运气签" if result.mode == "lucky" else "普通签"
+        """Send one fixed-title, separator-based notification template."""
+        title = "【癫影签到】任务完成"
         checked = str(result.checked_at or "").replace("T", " ")
         if "+" in checked:
             checked = checked.rsplit("+", 1)[0]
@@ -311,53 +325,58 @@ class Dian115Sign(_PluginBase):
             checked = checked[:-1]
 
         if diagnostic:
-            title = "癫影诊断正常" if result.ok else "癫影诊断失败"
-            status = ("今日已签到" if result.ok and result.already else
-                      "登录与账号状态正常" if result.ok else result.message)
-            lines = [
-                f"🔎 状态：{status}",
-                f"📅 日期：{result.date or '未取得'}",
-                f"💰 当前积分：{self._number_text(result.balance)}",
-                f"📆 本地连续签到：{self._number_text(result.local_streak)}"
-                    + (" 天" if result.local_streak is not None else ""),
-            ]
+            status = "✅诊断正常" if result.ok else "❌诊断失败"
         elif result.ok and result.already:
-            title = "癫影今日已签到"
-            lines = [
-                "ℹ️ 状态：今日已签到，无需重复操作",
-                f"📅 日期：{result.date or '未取得'}",
-                f"💰 当前积分：{self._number_text(result.balance)}",
-                f"📆 本地连续签到：{self._number_text(result.local_streak)}"
-                    + (" 天" if result.local_streak is not None else ""),
-            ]
+            status = "✅今日已签到"
         elif result.ok:
-            title = "癫影签到成功"
-            lines = [
-                "✅ 状态：签到成功",
-                f"📅 日期：{result.date or '未取得'}",
-                f"🎯 模式：{mode}",
-                f"🎁 本次积分：{self._number_text(result.award, signed=True)}",
+            status = "✅签到成功"
+        else:
+            status = "❌签到失败"
+
+        lines = [
+            "━━━━━━━━━━━━━━",
+            f"✨ 状态：{status}",
+            "━━━━━━━━━━━━━━",
+        ]
+        if result.ok:
+            lines.extend([
+                "📊 数据统计",
                 f"💰 当前积分：{self._number_text(result.balance)}",
                 f"📆 本地连续签到：{self._number_text(result.local_streak)}"
-                    + (" 天" if result.local_streak is not None else ""),
-            ]
+                    + ("天" if result.local_streak is not None else ""),
+            ])
+            if result.ok and not result.already and not diagnostic:
+                lines.insert(-2, f"🎁 本次积分：{self._number_text(result.award, signed=True)}")
         else:
-            title = "癫影签到失败"
-            lines = [
-                f"❌ 状态：{result.message or '未知错误'}",
-                f"📅 日期：{result.date or '未取得'}",
-                f"🎯 模式：{mode}",
-                f"🧩 代码：{result.code or 'unknown'}",
-            ]
-        if checked:
-            lines.append(f"🕒 时间：{checked}")
+            lines.extend([
+                "📊 任务信息",
+                f"🧩 错误代码：{result.code or 'unknown'}",
+                f"📝 失败原因：{result.message or '未知错误'}",
+                f"🔁 已重试：{int(result.retry_count or 0)}次",
+            ])
+        lines.extend([
+            "━━━━━━━━━━━━━━",
+            f"🕐 签到时间：{checked or '未取得'}",
+        ])
         self.post_message(
             mtype=NotificationType.Plugin,
             title=title,
             text="\n".join(lines),
         )
 
-    def _run(self, manual: bool = False, diagnose: bool | None = None) -> dict:
+    @staticmethod
+    def _retryable(result: Outcome) -> bool:
+        """Retry only transient failures that occurred before an uncertain write."""
+        if result.ok or result.submitted or result.uncertain:
+            return False
+        return result.code in {
+            "browser_timeout", "timeout", "browser_error",
+            "proxy_failed", "dns_failed", "server_error",
+            "account_unconfirmed", "login_timeout", "runtime_error",
+        }
+
+    def _run(self, manual: bool = False, diagnose: bool | None = None,
+             force: bool = False) -> dict:
         """One shared execution entry for services, commands and POST APIs."""
         if not self._run_lock.acquire(blocking=False):
             return Outcome(code="busy", message="已有任务运行，已跳过并发请求。").to_dict()
@@ -371,6 +390,7 @@ class Dian115Sign(_PluginBase):
                     return Outcome(code="disabled", message="插件已停用或任务已取消。").to_dict()
                 if manual:
                     self._pending_once = False
+                    self._force_once = False
             diagnostic = bool(config.get("diagnose_only", True)) if diagnose is None else diagnose
             logger.info(f"癫影开始{'诊断（不签到）' if diagnostic else '签到'}，模式：{options.mode}")
             result: Outcome
@@ -379,25 +399,38 @@ class Dian115Sign(_PluginBase):
                 identity = options.identity(raw_proxy)
                 state_file = self._session_file()
                 completed = self.get_data("completed_day") or {}
-                if (not diagnostic and isinstance(completed, dict)
-                        and completed.get("date") == options.today()
-                        and completed.get("identity") == identity):
+                same_day_completed = (
+                    isinstance(completed, dict)
+                    and completed.get("date") == options.today()
+                    and completed.get("identity") == identity
+                )
+                local_duplicate_ready = (
+                    same_day_completed
+                    and completed.get("duplicate_verified") is True
+                    and completed.get("balance") is not None
+                )
+                if not diagnostic and not force and local_duplicate_ready:
                     result = Outcome(
                         ok=True,
                         code="already_signed",
-                        message="本地记录确认今日已完成签到，无需重复提交",
+                        message="本地记录确认今日已签到，无需再次访问站点",
                         date=options.today(),
                         mode=options.mode,
                         already=True,
                         balance=completed.get("balance"),
-                        streak=completed.get("streak"),
                         local_streak=completed.get("local_streak"),
                         checked_at=datetime.now(
                             ZoneInfo(options.timezone)
                         ).isoformat(timespec="seconds"),
                     )
-                    logger.info("癫影：本地记录确认今日已签到，跳过站点签到请求")
+                    logger.info("癫影：本地重复签到状态已确认，跳过站点请求")
                     raise _LocalCompleted(result)
+
+                # The first duplicate check of the day must be confirmed by the site
+                # toast. A force-once run also bypasses the local duplicate shortcut.
+                verify_duplicate = bool(force or not (
+                    same_day_completed and completed.get("duplicate_verified") is True
+                ))
 
                 def current() -> bool:
                     """Never publish old-generation results after a configuration reload."""
@@ -451,9 +484,42 @@ class Dian115Sign(_PluginBase):
 
                 # Delay browser imports/launch until an explicit task actually runs.
                 from app.sdk.browser import launch_browser_context
-                runner = BrowserRunner(options, launch_browser_context, cancel, load_state,
-                                       save_state, pending, mark_pending, proxy)
-                result = runner.run(diagnose=diagnostic)
+                max_retry = (
+                    int(config.get("retry_count") or 0)
+                    if config.get("retry_enabled") and not diagnostic
+                    else 0
+                )
+                retry_interval = int(config.get("retry_interval") or 60)
+                retry_count = 0
+                while True:
+                    runner = BrowserRunner(
+                        options, launch_browser_context, cancel, load_state,
+                        save_state, pending, mark_pending, proxy
+                    )
+                    result = runner.run(
+                        diagnose=diagnostic,
+                        verify_duplicate=verify_duplicate,
+                    )
+                    result.retry_count = retry_count
+                    if (not self._retryable(result)) or retry_count >= max_retry:
+                        break
+                    retry_count += 1
+                    logger.warning(
+                        f"癫影：[{result.code}] {result.message}；"
+                        f"{retry_interval} 秒后进行第 {retry_count} 次重试"
+                    )
+                    if cancel.wait(retry_interval):
+                        result = Outcome(
+                            code="cancelled",
+                            message="插件已停用或配置已更新，取消失败重试。",
+                            date=options.today(),
+                            mode=options.mode,
+                            retry_count=retry_count,
+                            checked_at=datetime.now(
+                                ZoneInfo(options.timezone)
+                            ).isoformat(timespec="seconds"),
+                        )
+                        break
                 self._update_local_streak(result, identity)
                 with self._state_lock:
                     if current():
@@ -469,6 +535,7 @@ class Dian115Sign(_PluginBase):
                                     "balance": result.balance,
                                     "streak": result.streak,
                                     "local_streak": result.local_streak,
+                                    "duplicate_verified": bool(result.already),
                                 })
                             history = self.get_data("run_history") or []
                             history = history if isinstance(history, list) else []

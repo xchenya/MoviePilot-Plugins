@@ -167,6 +167,7 @@ def test_same_day_completed_identity_skips_browser(monkeypatch):
         "identity": identity,
         "balance": 610,
         "streak": 4,
+        "duplicate_verified": True,
     })
     monkeypatch.setattr(
         __import__("app.sdk.browser", fromlist=["launch_browser_context"]),
@@ -178,6 +179,56 @@ def test_same_day_completed_identity_skips_browser(monkeypatch):
     assert result["code"] == "already_signed"
     assert result["balance"] == 610
     assert result["local_streak"] == 1
+
+
+def test_unverified_same_day_completion_does_not_use_local_shortcut(monkeypatch):
+    p = Dian115Sign()
+    p.init_plugin({"enabled": True, "use_system_proxy": False})
+    identity = p._options.identity("")
+    p.save_data("completed_day", {
+        "date": p._options.today(),
+        "identity": identity,
+        "balance": 610,
+        "local_streak": 1,
+        "duplicate_verified": False,
+    })
+
+    class FakeRunner:
+        def __init__(self, *args, **kwargs):
+            pass
+        def run(self, diagnose=False, verify_duplicate=False):
+            assert verify_duplicate is True
+            return Outcome(
+                ok=True, code="already_signed", message="页面提示今日已签到",
+                date=p._options.today(), mode="normal", already=True, balance=610,
+            )
+
+    import app.plugins.dian115sign as module
+    monkeypatch.setattr(module, "BrowserRunner", FakeRunner)
+    result = p._run(manual=True, diagnose=False)
+    assert result["ok"] and result["already"]
+    completed = p.get_data("completed_day")
+    assert completed["duplicate_verified"] is True
+    assert completed["balance"] == 610
+
+
+def test_force_once_creates_forced_one_shot():
+    p = Dian115Sign()
+    p.init_plugin({"force_once": True, "enabled": False})
+    services = p.get_service()
+    assert len(services) == 1
+    assert services[0]["kwargs"]["force"] is True
+    assert p.saved_config["force_once"] is False
+
+
+def test_retryable_only_transient_prewrite_failures():
+    assert Dian115Sign._retryable(Outcome(code="browser_timeout"))
+    assert Dian115Sign._retryable(Outcome(code="server_error"))
+    assert not Dian115Sign._retryable(Outcome(code="access_denied"))
+    assert not Dian115Sign._retryable(Outcome(code="login_failed"))
+    assert not Dian115Sign._retryable(
+        Outcome(code="browser_error", submitted=True, uncertain=True)
+    )
 
 
 def test_local_streak_same_day_not_incremented():
