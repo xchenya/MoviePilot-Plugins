@@ -502,13 +502,15 @@ class BrowserRunner:
             r"^\s*(?:立即签到|今日签到|签到|开始签到)\s*$")))
 
     def _refresh_account_snapshot(self) -> dict[str, Any] | None:
-        """Best-effort refresh after a write; never downgrade a confirmed result."""
+        """Best-effort read-only account refresh after duplicate confirmation."""
         try:
             self.trace.user = None
             self.trace.latest.pop(f"{API}/me", None)
-            self.page.reload(wait_until="domcontentloaded",
-                             timeout=min(self.options.timeout, 10) * 1000)
-            stop = min(self.deadline, time.monotonic() + min(self.options.timeout, 8))
+            self.page.reload(
+                wait_until="domcontentloaded",
+                timeout=min(self.options.timeout, 10) * 1000,
+            )
+            stop = min(self.deadline, time.monotonic() + min(self.options.timeout, 5))
             while time.monotonic() < stop:
                 try:
                     self._check()
@@ -517,6 +519,37 @@ class BrowserRunner:
                 if self.trace.user:
                     return self.trace.user
                 self.page.wait_for_timeout(200)
+        except Exception:
+            pass
+
+        # Some frontend builds keep the account state client-side and do not
+        # naturally request /me again after reload. Use one same-origin read-only
+        # fetch in the already-authenticated page as a fallback.
+        try:
+            payload = self.page.evaluate(
+                """async () => {
+                    const response = await fetch('/api/portal/me', {
+                        method: 'GET',
+                        credentials: 'include',
+                        cache: 'no-store',
+                        headers: {'Accept': 'application/json'}
+                    });
+                    let body = null;
+                    try { body = await response.json(); } catch (_) {}
+                    return {status: response.status, body};
+                }"""
+            )
+            if not isinstance(payload, dict) or not (200 <= int(payload.get("status") or 0) < 300):
+                return None
+            body = payload.get("body")
+            if not isinstance(body, dict) or body.get("code") != "ok":
+                return None
+            user = body.get("user")
+            if isinstance(user, dict):
+                return {
+                    "points": user.get("points"),
+                    "last_signin_date": user.get("last_signin_date"),
+                }
         except Exception:
             return None
         return None
@@ -569,6 +602,7 @@ class BrowserRunner:
         if not duplicate_before and self._duplicate_notice_visible():
             outcome.ok, outcome.already = True, True
             outcome.code, outcome.message = "already_signed", "页面提示今日已签到，无需重复提交"
+            self._apply_account(outcome, self._refresh_account_snapshot())
             return
         # Some sites have a mode selector followed by a separate submit button.
         if mode_button is not None and not self.guard.sent and not self.trace.sign:
@@ -582,6 +616,7 @@ class BrowserRunner:
             if self._duplicate_notice_visible():
                 outcome.ok, outcome.already = True, True
                 outcome.code, outcome.message = "already_signed", "页面提示今日已签到，无需重复提交"
+                self._apply_account(outcome, self._refresh_account_snapshot())
                 return
             gate = self.trace.gate_error()
             if gate:
@@ -598,6 +633,8 @@ class BrowserRunner:
         if code in already_codes and status in {200, 400, 409}:
             outcome.ok, outcome.already = True, True
             outcome.code, outcome.message = "already_signed", "站点确认今日已签到"
+            if outcome.balance is None:
+                self._apply_account(outcome, self._refresh_account_snapshot())
         elif 200 <= status < 300 and code == "ok":
             if sign.get("mode") not in {None, "", self.options.mode}:
                 raise PortalError("response_mode_mismatch", "站点返回的签到模式不符；请人工核对结果。")

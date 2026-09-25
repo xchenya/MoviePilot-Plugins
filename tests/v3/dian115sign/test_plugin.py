@@ -212,6 +212,35 @@ def test_unverified_same_day_completion_does_not_use_local_shortcut(monkeypatch)
     assert completed["balance"] == 610
 
 
+def test_duplicate_result_keeps_same_day_known_balance(monkeypatch):
+    p = Dian115Sign()
+    p.init_plugin({"enabled": True, "use_system_proxy": False})
+    identity = p._options.identity("")
+    p.save_data("completed_day", {
+        "date": p._options.today(),
+        "identity": identity,
+        "balance": 610,
+        "local_streak": 1,
+        "duplicate_verified": False,
+    })
+
+    class FakeRunner:
+        def __init__(self, *args, **kwargs):
+            pass
+        def run(self, diagnose=False, verify_duplicate=False):
+            assert verify_duplicate is True
+            return Outcome(
+                ok=True, code="already_signed", message="页面提示今日已签到",
+                date=p._options.today(), mode="normal", already=True, balance=None,
+            )
+
+    import app.plugins.dian115sign as module
+    monkeypatch.setattr(module, "BrowserRunner", FakeRunner)
+    result = p._run(manual=True, diagnose=False)
+    assert result["balance"] == 610
+    assert p.get_data("completed_day")["balance"] == 610
+
+
 def test_force_once_creates_forced_one_shot():
     p = Dian115Sign()
     p.init_plugin({"force_once": True, "enabled": False})

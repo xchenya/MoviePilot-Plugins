@@ -1,4 +1,4 @@
-"""Dian115Sign 2.0.5: MoviePilot V3 browser-native, fail-closed rewrite.
+"""Dian115Sign 2.0.6: MoviePilot V3 browser-native, fail-closed rewrite.
 
 Independent rewrite maintained by xchenya; original feature reference: JinxJie's
 plugins.v2/dian115sign. This is not an official release from that author.
@@ -71,7 +71,7 @@ class Dian115Sign(_PluginBase):
     plugin_name = "癫影自动签到"
     plugin_desc = "V3 浏览器重写测试版：普通签/运气签、登录会话、登录诊断、错误分类及结果通知。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "2.0.5"
+    plugin_version = "2.0.6"
     plugin_author = "xchenya"
     author_url = "https://github.com/xchenya/MoviePilot-Plugins"
     plugin_config_prefix = "dian115sign_"
@@ -317,12 +317,16 @@ class Dian115Sign(_PluginBase):
 
     def _send_result_notification(self, result: Outcome, diagnostic: bool) -> None:
         """Send one fixed-title, separator-based notification template."""
-        title = "【癫影签到】任务完成"
-        checked = str(result.checked_at or "").replace("T", " ")
-        if "+" in checked:
-            checked = checked.rsplit("+", 1)[0]
-        elif checked.endswith("Z"):
-            checked = checked[:-1]
+        title = "癫影签到"
+        checked = "未取得"
+        try:
+            checked = datetime.fromisoformat(
+                str(result.checked_at or "").replace("Z", "+00:00")
+            ).strftime("%H:%M:%S")
+        except (TypeError, ValueError):
+            raw = str(result.checked_at or "")
+            if "T" in raw:
+                checked = raw.split("T", 1)[1][:8]
 
         if diagnostic:
             status = "✅诊断正常" if result.ok else "❌诊断失败"
@@ -356,7 +360,7 @@ class Dian115Sign(_PluginBase):
             ])
         lines.extend([
             "━━━━━━━━━━━━━━",
-            f"🕐 签到时间：{checked or '未取得'}",
+            f"🕐 签到时间：{checked}",
         ])
         self.post_message(
             mtype=NotificationType.Plugin,
@@ -520,6 +524,22 @@ class Dian115Sign(_PluginBase):
                             ).isoformat(timespec="seconds"),
                         )
                         break
+
+                # Never replace a same-day known balance with an empty duplicate result.
+                if result.ok and result.balance is None and same_day_completed:
+                    previous_balance = completed.get("balance")
+                    if previous_balance is not None:
+                        result.balance = previous_balance
+                    else:
+                        history = self.get_data("run_history") or []
+                        if isinstance(history, list):
+                            for item in reversed(history):
+                                if (isinstance(item, dict)
+                                        and item.get("date") == result.date
+                                        and item.get("ok") is True
+                                        and item.get("balance") is not None):
+                                    result.balance = item.get("balance")
+                                    break
                 self._update_local_streak(result, identity)
                 with self._state_lock:
                     if current():
@@ -529,10 +549,13 @@ class Dian115Sign(_PluginBase):
                             elif result.submitted and not result.uncertain:
                                 self.del_data("pending_submission")
                             if result.ok and (result.already or result.code == "signed"):
+                                saved_balance = result.balance
+                                if saved_balance is None and same_day_completed:
+                                    saved_balance = completed.get("balance")
                                 self.save_data("completed_day", {
                                     "date": result.date,
                                     "identity": identity,
-                                    "balance": result.balance,
+                                    "balance": saved_balance,
                                     "streak": result.streak,
                                     "local_streak": result.local_streak,
                                     "duplicate_verified": bool(result.already),
@@ -599,12 +622,23 @@ class Dian115Sign(_PluginBase):
                 }],
             }
 
+        def short_time(value: Any) -> str:
+            raw = str(value or "")
+            if not raw:
+                return "—"
+            try:
+                return datetime.fromisoformat(
+                    raw.replace("Z", "+00:00")
+                ).strftime("%H:%M:%S")
+            except ValueError:
+                return raw.split("T", 1)[-1][:8] if "T" in raw else raw[-8:]
+
         code = str(result.get("code") or "not_started")
         ok = bool(result.get("ok"))
         balance = result.get("balance")
         streak = result.get("local_streak")
         award = result.get("award")
-        checked = str(result.get("checked_at") or "—")
+        checked = short_time(result.get("checked_at"))
         today_state = (
             "已签到" if result.get("already") else
             "签到成功" if code == "signed" else
@@ -630,7 +664,7 @@ class Dian115Sign(_PluginBase):
                                     "success" if ok else "warning")]},
                 {"component": "VCol", "props": {"cols": 6, "md": 3},
                  "content": [metric("mdi-clock-outline", "最近执行",
-                                    checked.replace("T", " "), "primary")]},
+                                    checked, "primary")]},
             ]},
         ]
 
@@ -642,7 +676,7 @@ class Dian115Sign(_PluginBase):
             rows.append({
                 "component": "tr",
                 "content": [
-                    {"component": "td", "text": str(item.get("checked_at") or "—").replace("T", " ")},
+                    {"component": "td", "text": short_time(item.get("checked_at"))},
                     {"component": "td", "props": {"class": "text-center"},
                      "text": "运气签" if item.get("mode") == "lucky" else "普通签"},
                     {"component": "td", "props": {"class": "text-center"},

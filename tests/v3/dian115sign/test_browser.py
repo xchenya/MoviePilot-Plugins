@@ -105,10 +105,12 @@ def exercise(chromium, *, diagnose=False, lucky=False, style="direct", gate_stat
              authenticated=True, already=False, sign_status=200, sign_code="ok",
              lost_response=False, pending=False, redirect=False, auto_sign=False,
              save_fails=False, seed=False, conflict_marks_signed=False,
-             client_already=False, verify_duplicate=False):
+             client_already=False, verify_duplicate=False,
+             first_me_without_points=False):
     state = {"sign_calls": 0, "login_calls": 0, "closed": 0, "saved": 0,
              "pending": pending, "auth": authenticated, "gate_calls": 0,
-             "cookies_seen": "", "signed": already, "points": 100, "streak": 3}
+             "cookies_seen": "", "signed": already, "points": 100, "streak": 3,
+             "me_calls": 0}
     options = Options(email="example@example.invalid", password="PRIVATE_PASSWORD",
                       token="header.payload.signature" if seed else "",
                       lucky_mode=lucky, timeout=2)
@@ -125,7 +127,9 @@ def exercise(chromium, *, diagnose=False, lucky=False, style="direct", gate_stat
             route.fulfill(status=gate_status, content_type="application/json",
                           body=json.dumps({"code": "ok" if gate_status == 200 else "access_denied", "msg": "PRIVATE_PASSWORD"}))
         elif path == f"{API}/me":
-            data = {"code": "ok", "user": {"points": state["points"],
+            state["me_calls"] += 1
+            points = None if first_me_without_points and state["me_calls"] == 1 else state["points"]
+            data = {"code": "ok", "user": {"points": points,
                     "consecutive_signin": state["streak"],
                     "last_signin_date": options.today() if state["signed"] else "2020-01-01"}}
             if not state["auth"]: data = {"code": "invalid_token"}
@@ -196,11 +200,14 @@ def test_real_browser_modes(chromium, style, lucky):
 
 def test_real_browser_duplicate_toast_without_post(chromium):
     result, state = exercise(
-        chromium, already=True, client_already=True, verify_duplicate=True
+        chromium, already=True, client_already=True, verify_duplicate=True,
+        first_me_without_points=True,
     )
     assert result.ok and result.already
     assert result.code == "already_signed"
+    assert result.balance == 100
     assert state["sign_calls"] == 0
+    assert state["me_calls"] >= 2
 
 
 def test_real_browser_403_no_login_and_no_retries(chromium):
