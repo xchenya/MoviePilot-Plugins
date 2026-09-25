@@ -176,7 +176,19 @@ def test_same_day_completed_identity_skips_browser(monkeypatch):
     result = p._run(manual=True, diagnose=False)
     assert result["ok"] and result["already"]
     assert result["code"] == "already_signed"
-    assert result["balance"] == 610 and result["streak"] == 4
+    assert result["balance"] == 610
+    assert result["local_streak"] == 1
+
+
+def test_local_streak_same_day_not_incremented():
+    p = Dian115Sign()
+    p.init_plugin({})
+    identity = p._options.identity("")
+    first = Outcome(ok=True, code="signed", date=p._options.today())
+    p._update_local_streak(first, identity)
+    second = Outcome(ok=True, code="already_signed", date=p._options.today())
+    p._update_local_streak(second, identity)
+    assert first.local_streak == second.local_streak == 1
 
 
 def test_parallel_run_rejected():

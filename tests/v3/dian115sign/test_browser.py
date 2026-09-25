@@ -34,6 +34,14 @@ async function boot() {
  let mode='normal';
  app.innerHTML='<button id="normal">普通签</button><button id="lucky">运气签</button>';
  const submit = async m => {
+  if (CLIENT_ALREADY) {
+   const toast=document.createElement('div');
+   toast.setAttribute('role','alert');
+   toast.textContent='今日已签到';
+   document.body.appendChild(toast);
+   setTimeout(()=>toast.remove(), 1800);
+   return;
+  }
   try { await fetch('/api/portal/signin', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:m})}); }
   catch(e) { }
  };
@@ -96,7 +104,8 @@ class Context:
 def exercise(chromium, *, diagnose=False, lucky=False, style="direct", gate_status=200,
              authenticated=True, already=False, sign_status=200, sign_code="ok",
              lost_response=False, pending=False, redirect=False, auto_sign=False,
-             save_fails=False, seed=False, conflict_marks_signed=False):
+             save_fails=False, seed=False, conflict_marks_signed=False,
+             client_already=False):
     state = {"sign_calls": 0, "login_calls": 0, "closed": 0, "saved": 0,
              "pending": pending, "auth": authenticated, "gate_calls": 0,
              "cookies_seen": "", "signed": already, "points": 100, "streak": 3}
@@ -140,7 +149,9 @@ def exercise(chromium, *, diagnose=False, lucky=False, style="direct", gate_stat
                     {"code": sign_code, "award": 5, "new_balance": 105,
                      "mode": req.post_data_json.get("mode")}))
         else:
-            html = HTML.replace("STYLE", json.dumps(style)).replace("AUTO_SIGN", json.dumps(auto_sign))
+            html = (HTML.replace("STYLE", json.dumps(style))
+                    .replace("AUTO_SIGN", json.dumps(auto_sign))
+                    .replace("CLIENT_ALREADY", json.dumps(client_already)))
             route.fulfill(status=200, content_type="text/html", body=html)
 
     def launch(**kwargs):
@@ -180,7 +191,14 @@ def test_real_browser_modes(chromium, style, lucky):
     assert result.ok, result.to_dict()
     assert result.code == "signed" and state["sign_calls"] == 1
     assert result.mode == ("lucky" if lucky else "normal")
-    assert result.balance == 105 and result.streak == 4
+    assert result.balance == 105 and result.streak is None
+
+
+def test_real_browser_duplicate_toast_without_post(chromium):
+    result, state = exercise(chromium, client_already=True)
+    assert result.ok and result.already
+    assert result.code == "already_signed"
+    assert state["sign_calls"] == 0
 
 
 def test_real_browser_403_no_login_and_no_retries(chromium):
@@ -216,7 +234,6 @@ def test_real_browser_409_is_not_always_success(chromium):
 def test_real_browser_explicit_already_signed(chromium):
     result, state = exercise(chromium, sign_status=409, sign_code="already_signed")
     assert result.ok and result.already and state["sign_calls"] == 1
-    assert result.streak == 3
 
 
 def test_real_browser_unknown_conflict_not_misclassified(chromium):

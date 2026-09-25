@@ -1,4 +1,4 @@
-"""Dian115Sign 2.0.3: MoviePilot V3 browser-native, fail-closed rewrite.
+"""Dian115Sign 2.0.4: MoviePilot V3 browser-native, fail-closed rewrite.
 
 Independent rewrite maintained by xchenya; original feature reference: JinxJie's
 plugins.v2/dian115sign. This is not an official release from that author.
@@ -49,6 +49,7 @@ class RunData(BaseModel):
     award: float | None = None
     balance: float | None = None
     streak: int | None = None
+    local_streak: int | None = None
     uncertain: bool = False
     submitted: bool = False
     checked_at: str = ""
@@ -69,7 +70,7 @@ class Dian115Sign(_PluginBase):
     plugin_name = "癫影自动签到"
     plugin_desc = "V3 浏览器重写测试版：普通签/运气签、登录会话、登录诊断、错误分类及结果通知。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "2.0.3"
+    plugin_version = "2.0.4"
     plugin_author = "xchenya"
     author_url = "https://github.com/xchenya/MoviePilot-Plugins"
     plugin_config_prefix = "dian115sign_"
@@ -273,6 +274,33 @@ class Dian115Sign(_PluginBase):
             return "+" + text
         return text
 
+    def _update_local_streak(self, result: Outcome, identity: str) -> None:
+        """Maintain plugin-local consecutive days; never present it as site data."""
+        if not identity or not result.ok or result.code not in {"signed", "already_signed"}:
+            return
+        try:
+            today = datetime.fromisoformat(result.date).date()
+        except (TypeError, ValueError):
+            return
+        state = self.get_data("local_streak") or {}
+        count = 1
+        if isinstance(state, dict) and state.get("identity") == identity:
+            try:
+                last = datetime.fromisoformat(str(state.get("last_date") or "")).date()
+                old_count = max(int(state.get("count") or 0), 0)
+                if last == today:
+                    count = max(old_count, 1)
+                elif last == today - timedelta(days=1):
+                    count = old_count + 1
+            except (TypeError, ValueError):
+                count = 1
+        result.local_streak = count
+        self.save_data("local_streak", {
+            "identity": identity,
+            "last_date": result.date,
+            "count": count,
+        })
+
     def _send_result_notification(self, result: Outcome, diagnostic: bool) -> None:
         """Send a status-oriented notification with unambiguous score labels."""
         mode = "运气签" if result.mode == "lucky" else "普通签"
@@ -290,8 +318,8 @@ class Dian115Sign(_PluginBase):
                 f"🔎 状态：{status}",
                 f"📅 日期：{result.date or '未取得'}",
                 f"💰 当前积分：{self._number_text(result.balance)}",
-                f"🔥 连续签到：{self._number_text(result.streak)}"
-                    + (" 天" if result.streak is not None else ""),
+                f"📆 本地连续签到：{self._number_text(result.local_streak)}"
+                    + (" 天" if result.local_streak is not None else ""),
             ]
         elif result.ok and result.already:
             title = "癫影今日已签到"
@@ -299,8 +327,8 @@ class Dian115Sign(_PluginBase):
                 "ℹ️ 状态：今日已签到，无需重复操作",
                 f"📅 日期：{result.date or '未取得'}",
                 f"💰 当前积分：{self._number_text(result.balance)}",
-                f"🔥 连续签到：{self._number_text(result.streak)}"
-                    + (" 天" if result.streak is not None else ""),
+                f"📆 本地连续签到：{self._number_text(result.local_streak)}"
+                    + (" 天" if result.local_streak is not None else ""),
             ]
         elif result.ok:
             title = "癫影签到成功"
@@ -310,8 +338,8 @@ class Dian115Sign(_PluginBase):
                 f"🎯 模式：{mode}",
                 f"🎁 本次积分：{self._number_text(result.award, signed=True)}",
                 f"💰 当前积分：{self._number_text(result.balance)}",
-                f"🔥 连续签到：{self._number_text(result.streak)}"
-                    + (" 天" if result.streak is not None else ""),
+                f"📆 本地连续签到：{self._number_text(result.local_streak)}"
+                    + (" 天" if result.local_streak is not None else ""),
             ]
         else:
             title = "癫影签到失败"
@@ -363,6 +391,7 @@ class Dian115Sign(_PluginBase):
                         already=True,
                         balance=completed.get("balance"),
                         streak=completed.get("streak"),
+                        local_streak=completed.get("local_streak"),
                         checked_at=datetime.now(
                             ZoneInfo(options.timezone)
                         ).isoformat(timespec="seconds"),
@@ -425,6 +454,7 @@ class Dian115Sign(_PluginBase):
                 runner = BrowserRunner(options, launch_browser_context, cancel, load_state,
                                        save_state, pending, mark_pending, proxy)
                 result = runner.run(diagnose=diagnostic)
+                self._update_local_streak(result, identity)
                 with self._state_lock:
                     if current():
                         try:
@@ -438,6 +468,7 @@ class Dian115Sign(_PluginBase):
                                     "identity": identity,
                                     "balance": result.balance,
                                     "streak": result.streak,
+                                    "local_streak": result.local_streak,
                                 })
                             history = self.get_data("run_history") or []
                             history = history if isinstance(history, list) else []
@@ -448,6 +479,10 @@ class Dian115Sign(_PluginBase):
                             logger.warning("癫影：执行结果写入本地缓存失败；不会因此重做签到。")
             except _LocalCompleted as completed:
                 result = completed.outcome
+                try:
+                    self._update_local_streak(result, identity)
+                except Exception:
+                    logger.warning("癫影：本地连续签到统计更新失败。")
             except PortalError as error:
                 result = Outcome(code=error.code, message=str(error))
             except Exception as error:
@@ -500,7 +535,7 @@ class Dian115Sign(_PluginBase):
         code = str(result.get("code") or "not_started")
         ok = bool(result.get("ok"))
         balance = result.get("balance")
-        streak = result.get("streak")
+        streak = result.get("local_streak")
         award = result.get("award")
         checked = str(result.get("checked_at") or "—")
         today_state = (
@@ -521,7 +556,7 @@ class Dian115Sign(_PluginBase):
                  "content": [metric("mdi-wallet-outline", "当前积分",
                                     str(balance if balance is not None else "—"), "info")]},
                 {"component": "VCol", "props": {"cols": 6, "md": 3},
-                 "content": [metric("mdi-fire", "连续签到",
+                 "content": [metric("mdi-fire", "本地连续签到",
                                     f"{streak} 天" if streak is not None else "—", "success")]},
                 {"component": "VCol", "props": {"cols": 6, "md": 3},
                  "content": [metric("mdi-calendar-check", "今日状态", today_state,

@@ -82,6 +82,7 @@ class Outcome:
     award: float | None = None
     balance: float | None = None
     streak: int | None = None
+    local_streak: int | None = None
     uncertain: bool = False
     submitted: bool = False
     checked_at: str = ""
@@ -525,11 +526,29 @@ class BrowserRunner:
         if not user:
             return
         balance = number(user.get("points"))
-        streak = number(user.get("consecutive_signin"))
         if balance is not None:
             outcome.balance = balance
-        if streak is not None:
-            outcome.streak = int(streak)
+
+    def _duplicate_notice_visible(self) -> bool:
+        """Detect the site's floating duplicate-sign-in notice."""
+        pattern = re.compile(r"(?:今日|今天).{0,6}已(?:经)?签到|已(?:经)?签到", re.I)
+        selectors = (
+            '[role="alert"], [role="status"], .toast, .v-snackbar, .van-toast, '
+            '.ant-message, .ant-message-notice, .el-message, '
+            '[class*="toast"], [class*="snackbar"], [class*="message"]'
+        )
+        try:
+            candidates = self.page.locator(selectors)
+            for index in range(min(candidates.count(), 50)):
+                item = candidates.nth(index)
+                if not item.is_visible():
+                    continue
+                text = (item.inner_text() or "").strip()
+                if pattern.search(text):
+                    return True
+        except Exception:
+            return False
+        return False
 
     def _sign(self, outcome: Outcome) -> None:
         """Use the actual UI, observe its response, never replay an uncertain POST."""
@@ -542,9 +561,14 @@ class BrowserRunner:
             button = self._submit_button()
         if button is None:
             raise PortalError("signin_ui_changed", "没有找到唯一签到按钮；请设置模式/提交按钮选择器。")
+        duplicate_before = self._duplicate_notice_visible()
         self._check()
         button.click(timeout=5000)
-        self._wait(0.5)
+        self._wait(0.35)
+        if not duplicate_before and self._duplicate_notice_visible():
+            outcome.ok, outcome.already = True, True
+            outcome.code, outcome.message = "already_signed", "页面提示今日已签到，无需重复提交"
+            return
         # Some sites have a mode selector followed by a separate submit button.
         if mode_button is not None and not self.guard.sent and not self.trace.sign:
             submit = self._submit_button()
@@ -554,6 +578,10 @@ class BrowserRunner:
         stop = min(self.deadline, time.monotonic() + self.options.timeout)
         while self.trace.sign is None and time.monotonic() < stop:
             self._wait()
+            if self._duplicate_notice_visible():
+                outcome.ok, outcome.already = True, True
+                outcome.code, outcome.message = "already_signed", "页面提示今日已签到，无需重复提交"
+                return
             gate = self.trace.gate_error()
             if gate:
                 raise gate
@@ -569,14 +597,17 @@ class BrowserRunner:
         if code in already_codes and status in {200, 400, 409}:
             outcome.ok, outcome.already = True, True
             outcome.code, outcome.message = "already_signed", "站点确认今日已签到"
-            self._apply_account(outcome, self._refresh_account_snapshot())
         elif 200 <= status < 300 and code == "ok":
             if sign.get("mode") not in {None, "", self.options.mode}:
                 raise PortalError("response_mode_mismatch", "站点返回的签到模式不符；请人工核对结果。")
+            before_balance = outcome.balance
+            new_balance = number(sign.get("new_balance"))
             outcome.ok, outcome.code, outcome.message = True, "signed", "站点确认签到成功"
             outcome.award = number(sign.get("award"))
-            outcome.balance = number(sign.get("new_balance"))
-            self._apply_account(outcome, self._refresh_account_snapshot())
+            if outcome.award is None and before_balance is not None and new_balance is not None:
+                outcome.award = new_balance - before_balance
+            if new_balance is not None:
+                outcome.balance = new_balance
         else:
             # Conflict/error wording may drift. Re-check the account state before
             # reporting a failure; last_signin_date is the authoritative duplicate signal.
