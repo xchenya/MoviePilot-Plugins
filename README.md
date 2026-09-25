@@ -1,97 +1,75 @@
 # MoviePilot-Plugins
 
-MoviePilot 官方插件仓库，也是默认插件市场的源码与索引仓库：
-<https://github.com/jxxghp/MoviePilot-Plugins>
+xchenya 的 [MoviePilot](https://github.com/jxxghp/MoviePilot) 第三方插件库。
 
-当前开发目标是 MoviePilot V3。新插件开发者不需要先阅读 V2 文档，也不要在多份
-“适配指南”之间自行拼接流程。
+本仓库基于官方 [jxxghp/MoviePilot-Plugins](https://github.com/jxxghp/MoviePilot-Plugins) 初始化，并参考 [JinxJie/MoviePilot-Plugins](https://github.com/JinxJie/MoviePilot-Plugins) 的个人插件仓库组织方式，仅用于维护本人开发、重构或长期维护的插件。
 
-## 从这里开始
+## 插件列表
 
-### 开发一个新的 V3 插件
+当前仓库已完成初始化，插件将按需加入。
 
-阅读 [MoviePilot 插件开发指南（V3）](./docs/Plugin_Development.md)。这是当前唯一的
-完整主指南，覆盖目录、最小骨架、生命周期、稳定 SDK、配置与数据、V3 数据库事务、
-页面、事件、API、服务、测试和发布。
+| 插件 | 目录 | 版本 | 状态 |
+|---|---|---|---|
+| 暂无 | - | - | 待发布 |
 
-### 把旧插件迁移到 V3
+## 使用方法
 
-先阅读主指南，再查看
-[V2 插件迁移到 V3](./docs/V3_Plugin_Adaptation.md)。迁移专题只讲旧导入兼容、
-数据库事务、媒体身份、音乐链、数据迁移和 V3 合同差异，不再承担从零开发说明。
+### MoviePilot 插件市场
 
-### 维护官方仓库或发布版本
+在 MoviePilot 的第三方插件市场配置中加入本仓库：
 
-查看 [仓库与发布指南](./docs/Repository_Guide.md)，了解索引、版本选择、元数据、
-CI、Release 和跨仓协作边界。
+```text
+https://github.com/xchenya/MoviePilot-Plugins
+```
 
-### 按具体功能查示例
+如通过环境变量配置，可将仓库地址加入 `PLUGIN_MARKET`；多个仓库地址使用逗号分隔。
 
-查看 [常见问题](./docs/FAQ.md)。API 返回与前端调用另见
-[插件 API 专题](./docs/V3_API_Response_Adaptation.md)。
+MoviePilot 插件市场读取仓库的 `main` 分支。
 
-### 仍然维护 V2 插件
-
-[V2 插件开发指南](./docs/V2_Plugin_Development.md) 仅作为历史版本参考。新插件和
-V3 专用实现不要从该文档开始。
-
-## 仓库负责什么
-
-本仓库不是独立运行时：
-
-- `MoviePilot` 负责插件加载、事件分发、API、服务、数据、工作流和 Agent 运行时。
-- `MoviePilot-Frontend` 负责配置页、详情页、仪表板和 Vue 联邦组件渲染。
-- `MoviePilot-Plugins` 负责插件源码、市场索引、图标、测试、文档和发布流程。
-
-## 当前目录
+## 目录结构
 
 ```text
 MoviePilot-Plugins/
-├── plugins.v3/              # 当前 V3 专用插件，新插件放这里
-├── tests/v3/                # V3 插件测试
-├── package.v3.json          # V3 插件市场索引
-├── plugins.v2/              # V2 历史专用实现
-├── package.v2.json          # V2 历史索引
-├── plugins/                 # 更早或跨版本的存量实现
-├── package.json             # 默认历史索引
-├── icons/                   # 插件图标
-├── docs/                    # 开发、迁移、FAQ 和发布文档
-└── .github/                 # CI 与 Release 工作流
+├── plugins/                    # V1 / 历史插件（按需使用）
+├── plugins.v2/                 # MoviePilot V2 插件
+├── plugins.v3/                 # MoviePilot V3 插件
+├── icons/                      # 插件图标
+├── tests/
+│   └── v3/                     # V3 插件测试
+├── docs/                       # 官方开发与迁移文档
+├── scripts/                    # 官方辅助脚本
+├── .github/                    # CI / Release 工作流
+├── package.json                # V1 插件索引
+├── package.v2.json             # V2 插件索引
+├── package.v3.json             # V3 插件索引
+└── README.md
 ```
 
-V3 新插件使用 `plugins.v3/<plugin_id_lower>/`、`tests/v3/<plugin_id_lower>/` 和
-`package.v3.json`。V3 对旧插件的回退加载只用于兼容存量实现，不是新插件继续写入
-旧目录的理由。
+## 开发约定
 
-## 最重要的提交规则
+- V2 插件放在 `plugins.v2/<plugin_id_lower>/`。
+- V3 新插件优先放在 `plugins.v3/<plugin_id_lower>/`。
+- 插件目录名使用插件主类名的小写形式。
+- 插件版本、索引版本及最新更新记录保持一致。
+- V2 插件同步维护 `package.v2.json`；V3 插件同步维护 `package.v3.json`。
+- 图标统一放在 `icons/`，或在插件索引中使用稳定的远程图标地址。
+- V3 测试放在 `tests/v3/<plugin_id_lower>/`。
+- 第三方插件依赖及实现应遵循当前 MoviePilot 对应版本的开发规范。
 
-- 插件目录名必须是插件主类名的小写形式，主类定义在目录的 `__init__.py`。
-- 新增类和方法需要补充说明职责的注释。
-- `plugin_version`、索引 `version` 和最新 `history` 必须一致。
-- 当前版本历史置顶，所有历史按语义版本降序排列。
-- V3 新代码优先使用 `app.sdk`；不要新增对宿主内部目录布局的无必要依赖。
-- 宿主数据通过 Oper、Chain 或稳定 SDK 访问；不要直接操作宿主 Model，也不要自行持有
-  `SessionFactory` 等裸会话工厂。数据库事务装饰器只用于插件自有表。
-- 插件运行数据写入插件数据目录，不要写回源码目录。
-- V3 第三方依赖写入插件 `pyproject.toml`，不提交插件 `uv.lock`；V1/V2 保留 `requirements.txt`。
-- 第三方依赖安装在宿主共享环境，不能降级或覆盖 MoviePilot 核心依赖，也不要由插件直接执行包管理器。
-- 测试放在仓库根 `tests/v3/<plugin_id>/`，不要放进插件源码目录。
-- 提交前运行 Python 编译、版本门禁、相关测试和 `git diff --check`。
+## 开发文档
 
-## 第三方插件仓库
-
-第三方仓库建议 fork 本项目并保留相同目录和索引结构。MoviePilot 插件市场只读取
-GitHub 仓库的 `main` 分支；仓库地址通过 `PLUGIN_MARKET` 配置，多个地址用逗号
-分隔。
-
-请勿开发用于破解 MoviePilot 用户认证，或提供色情、赌博等违法违规内容的插件。
-
-## 常用链接
-
-- [完整 V3 开发指南](./docs/Plugin_Development.md)
-- [V2 插件迁移到 V3](./docs/V3_Plugin_Adaptation.md)
-- [插件 API 专题](./docs/V3_API_Response_Adaptation.md)
+- [V3 插件开发指南](./docs/Plugin_Development.md)
+- [V2 插件开发指南](./docs/V2_Plugin_Development.md)
+- [V2 → V3 迁移指南](./docs/V3_Plugin_Adaptation.md)
 - [仓库与发布指南](./docs/Repository_Guide.md)
-- [FAQ 索引](./docs/FAQ.md)
-- [插件仓测试说明](./tests/README.md)
-- [MoviePilot-Frontend V3 模块联邦指南](https://github.com/jxxghp/MoviePilot-Frontend/blob/v3/docs/module-federation-guide.md)
+- [FAQ](./docs/FAQ.md)
+
+## 说明
+
+本仓库是个人维护的第三方插件仓库，并非 MoviePilot 官方插件市场。插件使用前请阅读对应说明，并根据自己的 MoviePilot 版本确认兼容性。
+
+## 致谢
+
+- [MoviePilot](https://github.com/jxxghp/MoviePilot)
+- [MoviePilot-Plugins](https://github.com/jxxghp/MoviePilot-Plugins)
+- [JinxJie/MoviePilot-Plugins](https://github.com/JinxJie/MoviePilot-Plugins)
