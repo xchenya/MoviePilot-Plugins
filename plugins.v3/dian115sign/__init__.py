@@ -1,4 +1,4 @@
-"""Dian115Sign 2.0.0: MoviePilot V3 browser-native, fail-closed rewrite.
+"""Dian115Sign 2.0.2: MoviePilot V3 browser-native, fail-closed rewrite.
 
 Independent rewrite maintained by xchenya; original feature reference: JinxJie's
 plugins.v2/dian115sign. This is not an official release from that author.
@@ -58,10 +58,10 @@ class RunData(BaseModel):
 class Dian115Sign(_PluginBase):
     """Single-account plugin; use V3 virtual instances for additional accounts."""
 
-    plugin_name = "癫影自动签到（浏览器重写版）"
+    plugin_name = "癫影自动签到"
     plugin_desc = "V3 浏览器重写测试版：普通签/运气签、登录会话、登录诊断、错误分类及结果通知。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "2.0.1"
+    plugin_version = "2.0.2"
     plugin_author = "xchenya"
     author_url = "https://github.com/xchenya/MoviePilot-Plugins"
     plugin_config_prefix = "dian115sign_"
@@ -118,6 +118,10 @@ class Dian115Sign(_PluginBase):
                     kwargs[name] = str(kwargs[name] or "").strip()
                 kwargs["password"] = str(kwargs["password"] or "")
                 kwargs["lucky_mode"] = bool(kwargs["lucky_mode"])
+                # The visible token field accepts a bare token or a complete Cookie string.
+                # If it is filled, it takes precedence over the hidden legacy cookie field.
+                if kwargs["token"]:
+                    kwargs["cookie"] = ""
                 self._options = Options(**kwargs)
             except Exception:
                 self._config_error = "配置无效：请检查五段 Cron、IANA 时区和超时秒数。"

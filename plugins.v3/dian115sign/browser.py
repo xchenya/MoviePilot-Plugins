@@ -360,6 +360,7 @@ class BrowserRunner:
     def _account(self) -> dict[str, Any]:
         """Confirm authentication from /me, not from the unverified JWT payload."""
         stop = min(self.deadline, time.monotonic() + self.options.timeout)
+        ui_probe_at = time.monotonic() + 2
         while time.monotonic() < stop:
             self._check()
             gate = self.trace.gate_error()
@@ -369,9 +370,22 @@ class BrowserRunner:
                 return self.trace.user
             if self.trace.auth_failed or self._password() is not None:
                 break
+            # Some frontend builds reuse cached account state and do not request
+            # /me on every visit. A visible mode-specific sign-in control is enough
+            # to continue, but account statistics remain unknown.
+            if time.monotonic() >= ui_probe_at:
+                try:
+                    if self._sign_button() is not None or self._submit_button() is not None:
+                        self.trace.rows.append({
+                            "path": "browser.ui", "status": 0,
+                            "code": "session_ui_confirmed", "content_type": "other",
+                        })
+                        return {}
+                except PortalError:
+                    pass
             self._wait()
         else:
-            raise PortalError("account_unconfirmed", "未观察到有效账号响应；页面或接口可能变化，请查看诊断记录。")
+            raise PortalError("account_unconfirmed", "未观察到账号接口，也未识别到签到页面；请查看诊断信息。")
         if not (self.options.email and self.options.password):
             raise PortalError("login_required", "站点要求登录；请在插件配置中填入完整 Cookie，或邮箱和密码。")
         if self.trace.human_required:
@@ -400,14 +414,46 @@ class BrowserRunner:
         self._check()
         password.fill(self.options.password)
         self._check()
-        button = (self._one(self.page.locator(self.options.login_selector))
-                  if self.options.login_selector else self._one(self.page.get_by_role(
-                      "button", name=re.compile(r"^\s*(?:登录|登\s+录|立即登录|Login|Sign in)\s*$", re.I))))
+        # Prefer an explicit selector, then discover the submit action inside the
+        # password form. The site has changed button labels before, so login must
+        # not depend on one exact visible string.
+        form = password.locator("xpath=ancestor::form[1]")
+        form = form if form.count() == 1 else None
+        button = None
+        if self.options.login_selector:
+            button = self._one(self.page.locator(self.options.login_selector))
         if button is None:
-            raise PortalError("login_ui_changed", "未找到唯一登录按钮；请设置登录按钮选择器。")
+            scope = form if form is not None else self.page
+            button = self._one(scope.get_by_role(
+                "button", name=re.compile(
+                    r"(?:登录|登\s*录|登入|Login|Log\s*in|Sign\s*in|继续|提交)", re.I)))
+        if button is None and form is not None:
+            button = self._one(form.locator(
+                'button[type="submit"], input[type="submit"]'))
+        if button is None and form is not None:
+            button = self._one(form.locator("button"))
+
         self.trace.auth_failed = False
         self.trace.latest.pop(f"{API}/auth/login", None)
-        button.click(timeout=5000)
+        if button is not None:
+            button.click(timeout=5000)
+        elif form is not None:
+            # requestSubmit() preserves the page's submit event handlers and
+            # validation without guessing a button label.
+            try:
+                form.evaluate("(form) => form.requestSubmit()")
+            except Exception:
+                password.press("Enter")
+        else:
+            # Last safe fallback: submit the already-identified password field.
+            # The outgoing /auth/login POST is still protected by SubmissionGuard.
+            try:
+                password.press("Enter")
+            except Exception:
+                raise PortalError(
+                    "login_ui_changed",
+                    "已识别登录表单，但无法触发提交；请查看诊断信息。"
+                ) from None
         stop = min(self.deadline, time.monotonic() + self.options.timeout)
         while time.monotonic() < stop:
             self._wait()

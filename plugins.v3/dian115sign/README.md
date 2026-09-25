@@ -1,18 +1,18 @@
-# 癫影自动签到（V3 浏览器重写测试版）
+# 癫影自动签到
 
 | 项目 | 内容 |
 | --- | --- |
 | 插件 ID | `Dian115Sign` |
-| 插件版本 | `2.0.1` |
+| 插件版本 | `2.0.2` |
 | 维护者 | [xchenya](https://github.com/xchenya) |
 | 宿主要求 | MoviePilot V3（`>=3.0.0`） |
 | 发布状态 | 测试版；默认仅诊断；未完成真实站点联调 |
 
-**插件版本 2.0.1 不代表支持 MoviePilot V2。** 本版是独立重写，不是 JinxJie 发布的官方更新，也不保证已解决所有 HTTP 403。
+**插件版本 2.0.2 不代表支持 MoviePilot V2。** 本版是独立重写，不是 JinxJie 发布的官方更新，也不保证已解决所有 HTTP 403。
 
 ## 安装
 
-在 MoviePilot 第三方插件市场中添加仓库，刷新插件列表，选择本仓库的“癫影自动签到（浏览器重写版）”：
+在 MoviePilot 第三方插件市场中添加仓库，刷新插件列表，选择本仓库的“癫影自动签到”：
 
 ```text
 https://github.com/xchenya/MoviePilot-Plugins
@@ -25,6 +25,8 @@ https://github.com/xchenya/MoviePilot-Plugins
 手工部署时必须复制整个 `dian115sign` 目录，包括 `__init__.py` 与 `browser.py`。插件不自行安装 Python 包；依赖宿主已有的 SDK、Pydantic、APScheduler 与可用浏览器环境。
 
 ## 功能与变化
+
+**2.0.2 修复：** 登录按钮不再依赖固定文案，按“按钮文本 → submit 控件 → 表单 requestSubmit → Enter”自动提交；配置页删除重复的完整 Cookie 输入框，统一为“Token / Cookie”，并恢复为接近原插件的紧凑卡片布局。
 
 **2.0.1 修复：** 邮箱 + 密码现在可以完全独立登录；升级后若残留无效 Token/Cookie，会忽略旧值继续走网页登录。配置页恢复为卡片双栏布局，详情页恢复为 KPI + 最近执行表格。
 
@@ -43,10 +45,9 @@ HTTP 403 不会直接视为 Token 过期，也不会每分钟循环重试。详�
 | 保存后立即执行一次 | 开启，保存后自动复位 |
 | 运气签 | 关闭，先验证普通签；运气签可能扣分 |
 | 邮箱 / 密码 | 推荐方式，可独立使用，不需要先配置 Token/Cookie |
-| Token / 完整 Cookie | 可选，仅用于复用已有登录态；无效旧值不会阻止邮箱密码登录 |
+| Token / Cookie | 可选；一个字段兼容纯 Token、单个 Cookie 或完整 Cookie；无效值不会阻止邮箱密码登录 |
 | 系统代理 | 按自己的实际网络设置；自定义代理在关闭系统代理后生效 |
 | Cron / 时区 | 默认 `30 9 * * *` / `Asia/Shanghai` |
-| CSS 选择器 | 先留空，仅在页面适配失败时调整 |
 
 查看插件详情页的本地结果：`diagnostic_ok` 仅表示登录与账号读取正常，**不是签到成功**。诊断正常后关闭“仅诊断”，手动执行一次普通签；出现 `signed` 或 `already_signed` 后再开启定时任务。
 

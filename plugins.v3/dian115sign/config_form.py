@@ -5,12 +5,12 @@ from typing import Any
 
 
 def build_form() -> tuple[list[dict], dict[str, Any]]:
-    """Keep everyday settings compact; retain advanced recovery controls."""
+    """Keep the UI close to the original plugin: three compact cards."""
 
     def card(icon: str, color: str, title: str, rows: list[dict]) -> dict:
         return {
             "component": "VCard",
-            "props": {"class": "mt-3", "variant": "tonal"},
+            "props": {"class": "mt-3"},
             "content": [
                 {"component": "VCardTitle", "props": {"class": "d-flex align-center"}, "content": [
                     {"component": "VIcon", "props": {"color": color, "class": "mr-2"}, "text": icon},
@@ -44,26 +44,30 @@ def build_form() -> tuple[list[dict], dict[str, Any]]:
     form = [{
         "component": "VForm",
         "content": [
-            card("mdi-account-key", "primary", "账号与基础设置", [
+            card("mdi-cog", "primary", "基础设置", [
                 row([
-                    col(6, switch("enabled", "启用定时签到", "primary",
-                                  hint="开启后按下方 Cron 自动执行", persistent_hint=True)),
-                    col(6, switch("notify", "签到结果通知", "success",
+                    col(4, switch("enabled", "启用插件", "primary",
+                                  hint="开启后按定时计划自动签到", persistent_hint=True)),
+                    col(4, switch("notify", "签到结果通知", "success",
                                   hint="成功、已签到或失败时发送通知", persistent_hint=True)),
+                    col(4, switch("diagnose_only", "仅诊断", "info",
+                                  hint="只检查登录与账号，不提交签到", persistent_hint=True)),
                 ]),
                 row([
                     col(6, text("email", "登录邮箱", placeholder="you@example.com",
-                                hint="可以只使用邮箱 + 密码，不要求 Token/Cookie",
-                                persistent_hint=True, clearable=True)),
+                                hint="邮箱 + 密码可以独立登录", persistent_hint=True,
+                                clearable=True)),
                     col(6, text("password", "登录密码", type="password",
                                 hint="仅保存在 MoviePilot 插件配置中",
                                 persistent_hint=True, clearable=True)),
                 ]),
                 row([
-                    col(12, text("token", "登录 Token（可选）", type="password",
-                                 placeholder="有邮箱密码时可留空",
-                                 hint="仅用于复用已有登录态；无效旧 Token 不再阻止邮箱密码登录",
-                                 persistent_hint=True, clearable=True)),
+                    col(12, text(
+                        "token", "Token / Cookie（可选）", type="password",
+                        placeholder="纯 Token，或 portal_token=...; __Host-portal_browser=...",
+                        hint="兼容纯 Token、单个 Cookie、完整 Cookie；填写后优先使用，失效时可回退邮箱密码登录",
+                        persistent_hint=True, clearable=True
+                    )),
                 ]),
             ]),
             card("mdi-calendar-check", "success", "签到设置", [
@@ -71,65 +75,39 @@ def build_form() -> tuple[list[dict], dict[str, Any]]:
                     col(4, switch("lucky_mode", "运气签模式", "warning",
                                   hint="关闭为普通签；运气签存在扣分可能",
                                   persistent_hint=True)),
-                    col(4, switch("diagnose_only", "仅诊断", "info",
-                                  hint="只验证登录与账号读取，不提交签到",
-                                  persistent_hint=True)),
                     col(4, text("cron", "定时表达式", placeholder="30 9 * * *",
                                 hint="默认每天 09:30", persistent_hint=True)),
-                ]),
-            ]),
-            card("mdi-earth", "info", "网络设置", [
-                row([
                     col(4, switch("use_system_proxy", "使用系统代理", "info",
-                                  hint="使用 MoviePilot 中配置的代理",
-                                  persistent_hint=True)),
-                    col(8, text("proxy", "自定义代理（可选）",
-                                placeholder="http://10.0.0.2:7890",
-                                hint="关闭系统代理后生效", persistent_hint=True,
-                                clearable=True)),
+                                  hint="使用 MoviePilot 系统代理", persistent_hint=True)),
+                ]),
+                row([
+                    col(12, text("proxy", "自定义代理（可选）",
+                                 placeholder="http://10.0.0.2:7890",
+                                 hint="关闭系统代理后生效", persistent_hint=True,
+                                 clearable=True)),
                 ]),
             ]),
-            card("mdi-flask-outline", "secondary", "测试与恢复", [
+            card("mdi-bug", "info", "调试与恢复", [
                 row([
-                    col(4, switch("onlyonce", "立即执行一次", "info",
-                                  hint="保存后执行一次，随后自动复位",
-                                  persistent_hint=True)),
+                    col(4, switch("onlyonce", "立即运行一次", "info",
+                                  hint="保存后执行一次并自动复位", persistent_hint=True)),
                     col(4, switch("reset_session", "清除浏览器会话", "warning",
-                                  hint="下次重新登录或使用配置中的 Token/Cookie",
-                                  persistent_hint=True)),
+                                  hint="下次重新建立登录态", persistent_hint=True)),
                     col(4, switch("clear_pending", "清除待确认标记", "error",
-                                  hint="仅在已人工核对网站签到状态后使用",
+                                  hint="仅在已人工确认网站签到状态后使用",
                                   persistent_hint=True)),
-                ]),
-            ]),
-            card("mdi-tune-variant", "grey", "高级适配（通常无需修改）", [
-                row([
-                    col(12, text("cookie", "完整 Cookie（可选）", type="password",
-                                 hint="仅在需要复用完整浏览器会话时填写；邮箱+密码可独立使用",
-                                 persistent_hint=True, clearable=True)),
-                ]),
-                row([
-                    col(6, text("timezone", "站点时区", placeholder="Asia/Shanghai")),
-                    col(6, text("timeout", "页面超时（秒）", type="number",
-                                hint="范围 10–60 秒", persistent_hint=True)),
-                ]),
-                row([
-                    col(6, text("normal_selector", "普通签按钮 CSS 选择器")),
-                    col(6, text("lucky_selector", "运气签按钮 CSS 选择器")),
-                ]),
-                row([
-                    col(6, text("submit_selector", "最终提交按钮 CSS 选择器")),
-                    col(6, text("login_selector", "登录按钮 CSS 选择器")),
                 ]),
             ]),
             {"component": "VAlert", "props": {
                 "type": "info", "variant": "tonal", "class": "mt-3",
-                "text": "推荐直接填写邮箱和密码。Token/Cookie 都是可选项；如果旧配置残留无效值，"
-                        "插件会忽略它并继续使用邮箱密码登录。首次建议开启“仅诊断”测试登录。",
+                "text": "推荐填写邮箱和密码；Token / Cookie 是可选加速项。"
+                        "该字段可直接粘贴纯 Token，也可粘贴完整 Cookie。首次建议开启“仅诊断”。",
             }},
         ],
     }]
 
+    # cookie/login_selector and other adaptation keys remain accepted internally
+    # for backward compatibility but are intentionally not exposed in the normal UI.
     return form, {
         "enabled": False,
         "onlyonce": False,

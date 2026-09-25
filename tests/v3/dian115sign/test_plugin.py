@@ -22,6 +22,11 @@ def test_complete_cookie_not_discarded():
     result = seed_cookies("__Host-portal_token=abc.def.ghi; cf_clearance=clear; pref=one")
     assert {c["name"] for c in result} == {"__Host-portal_token", "cf_clearance", "pref"}
 
+
+def test_portal_token_field_accepts_complete_cookie():
+    result = seed_cookies("portal_token=abc.def.ghi; __Host-portal_browser=browser-session")
+    assert {c["name"] for c in result} == {"portal_token", "__Host-portal_browser"}
+
 def test_cookie_attributes_are_not_cookies():
     result = seed_cookies(cookie="a=one; Path=/; Secure; HttpOnly; SameSite=Lax")
     assert [c["name"] for c in result] == ["a"]
@@ -165,6 +170,13 @@ def test_bad_cron_does_not_raise_during_registration():
 def test_defaults_are_diagnostic_and_normal():
     d = Dian115Sign._defaults()
     assert d["diagnose_only"] and not d["lucky_mode"]
+
+
+def test_visible_token_takes_precedence_over_hidden_legacy_cookie():
+    p = Dian115Sign()
+    p.init_plugin({"token": "abc.def.ghi", "cookie": "portal_token=old.value.token"})
+    assert p._options.token == "abc.def.ghi"
+    assert p._options.cookie == ""
 
 
 @pytest.mark.parametrize("text,expected", [
