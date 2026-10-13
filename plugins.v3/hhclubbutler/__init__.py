@@ -26,15 +26,69 @@ from app.sdk._legacy.site import SiteOper
 from app.sdk.services import DownloaderHelper
 from app.sdk.logging import logger
 from app.plugins import _PluginBase
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ConfigDict
 from app.schemas.types import EventType
 from app.sdk.events import eventmanager, Event
 from app.schemas.types import NotificationType
+from fastapi import Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
+from app.adapters.web.security.access import verify_resource_token
 
 import requests
 
-lock = threading.Lock()
+def _require_resource_admin(request: Request, identity=Depends(verify_resource_token)) -> None:
+    """V3 resource Cookie used by independently opened HTML pages.
+
+    MoviePilot issues this short-lived HttpOnly cookie to logged-in users.
+    No global API token is put into links, HTML or JavaScript.
+    """
+    if not getattr(identity, "super_user", False):
+        raise HTTPException(status_code=403, detail="管理员权限不足")
+    if request.method not in {"GET", "HEAD"}:
+        if request.headers.get("X-HHClub-Request") != "1":
+            raise HTTPException(status_code=403, detail="拒绝跨站修改请求")
+
+
+class RescueSeedItem(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    title: str = ""
+    size: float = 0
+    seeders: int = 0
+    seed_id: int | None = None
+    downloader: str = ""
+    hash: str = ""
+
+
+class RescueSeedList(BaseModel):
+    success: bool
+    message: str = ""
+    data: list[RescueSeedItem] | None = None
+
+
+class SettlementRecord(BaseModel):
+    date: str = ""
+    bean: float = 0
+    pt: float = 0
+
+
+class SettlementData(BaseModel):
+    labels: list[str] = Field(default_factory=list)
+    bean: list[float | None] = Field(default_factory=list)
+    pt: list[float | None] = Field(default_factory=list)
+    days: list[int] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+    total_bean: float = 0
+    total_pt: float = 0
+    updated_at: str = ""
+    last_fetch_date: str = ""
+    records_total: int = 0
+    records: list[SettlementRecord] = Field(default_factory=list)
+    fetch_state: str = ""
+    attempt_count: int = 0
+    diag: dict = Field(default_factory=dict)
+    error: str = ""
+
+
 
 
 class ActionResult(BaseModel):
@@ -97,7 +151,7 @@ class HHClubButler(_PluginBase):
     plugin_name = "憨憨保种区管家"
     plugin_desc = "自动优选添加及换种工具\n保种管理器/Hosts加速"
     plugin_icon = "https://raw.githubusercontent.com/xchenya/MoviePilot-Plugins/main/plugins.v3/hhclubbutler/icon.png"
-    plugin_version = "3.0.0"
+    plugin_version = "3.0.1"
     plugin_author = "六个橙子"
     author_url = "https://github.com/SixOrg"
     plugin_config_prefix = "hhclubbutler_"
@@ -133,6 +187,19 @@ class HHClubButler(_PluginBase):
     _overview_hours: float = 6.0
     _overview_thread: Optional[threading.Thread] = None
     _overview_stop: Optional[threading.Event] = None
+
+    def __init__(self):
+        super().__init__()
+        # V3 supports plugin clones: never share execution or refresh state between instances.
+        self._run_lock = threading.Lock()
+        self._enabled = False
+        self._running = False
+        self._last_result = "尚未运行"
+        self._last_overview = None
+        self._last_overview_ts = 0.0
+        self._scheduler = None
+        self._overview_thread = None
+        self._overview_stop = None
 
     def init_plugin(self, config: dict = None):
         self.stop_service()
@@ -171,10 +238,10 @@ class HHClubButler(_PluginBase):
         except (TypeError, ValueError):
             self._auto_clean_days = 0
         self._auto_clean_days = max(0.0, min(365.0, self._auto_clean_days))
-        self._hosts_enabled = bool(config.get("hosts_enabled"))
+        self._hosts_enabled = bool(config.get("hosts_enabled")) and self._enabled
         self._hosts_config = str(config.get("hosts_config") or "").strip()
-        if self._enabled:
-            self._apply_hosts()
+        # Even on disable, remove the hosts block previously installed by this plugin.
+        self._apply_hosts()
         self._overview_hours = 6.0
         if self._enabled:
             self._start_overview_thread()
@@ -232,29 +299,37 @@ class HHClubButler(_PluginBase):
             self.run()
 
     def get_api(self) -> List[Dict[str, Any]]:
-        # 独立 HTML 页面保持原生响应；JSON 接口必须声明具体类型。
+        # 独立窗口不能附加 Bearer header；使用 V3 的 HttpOnly 资源 Cookie。
+        # 这些端点的 allow_anonymous 仅表示由显式 Depends 处理认证，并非公开访问。
+        page_deps = [Depends(_require_resource_admin)]
         return [
-            {"path": "/run", "endpoint": self.api_run, "methods": ["POST"], "auth": "bear",
-             "summary": "立即运行优选", "response_model": ActionResult},
-            {"path": "/result", "endpoint": self.api_result, "methods": ["GET"], "auth": "bear",
-             "summary": "最近运行结果", "response_model": ResultData},
-            {"path": "/refresh_overview", "endpoint": self.api_refresh_overview, "methods": ["POST"],
-             "auth": "bear", "summary": "刷新概况", "response_model": OperationResult},
+            {"path": "/run", "endpoint": self.api_run, "methods": ["POST"],
+             "auth": "bear", "summary": "立即运行优选", "response_model": ActionResult},
+            {"path": "/result", "endpoint": self.api_result, "methods": ["GET"],
+             "auth": "bear", "summary": "最近运行结果", "response_model": ResultData},
+            {"path": "/refresh_overview", "endpoint": self.api_refresh_overview,
+             "methods": ["POST"], "auth": "bear", "summary": "刷新概况",
+             "response_model": OperationResult},
             {"path": "/list_rescue_seeds", "endpoint": self.api_list_rescue_seeds,
-             "methods": ["GET"], "auth": "bear", "summary": "在保种子"},
+             "methods": ["GET"], "allow_anonymous": True, "dependencies": page_deps,
+             "summary": "当前保种种子", "response_model": RescueSeedList},
             {"path": "/delete_rescue_seed", "endpoint": self.api_delete_rescue_seed,
-             "methods": ["POST"], "auth": "bear", "summary": "删除种子及文件",
+             "methods": ["POST"], "allow_anonymous": True, "dependencies": page_deps,
+             "summary": "按下载器与哈希删除任务及文件",
              "response_model": OperationResult},
             {"path": "/rescue_panel", "endpoint": self.api_rescue_panel,
-             "methods": ["GET"], "auth": "bear", "summary": "保种管理页",
-             "response_model": None, "response_class": HTMLResponse,
+             "methods": ["GET"], "allow_anonymous": True, "dependencies": page_deps,
+             "summary": "保种管理器", "response_model": None,
+             "response_class": HTMLResponse,
              "responses": {200: {"content": {"text/html": {"schema": {"type": "string"}}}}}},
             {"path": "/monthly_stats", "endpoint": self.api_monthly_stats,
-             "methods": ["GET"], "auth": "bear", "summary": "结算统计页",
-             "response_model": None, "response_class": HTMLResponse,
+             "methods": ["GET"], "allow_anonymous": True, "dependencies": page_deps,
+             "summary": "结算统计页", "response_model": None,
+             "response_class": HTMLResponse,
              "responses": {200: {"content": {"text/html": {"schema": {"type": "string"}}}}}},
             {"path": "/monthly_stats_data", "endpoint": self.api_monthly_stats_data,
-             "methods": ["GET"], "auth": "bear", "summary": "结算统计数据"},
+             "methods": ["GET"], "allow_anonymous": True, "dependencies": page_deps,
+             "summary": "结算统计数据", "response_model": SettlementData},
         ]
 
     def get_service(self) -> List[Dict[str, Any]]:
@@ -667,7 +742,7 @@ class HHClubButler(_PluginBase):
                                    "events": {"click": {
                                        "api": "plugin/HHClubButler/delete_rescue_seed",
                                        "method": "post",
-                                       "params": {"apikey": settings.API_TOKEN, "title": safe_title}
+                                       "params": {"title": title}
                                    }}}]},
                 ]
             })
@@ -712,8 +787,7 @@ class HHClubButler(_PluginBase):
                                              "prepend-icon": "mdi-refresh"},
                                    "events": {"click": {
                                        "api": "plugin/HHClubButler/refresh_overview",
-                                       "method": "get",
-                                       "params": {"apikey": settings.API_TOKEN}
+                                       "method": "post"
                                    }},
                                    "content": [{"component": "div", "text": "刷新列表"}]}]}
                 ]}
@@ -728,15 +802,15 @@ class HHClubButler(_PluginBase):
             logger.error(f"获取憨憨保种区管家概况失败：{e}")
         panel_link = (
             '<div style="padding:10px 0;display:flex;align-items:center;gap:10px;">'
-            '<a href="/api/v1/plugin/HHClubButler/monthly_stats?apikey=' + getattr(settings, 'API_TOKEN', '') + '" target="_blank" '
+            '<a href="/api/v1/plugin/HHClubButler/monthly_stats" target="_blank" rel="noopener noreferrer" '
             'style="display:inline-flex;align-items:center;gap:6px;padding:7px 18px;background:rgba(66,165,245,.12);'
             'color:#42A5F5;text-decoration:none;border-radius:4px;font-size:13px;font-weight:500;border:1px solid rgba(66,165,245,.3);">'
             '📊 结算统计表</a>'
-            '<a href="/api/v1/plugin/HHClubButler/rescue_panel?apikey=' + getattr(settings, 'API_TOKEN', '') + '" target="_blank"'
+            '<a href="/api/v1/plugin/HHClubButler/rescue_panel" target="_blank" rel="noopener noreferrer" '
             'style="display:inline-flex;align-items:center;gap:6px;padding:7px 18px;background:rgba(66,165,245,.12);'
             'color:#42A5F5;text-decoration:none;border-radius:4px;font-size:13px;font-weight:500;border:1px solid rgba(66,165,245,.3);">'
             '🖥️ 保种管理器</a>'
-            '<span style="font-size:11px;color:rgba(var(--v-theme-on-surface),.45);">独立工作台 · 批量删除 · 搜索· 查看· 档位· 筛选· 列自定义 · 多皮肤等功能</span>'
+            '<span style="font-size:11px;color:rgba(var(--v-theme-on-surface),.45);">独立工作台 · 批量删除 · 搜索 · 筛选</span>'
             '</div>'
         )
         return [{
@@ -752,8 +826,7 @@ class HHClubButler(_PluginBase):
                               + HHClubButler._refresh_note(self._last_overview_ts, self._overview_hours)
                               + '</div>')},
                           {'component': 'div', 'html': '<a style="cursor:pointer;color:#42A5F5;text-decoration:none;white-space:nowrap;">🔄 立即刷新</a>',
-                           'events': {'click': {'api': 'plugin/HHClubButler/refresh_overview', 'method': 'get',
-                                                'params': {'apikey': settings.API_TOKEN}}}}
+                           'events': {'click': {'api': 'plugin/HHClubButler/refresh_overview', 'method': 'post'}}}
                       ]},
                      {'component': 'div', 'html': HHClubButler._overview_html(
                          overview, self._last_overview_ts, self._overview_hours)},
@@ -811,39 +884,38 @@ class HHClubButler(_PluginBase):
 
     def _start_overview_thread(self):
         try:
-            self._overview_stop = threading.Event()
+            stop_event = threading.Event()
+            self._overview_stop = stop_event
             self._overview_thread = threading.Thread(
-                target=self._overview_loop, daemon=True, name="HHClubButler-OverviewRefresh")
+                target=self._overview_loop, args=(stop_event,),
+                daemon=True, name="HHClubButler-OverviewRefresh")
             self._overview_thread.start()
         except Exception as e:
             logger.error(f"启动概况刷新线程失败：{e}")
 
-    def _overview_loop(self):
-        while True:
+    def _overview_loop(self, stop_event: threading.Event):
+        # Use the captured event, not the mutable self._overview_stop.
+        # An old thread cannot accidentally join a newly created loop after reload.
+        while not stop_event.is_set():
             try:
-                if self._overview_stop is None or self._overview_stop.is_set():
-                    return
-                # 结算日志重试驱动（每 5 分钟醒来检查一次，与概况刷新小时配置无关；
-                # _ensure_monthly_stats 内部有当日缓存/重试窗口守卫，未到点或已成功时不会真正请求）
                 try:
                     self._ensure_monthly_stats()
                 except Exception as e:
                     logger.error(f"结算日志重试检查失败：{e}")
+                if stop_event.is_set():
+                    return
                 hours = self._overview_hours
                 if hours > 0:
                     wait = hours * 3600.0 - (time.time() - self._last_overview_ts)
                     if wait <= 0:
                         self._refresh_overview()
                         wait = hours * 3600.0
-                    self._overview_stop.wait(min(wait, 300.0))
+                    stop_event.wait(min(wait, 300.0))
                 else:
-                    self._overview_stop.wait(300)
-            except Exception:
-                try:
-                    if self._overview_stop is not None:
-                        self._overview_stop.wait(300)
-                except Exception:
-                    return
+                    stop_event.wait(300)
+            except Exception as e:
+                logger.error(f"概况刷新线程异常：{e}")
+                stop_event.wait(300)
 
     def _refresh_overview(self, manual: bool = False):
         try:
@@ -856,22 +928,24 @@ class HHClubButler(_PluginBase):
             cur = self._get_current_seeding([])
             if cur.get("error"):
                 logger.warning(f"憨憨保种区管家概况刷新失败（{cur['error']}），保留上次数据")
-                return
+                return False
             if cur.get("degraded"):
                 logger.warning(f"憨憨保种区管家概况刷新失败（{cur['degraded']}），保留上次数据")
-                return
+                return False
             self._last_overview = self._build_overview_from_current(cur)
             self._last_overview_ts = time.time()
             logger.info(f"憨憨保种区管家概况已{'手动' if manual else '自动'}刷新："
                         f"{cur.get('count', 0)} 个 / {cur.get('total_gb', 0.0):.1f} GB"
                         f" / 上次憨豆 {self._last_overview.get('last_bean', '—')}"
                         f" / 上次积分 {self._last_overview.get('last_pt', '—')}")
+            return True
         except Exception as e:
             logger.error(f"概况{'手动' if manual else '自动'}刷新失败：{e}")
+            return False
 
     def _get_overview_cached_or_refresh(self) -> dict:
         try:
-            if (self._last_overview is None
+            if self._enabled and (self._last_overview is None
                     or (self._overview_hours > 0
                         and time.time() - self._last_overview_ts > self._overview_hours * 3600 + 300)):
                 self._refresh_overview()
@@ -884,9 +958,11 @@ class HHClubButler(_PluginBase):
                      "4-5人": {"count": 0, "gb": 0.0}}}
 
     def api_run(self):
-        if self._running:
-            return {"success": False, "result": "憨憨保种区管家正在运行中，请稍候"}
-        threading.Thread(target=self.run, daemon=True).start()
+        if not self._enabled:
+            return {"success": False, "result": "请先启用插件"}
+        if self._running or self._run_lock.locked():
+            return {"success": False, "result": "憨憨保种区管家正在运行中"}
+        threading.Thread(target=self.run, daemon=True, name="HHClubButler-ManualRun").start()
         return {"success": True, "result": "已在后台启动优选，请查看运行日志"}
 
     def api_result(self):
@@ -894,13 +970,13 @@ class HHClubButler(_PluginBase):
 
     def api_refresh_overview(self):
         try:
-            self._refresh_overview(manual=True)
-            if self._last_overview_ts > 0:
-                return {"success": True, "message": "概况已刷新", "data": None}
-            return {"success": False, "message": "概况刷新失败", "data": None}
+            ok = self._refresh_overview(manual=True)
+            return {"success": bool(ok),
+                    "message": "概况已刷新" if ok else "概况刷新失败，已保留上次数据",
+                    "data": None}
         except Exception as e:
             logger.error(f"立即刷新概况失败：{e}")
-            return {"success": False, "message": f"概况刷新失败：{e}", "data": None}
+            return {"success": False, "message": "概况刷新异常，请检查插件日志", "data": None}
 
     def _prefetch_downloader_torrents(self) -> Optional[list]:
         try:
@@ -914,7 +990,7 @@ class HHClubButler(_PluginBase):
         try:
             torrents = self._prefetch_downloader_torrents()
             cur = self._get_current_seeding([], torrents=torrents)
-            if cur.get("degraded"):
+            if cur.get("error") or cur.get("degraded"):
                 return {"success": False, "message": "站点数据获取失败，请稍后重试"}
             seeds = list(cur.get("seeds", []) or [])
             try:
@@ -1028,6 +1104,7 @@ class HHClubButler(_PluginBase):
                     "cur_seeders": int(cur_s) if cur_s is not None else None,
                     "cur_leechers": int(cur_l) if cur_l is not None else None,
                     "tracker": dom,
+                    "hash": str(g(t, "hash", "hashString") or ""),
                     "added": added_str,
                     "progress": progress,
                     "downloader": dl_name,
@@ -1037,12 +1114,12 @@ class HHClubButler(_PluginBase):
         return out
 
     def api_rescue_panel(self):
-        apikey = getattr(settings, "API_TOKEN", "") or ""
-        return HTMLResponse(content=self._build_rescue_panel_html(apikey))
+        return HTMLResponse(
+            content=self._build_rescue_panel_html(),
+            headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
+                     "X-Content-Type-Options": "nosniff", "X-Frame-Options": "SAMEORIGIN"})
 
-    def _build_rescue_panel_html(self, apikey: str) -> str:
-        import json as _json
-        ak = _json.dumps(apikey)
+    def _build_rescue_panel_html(self) -> str:
         html = r"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>保种管理器</title><style>
@@ -1155,7 +1232,6 @@ tr.sel td{background:var(--tr-sel);color:#fff}
 <span>总体积 <b id="totalgb">0</b> GB</span>
 </div>
 <script>
-var APIKEY=__APIKEY__;
 var COLS=[
 {k:"c_sid",t:"种子ID",w:"70",r:1,sortk:"seed_id"},
 {k:"c_name",t:"种子名称",w:"260",sortk:"title"},
@@ -1232,7 +1308,7 @@ html+='<td><a style="color:#ff8080;cursor:pointer;" data-del="'+i+'">删除</a><
 if(!f.length)html='<tr><td colspan="20" style="text-align:center;padding:40px;color:#888">无匹配种子</td></tr>';
 document.getElementById("tbody").innerHTML=html;
 document.querySelectorAll("#tbody input[type=checkbox]").forEach(function(cb){cb.onchange=function(){var i=+this.dataset.idx;var t=filtered[i].title;sel[t]=this.checked;renderFooter()}});
-document.querySelectorAll("#tbody [data-del]").forEach(function(a){a.onclick=function(){delOne(filtered[+this.dataset.del].title)}});
+document.querySelectorAll("#tbody [data-del]").forEach(function(a){a.onclick=function(){delOne(filtered[+this.dataset.del])}});
 renderFooter();
 }
 function renderFooter(){
@@ -1268,27 +1344,42 @@ tick();tmr=setInterval(tick,250);
 var ctl=(typeof AbortController!=="undefined")?new AbortController():null;
 var to=ctl?setTimeout(function(){ctl.abort()},90000):null;
 try{
-var r=await fetch("/api/v1/plugin/HHClubButler/list_rescue_seeds?apikey="+encodeURIComponent(APIKEY),ctl?{signal:ctl.signal}:{});
+var r=await fetch("/api/v1/plugin/HHClubButler/list_rescue_seeds",ctl?{signal:ctl.signal,credentials:"same-origin"}:{credentials:"same-origin"});if(!r.ok)throw Error("HTTP "+r.status);
 if(to)clearTimeout(to);
 var j=await r.json();
 if(!j.success){if(tmr)clearInterval(tmr);showErr(j.message||"数据加载失败");return}
 seeds=j.data||[];doSort();buildDlList();render();if(tmr)clearInterval(tmr);st.style.display="none";
 }catch(e){if(to)clearTimeout(to);if(tmr)clearInterval(tmr);showErr((e&&e.name==="AbortError")?"加载超时，请稍后重试":"请求失败："+e)}}
-async function delOne(title){
-if(!confirm("确认删除种子:\\n"+title+"\\n\\n将同时删除下载器任务和文件!"))return;
-await doDel([title])}
+async function delOne(seed){
+if(!seed.downloader||!seed.hash){alert("无法确定下载器或哈希，已拒绝删除");return;}
+if(!confirm("确认删除种子:\\n"+seed.title+"\\n\\n将同时删除下载器任务和文件!"))return;
+await doDel([seed]);}
 async function delSel(){
-var ts=seeds.filter(function(s){return sel[s.title]}).map(function(s){return s.title});
-if(!ts.length){alert("未选中任何种子");return}
-if(!confirm("确认删除选中的 "+ts.length+" 个种子?\\n将同时删除下载器任务和文件!"))return;
-await doDel(ts)}
-async function doDel(titles){
-var okTitles=[];
-for(var i=0;i<titles.length;i++){
-try{var r=await fetch("/api/v1/plugin/HHClubButler/delete_rescue_seed?apikey="+encodeURIComponent(APIKEY)+"&title="+encodeURIComponent(titles[i]),{method:"POST"});var j=await r.json();if(!j.success)alert("删除失败:"+titles[i]+" -> "+(j.message||""));else{okTitles.push(titles[i])}delete sel[titles[i]]}
-catch(e){alert("删除异常:"+titles[i]+" "+e)}}
-if(okTitles.length){seeds=seeds.filter(function(s){return okTitles.indexOf(s.title)<0});doSort();render();}
+var items=seeds.filter(function(s){return sel[s.title]});
+if(!items.length){alert("未选中任何种子");return;}
+if(items.some(function(s){return !s.downloader||!s.hash;})){
+alert("所选种子含未匹配下载器或哈希的任务，请取消勾选后重试");return;}
+if(!confirm("确认删除选中的 "+items.length+" 个种子?\\n将同时删除下载器任务和文件!"))return;
+await doDel(items);}
+async function doDel(items){
+var removed={};
+for(var i=0;i<items.length;i++){
+var item=items[i],name=item.title||"";
+try{
+var params=new URLSearchParams({title:name,downloader:item.downloader,
+torrent_hash:item.hash,confirm:"true"});
+var r=await fetch("/api/v1/plugin/HHClubButler/delete_rescue_seed?"+params.toString(),
+{method:"POST",credentials:"same-origin",headers:{"X-HHClub-Request":"1"}});
+if(!r.ok)throw Error("HTTP "+r.status);
+var j=await r.json();
+if(!j.success){alert("删除失败："+name+" -> "+(j.message||"未知错误"));}
+else{removed[item.downloader+"|"+item.hash]=1;delete sel[name];}
+}catch(e){alert("删除异常："+name+" "+e);}
 }
+if(Object.keys(removed).length){
+seeds=seeds.filter(function(s){return !removed[(s.downloader||"")+"|"+(s.hash||"")]});
+doSort();render();
+}}
 document.getElementById("btnDel").onclick=delSel;
 document.getElementById("q").oninput=function(){query=this.value.trim().toLowerCase();render()};
 document.querySelectorAll(".topbar .chip").forEach(function(c){c.onclick=function(){document.querySelectorAll(".topbar .chip").forEach(function(x){x.classList.remove("active")});this.classList.add("active");curTier=this.dataset.tier;render()}});
@@ -1331,74 +1422,78 @@ sel.onchange=function(){applyTheme(this.value)};
 document.getElementById("btnExit").onclick=function(){try{window.close()}catch(e){}setTimeout(function(){window.close()},100);if(!window.closed)alert("濡傛湭鑷姩鍏抽棴锛岃鎵嬪姩鍏抽棴鏈爣绛鹃〉")};
 buildHead();load();
 </script></body></html>"""
-        return html.replace("__APIKEY__", ak)
+        return html
 
-    def api_delete_rescue_seed(self, title: str = None):
-        if not title:
-            return {"success": False, "message": "缺少 title 参数"}
-        logger.info(f"手动删除请求：{title}")
+    def api_delete_rescue_seed(self, title: str = "", downloader: str = "",
+                               torrent_hash: str = "", confirm: bool = False):
+        """删除必须以站点真实在保种子、下载器、精确哈希共同确认，拒绝模糊匹配。"""
+        if not self._enabled:
+            return {"success": False, "message": "插件未启用，拒绝删除"}
+        if not (confirm and title and downloader and torrent_hash):
+            return {"success": False, "message": "必须提供 title、downloader、torrent_hash 并确认删除"}
+        normalized = self._norm_title(title)
+        if not normalized or downloader not in self._downloaders:
+            return {"success": False, "message": "下载器或种子名称无效"}
         try:
-            svcs = self._get_manage_services()
-            if not svcs:
-                return {"success": False, "message": "未配置有效下载器"}
-            target_norm = HHClubButler._norm_title(title)
-            for name, sv in svcs.items():
-                try:
-                    torrents, error = sv.instance.get_torrents()
-                    if error:
-                        continue
-                except Exception:
+            current = self._get_current_seeding([])
+            if current.get("error") or current.get("degraded"):
+                return {"success": False, "message": "站点在保数据不完整，已中止删除"}
+            if not any(self._norm_title(seed.get("title") or "") == normalized
+                       for seed in (current.get("seeds") or [])):
+                return {"success": False, "message": "站点当前在保列表中未找到该种子"}
+            service = self._get_manage_services().get(downloader)
+            if not service:
+                return {"success": False, "message": "指定下载器不可用"}
+            torrents, error = service.instance.get_torrents()
+            if error or torrents is None:
+                return {"success": False, "message": "下载器种子列表获取失败"}
+            matched = []
+            for torrent in torrents:
+                name = (torrent.get("name") if isinstance(torrent, dict)
+                        else getattr(torrent, "name", ""))
+                value = (torrent.get("hash") if isinstance(torrent, dict)
+                         else getattr(torrent, "hash", None) or getattr(torrent, "hashString", ""))
+                if self._norm_title(name or "") != normalized or str(value or "").lower() != torrent_hash.lower():
                     continue
-                del_ids = []
-                matched_name = None
-                for t in torrents:
-                    try:
-                        tname = t.get("name") if isinstance(t, dict) else getattr(t, "name", "")
-                        thash = (t.get("hash") if isinstance(t, dict)
-                                 else getattr(t, "hash", None) or getattr(t, "hashString", ""))
-                    except Exception:
-                        continue
-                    if HHClubButler._norm_match(tname, {target_norm}):
-                        del_ids.append(thash)
-                        matched_name = tname
-                if not del_ids:
-                    continue
-                sv.instance.delete_torrents(delete_file=True, ids=del_ids)
-                logger.info(f"已手动删除种子：{matched_name}（{len(del_ids)}个任务，含文件，下载器 {name}）")
-                try:
-                    self._refresh_overview(manual=False)
-                except Exception:
-                    pass
-                return {"success": True, "message": f"已删除：{matched_name or title}"}
-            return {"success": False, "message": f"下载器中未找到匹配种子：{title}"}
+                tracker = self._extract_tracker_text(torrent).lower()
+                if not any(k in tracker for k in ("hhanclub", "hhclub", "hanclub")):
+                    return {"success": False, "message": "无法确认本站 Tracker，拒绝删除文件"}
+                matched.append(value)
+            if len(matched) != 1:
+                return {"success": False, "message": "未找到唯一精确匹配的下载器任务"}
+            service.instance.delete_torrents(delete_file=True, ids=matched)
+            logger.info(f"憨憨保种区管家手动删除：下载器={downloader}，hash={torrent_hash[:8]}…")
+            return {"success": True, "message": f"已删除：{title}"}
         except Exception as e:
             logger.error(f"手动删除种子失败：{e}")
-            return {"success": False, "message": f"删除失败：{e}"}
+            return {"success": False, "message": "删除失败，详见插件日志"}
 
     def run(self):
-        if self._running:
-            logger.info("憨憨保种区管家正在运行中，跳过本次触发")
-            return
-        cookie = self._get_site_cookie()
-        if not cookie:
-            self._last_result = "未获取到站点Cookie"
-            logger.warning(self._last_result)
+        # Per-instance atomic admission; one-shot, cron and API cannot run concurrently.
+        if not self._run_lock.acquire(blocking=False):
+            logger.info("憨憨保种区管家已有任务在运行，跳过重复触发")
             return
         self._running = True
         try:
-            with lock:
+            cookie = self._get_site_cookie()
+            if not cookie:
+                self._last_result = "未获取到站点Cookie"
+                logger.warning(self._last_result)
+                return
+            try:
                 self._do_run()
-        except Exception as e:
-            logger.error(f"憨憨保种区管家运行异常：{e}")
-            self._last_result = f"运行异常：{e}"
-            if self._notify:
-                try:
-                    self.post_message(mtype=NotificationType.Plugin,
-                                      title="【憨憨保种区管家】运行异常", text=str(e))
-                except Exception:
-                    pass
+            except Exception as e:
+                logger.error(f"憨憨保种区管家运行异常：{e}")
+                self._last_result = f"运行异常：{e}"
+                if self._notify:
+                    try:
+                        self.post_message(mtype=NotificationType.Plugin,
+                                          title="【憨憨保种区管家】运行异常", text=str(e))
+                    except Exception:
+                        pass
         finally:
             self._running = False
+            self._run_lock.release()
 
     def _do_run(self):
         logs = []
@@ -2023,8 +2118,10 @@ buildHead();load();
                 "last_fetch_date": data.get("last_fetch_date", "")}
 
     def api_monthly_stats(self):
-        apikey = getattr(settings, "API_TOKEN", "") or ""
-        return HTMLResponse(content=self._build_monthly_stats_html(apikey))
+        return HTMLResponse(
+            content=self._build_monthly_stats_html(),
+            headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
+                     "X-Content-Type-Options": "nosniff", "X-Frame-Options": "SAMEORIGIN"})
 
     def api_monthly_stats_data(self, refresh: int = 0):
         try:
@@ -2061,9 +2158,7 @@ buildHead();load();
             logger.error(f"获取结算统计表数据失败：{e}")
             return {"error": str(e)}
 
-    def _build_monthly_stats_html(self, apikey: str) -> str:
-        import json as _json
-        ak = _json.dumps(apikey)
+    def _build_monthly_stats_html(self) -> str:
         html = r"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>统计结算表</title>
@@ -2152,7 +2247,6 @@ td.pt{color:#38D9FF;font-weight:600}
 </div>
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
 <script>
-var APIKEY=__APIKEY__;
 var data=null,chb=null,chd1=null,chd2=null;
 function esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;")}
 function fmtBig(n){if(n===null||n===undefined)return "—";return Number(n).toLocaleString()}
@@ -2164,8 +2258,8 @@ var t0=Date.now(),tmr=null;
 document.getElementById('status').innerHTML='<span>正在获取每月结算数据，请稍候… <b id="el">0</b> 秒</span><div class="bar"><i></i></div>';
 function tick(){var el=document.getElementById("el");if(el)el.textContent=Math.floor((Date.now()-t0)/1000);}
 tick();tmr=setInterval(tick,250);
-var url='/api/v1/plugin/HHClubButler/monthly_stats_data?apikey='+encodeURIComponent(APIKEY)+(refresh?'&refresh=1':'');
-fetch(url).then(function(r){return r.json();}).then(function(j){
+var url='/api/v1/plugin/HHClubButler/monthly_stats_data'+(refresh?'?refresh=1':'');
+fetch(url,{credentials:'same-origin'}).then(function(r){if(!r.ok)throw Error('HTTP '+r.status);return r.json();}).then(function(j){
 if(j&&j.error){if(tmr)clearInterval(tmr);showErr(j.error);return;}
 data=j;
 var st=document.getElementById('status');if(tmr)clearInterval(tmr);st.style.display='none';
@@ -2233,7 +2327,7 @@ rows+='<tr><td class="d">'+esc(labs[j])+star+'</td><td class="bean">'+fmtBig(v)+
 document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>憨豆</th><th>积分</th><th>累计憨豆</th><th>累计积分</th></tr></thead><tbody>'+rows+'</tbody></table>';
 }
 </script></body></html>"""
-        return html.replace("__APIKEY__", ak)
+        return html
 
     def _fetch_rescue_all(self, logs: list) -> List[dict]:
         seeds = []
@@ -2797,8 +2891,10 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
                          else getattr(t, "hash", None) or getattr(t, "hashString", ""))
             except Exception:
                 continue
-            if HHClubButler._norm_match(tname, del_norms):
-                del_ids.append(thash)
+            if HHClubButler._norm_title(tname) in del_norms and thash:
+                tracker = HHClubButler._extract_tracker_text(t).lower()
+                if any(k in tracker for k in ("hhanclub", "hhclub", "hanclub")):
+                    del_ids.append(thash)
         if del_ids:
             try:
                 sv.instance.delete_torrents(delete_file=True, ids=del_ids)
@@ -2825,8 +2921,7 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
                     continue
                 total += self._do_delete_in_service(sv, sub, logs)
             else:
-                for _, sv in svcs.items():
-                    total += self._do_delete_in_service(sv, sub, logs)
+                logs.append("种子缺少来源下载器，拒绝跨下载器猜测删除")
         if total:
             logs.append(f"删除低档位种子：共 {total} 个")
 
@@ -2887,10 +2982,7 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
                 except Exception:
                     continue
                 is_site = ("hhanclub" in tracker or "hhclub" in tracker or "hanclub" in tracker)
-                if not is_site and site_titles:
-                    n = HHClubButler._norm_title(tname)
-                    if n and n in site_titles:
-                        is_site = True
+                # File deletion must never be inferred from a similar filename.
                 if not is_site:
                     continue
                 try:
