@@ -228,6 +228,7 @@ def test_default_disabled_preserves_clean_task(plugin, monkeypatch):
     monkeypatch.setattr(requests, "get", Mock(return_value=response(text='<div class="inventory-grid"></div>')))
     result = plugin.run_clean_task()
     assert result["data"]["trash"] == 3 and result["data"]["brick"]["message"] == "未开启"
+    assert plugin._stats["clean_result"] == "收集3个垃圾"
     assert post.call_count == 2
 
 

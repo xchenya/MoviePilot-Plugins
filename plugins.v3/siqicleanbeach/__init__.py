@@ -802,7 +802,7 @@ class SiQiCleanBeach(_PluginBase):
             try:
                 total = sum(item.get("count", 0) for item in self._inventory.values())
                 stock = self._inventory.get("砖块", {}).get("count")
-                clean_text = clean.get("message") or f"收集{clean.get('trash', 0)}个垃圾"
+                clean_text = f"收集{clean.get('trash', 0)}个垃圾" if clean.get("success") else clean.get("message", "未执行")
                 brick_text = brick.get("message", "未知")
                 daily = brick.get("daily_bricks")
                 moved = brick.get("bricks_moved", 0)
