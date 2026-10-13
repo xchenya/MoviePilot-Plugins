@@ -33,6 +33,7 @@ from app.schemas.types import NotificationType
 from fastapi import Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from app.adapters.web.security.access import verify_resource_token
+from .matching import associate_rescue_seeds
 
 import requests
 
@@ -56,12 +57,18 @@ class RescueSeedItem(BaseModel):
     seeders: int = 0
     seed_id: int | None = None
     downloader: str = ""
+    downloaders: list[str] = Field(default_factory=list)
+    matched: bool = False
+    match_status: str = "unmatched"
+    match_reason: str = ""
+    can_delete: bool = False
     hash: str = ""
 
 
 class RescueSeedList(BaseModel):
     success: bool
     message: str = ""
+    warning: str = ""
     data: list[RescueSeedItem] | None = None
     loading: bool = False
     elapsed_seconds: int = 0
@@ -155,7 +162,7 @@ class HHClubButler(_PluginBase):
     plugin_name = "憨憨保种区管家"
     plugin_desc = "自动优选添加及换种工具\n保种管理器/Hosts加速"
     plugin_icon = "https://raw.githubusercontent.com/xchenya/MoviePilot-Plugins/main/plugins.v3/hhclubbutler/icon.png"
-    plugin_version = "3.0.3"
+    plugin_version = "3.0.4"
     plugin_author = "六个橙子"
     author_url = "https://github.com/SixOrg"
     plugin_config_prefix = "hhclubbutler_"
@@ -215,6 +222,7 @@ class HHClubButler(_PluginBase):
         self._list_generation = 0
         self._list_thread = None
         self._list_cache_ttl = 180.0
+        self._list_warning = ""
         # Short HTTP requests start/recover a single deletion job by request_id.
         # Never automatically repeat a destructive command when response is lost.
         self._delete_lock = threading.Lock()
@@ -906,6 +914,7 @@ class HHClubButler(_PluginBase):
             self._list_cache = None
             self._list_updated_at = 0.0
             self._list_error = ""
+            self._list_warning = ""
             self._list_thread = None
         try:
             if self._scheduler:
@@ -1040,56 +1049,93 @@ class HHClubButler(_PluginBase):
             return None
 
     def _collect_rescue_seeds(self) -> list[dict]:
-        """Slow read-only snapshot. Never call this from the HTTP request thread."""
-        t0 = time.monotonic()
+        """Complete site rescue inventory, with optional downloader annotations.
+
+        This view must NEVER call _get_current_seeding: that intersection is
+        intentionally reserved for auto-optimization and deletion guards.
+        """
+        started = time.monotonic()
         logs = []
-        # A genuinely empty downloader is not a failed downloader.  Do not
-        # pass None to _get_current_seeding: its legacy fallback would show
-        # every site-completed torrent as if it were still in a downloader.
+        completed = self._fetch_completed(logs)
+        if not completed and any("失败" in line or "未获取到" in line for line in logs):
+            raise RuntimeError("站点完成页抓取失败，拒绝使用不完整列表")
+        logger.info(f"憨憨保种管理器：站点全部可保种记录 {len(completed)} 条，"
+                    f"用时 {time.monotonic()-started:.1f}s")
+        downloader_rows = []
+        warnings = []
         services = self._get_manage_services()
+        requested = set(self._downloaders or [])
+        missing = requested - set(services)
+        if missing:
+            warnings.append("以下已选下载器不可用：" + "、".join(sorted(missing)))
         if not services:
-            raise RuntimeError("未配置可用下载器")
-        torrents = []
+            warnings.append("未选择可用下载器，站点清单仍会完整显示")
         for name, service in services.items():
-            items, error = service.instance.get_torrents()
-            if error or items is None:
-                raise RuntimeError(f"下载器 {name} 读取种子失败")
-            torrents.extend((name, torrent) for torrent in items)
-        logger.info(f"憨憨保种管理器：下载器读取耗时 {time.monotonic() - t0:.1f}s，记录 {len(torrents)}")
-        cur = self._get_current_seeding(logs, torrents=torrents)
-        if cur.get("error") or cur.get("degraded"):
-            raise RuntimeError("站点完成页或下载器数据不完整")
-        logger.info(f"憨憨保种管理器：在保明细获取耗时 {time.monotonic() - t0:.1f}s，记录 {len(cur.get('seeds') or [])}")
-        details = self._get_downloader_detail_map(torrents=torrents)
-        # Exact matching is both linear-time and safer than O(N*M) fuzzy matches:
-        # ambiguous names must not inherit a hash and become deletable.
-        names = {}
-        for _, torrent in (torrents or []):
-            name = torrent.get("name") if isinstance(torrent, dict) else getattr(torrent, "name", "")
-            key = self._norm_title(name or "")
-            if key:
-                names[key] = names.get(key, 0) + 1
-        result = []
-        for item in cur.get("seeds") or []:
-            seed = dict(item)
-            key = self._norm_title(seed.get("title") or "")
-            # A matching completed-page record alone does not prove a torrent
-            # is still in our downloaders. Drop fuzzy-only/stale site matches.
-            if not names.get(key):
-                continue
-            detail = details.get(key) if names.get(key) == 1 else None
-            if detail:
-                for field in ("upspeed", "dlspeed", "eta", "ratio", "path",
-                              "cur_seeders", "cur_leechers", "tracker", "added",
-                              "progress", "hash", "downloader"):
-                    if field in detail:
-                        seed[field] = detail[field]
-            else:
-                seed.pop("hash", None)
-                seed.pop("downloader", None)
-            result.append(seed)
-        logger.info(f"憨憨保种管理器：快照总耗时 {time.monotonic() - t0:.1f}s，记录 {len(result)}")
-        return result
+            try:
+                torrents, error = service.instance.get_torrents()
+                if error or torrents is None:
+                    warnings.append(f"{name} 种子读取失败")
+                    continue
+                try:
+                    dl_type = str(service.config.type or service.type or "")
+                except Exception:
+                    dl_type = ""
+                for torrent in torrents:
+                    def g(*keys):
+                        for key in keys:
+                            try:
+                                value = (torrent.get(key) if isinstance(torrent, dict)
+                                         else getattr(torrent, key, None))
+                                if value is not None:
+                                    return value
+                            except Exception:
+                                pass
+                        return None
+                    label = str(g("name") or "")
+                    if not label:
+                        continue
+                    progress = self._get_progress_ratio(torrent, dl_type)
+                    size_bytes = (g("total_size") or g("totalSize") or g("size"))
+                    try:
+                        size_gb = float(size_bytes) / 1073741824 if size_bytes else None
+                    except (ValueError, TypeError):
+                        size_gb = None
+                    tracker = self._extract_tracker_text(torrent, dl_type)
+                    site_tracker = any(d in tracker.casefold() for d in
+                                       ("hhanclub", "hhancclub", "hhclub", "hanclub"))
+                    parsed_domain = re.search(r"https?://([A-Za-z0-9.:-]+)", tracker)
+                    try:
+                        added = g("added_on", "date_added", "dateAdded")
+                        added_at = (datetime.fromtimestamp(int(added)).strftime("%Y-%m-%d")
+                                    if added and int(added) > 1000000000 else "")
+                    except (TypeError, ValueError, OverflowError, OSError):
+                        added_at = ""
+                    downloader_rows.append({
+                        "name": label, "downloader": name,
+                        "hash": str(g("hash", "hashString") or ""),
+                        "progress": progress, "size_gb": size_gb,
+                        "state": str(g("state", "status") or ""),
+                        "site_tracker": site_tracker,
+                        "upspeed": g("upspeed", "rateUpload", "upload_speed", "uploadRate"),
+                        "dlspeed": g("dlspeed", "rateDownload", "download_speed", "downloadRate"),
+                        "eta": g("eta"), "ratio": g("ratio", "uploadRatio"),
+                        "path": str(g("save_path", "downloadDir", "download_dir",
+                                      "content_path", "path", "dir") or ""),
+                        "cur_seeders": g("num_seeds", "seeds", "seeders", "seederCount"),
+                        "cur_leechers": g("num_leechs", "leechs", "leechers", "leecherCount"),
+                        "tracker": parsed_domain.group(1) if parsed_domain else "",
+                        "added": added_at,
+                    })
+                logger.info(f"憨憨保种管理器：下载器 {name} 读取完成，种子 {len(torrents)} 条")
+            except Exception as e:
+                logger.warning(f"憨憨保种管理器：下载器 {name} 数据解析失败：{e}")
+                warnings.append(f"{name} 数据解析失败")
+        rows, stats = associate_rescue_seeds(completed, downloader_rows)
+        self._list_warning = "；".join(warnings)
+        logger.info(f"憨憨保种管理器：站点 {stats['eligible']} 条 / "
+                    f"已关联 {stats['linked']} 条 / 未匹配 {stats['unmatched']} 条 / "
+                    f"待核对 {stats['ambiguous']} 条；总用时 {time.monotonic()-started:.1f}s")
+        return rows
 
     def _list_rescue_worker(self, generation: int):
         """Update the in-memory snapshot atomically, keeping errors visible."""
@@ -1128,7 +1174,7 @@ class HHClubButler(_PluginBase):
             if (not refresh and self._list_cache is not None
                     and now - self._list_updated_at < self._list_cache_ttl):
                 return {"success": True, "loading": False,
-                        "data": self._list_cache,
+                        "data": self._list_cache, "warning": self._list_warning,
                         "updated_at": datetime.fromtimestamp(
                             self._list_updated_at).strftime("%Y-%m-%d %H:%M:%S")}
             if (not refresh and self._list_state == "error"
@@ -1296,6 +1342,11 @@ tr:hover td{background:var(--tr-hover)}
 tr.sel td{background:var(--tr-sel);color:#fff}
 .tier0{color:#22c55e;font-weight:600}.tier1{color:#4da3ff;font-weight:600}.tier2{color:#ff6b6b;font-weight:600}
 .qual-yes{color:#22c55e}
+.match-hint{font-size:10px;color:var(--muted);opacity:.85;margin-left:4px}
+.match-unmatched{color:var(--muted)}
+.match-ambiguous{color:#e59a32}
+.match-exact{color:#22c55e}
+.match-similar{color:#5aa9ff}
 .right{text-align:right;font-variant-numeric:tabular-nums}
 .hide{display:none !important}
 .footer{background:var(--footer);padding:6px 14px;font-size:11px;color:var(--muted);border-top:1px solid var(--footer-border);display:flex;gap:18px;flex-wrap:wrap}
@@ -1366,6 +1417,10 @@ tr.sel td{background:var(--tr-sel);color:#fff}
 <span>已选 <b id="seln">0</b> 个 / 共 <b id="totaln">0</b> 个</span>
 <span>已选体积 <b id="selgb">0</b> GB</span>
 <span>总体积 <b id="totalgb">0</b> GB</span>
+<span>下载器已关联 <b id="linkedCount">0</b> 个</span>
+<span>未关联 <b id="unlinkedCount">0</b> 个</span>
+<span>待核对 <b id="verifyCount">0</b> 个</span>
+<span title="这里显示憨憨站上全部可保种记录。未匹配下载器不代表站点没有资格；下载器任务删除后仍保留站点记录。">列表来源：憨憨站 · 关联仅供核对</span>
 </div>
 <div class="hh-overlay" id="hhConfirmOverlay" hidden>
   <div class="hh-dialog" role="dialog" aria-modal="true" aria-labelledby="hhConfirmTitle" aria-describedby="hhConfirmDesc">
@@ -1439,12 +1494,20 @@ if(c.k==="c_done_at")return esc(s.completed_at||"-");
 if(c.k==="c_last_settle")return esc(s.last_settle||"-");
 if(c.k==="c_today_hours")return esc(s.today_hours||"-");
 if(c.k==="c_qualified"){var q=s.qualified||"";var ok=(q.indexOf("\u5df2\u8fbe")>=0||q==="\u662f"||q==="Y"||q==="\u2713"||q==="\u2714"||q.indexOf("\u2714")>=0||q.indexOf("OK")>=0);return '<span class="'+(ok?"qual-yes":"")+'">'+esc(q||"-")+"</span>";}
-if(c.k==="c_dl")return esc(s.downloader||"-");
+if(c.k==="c_dl"){
+var names=s.downloaders&&s.downloaders.length?s.downloaders.join(" / "):(s.downloader||"");
+if(!names)return '<span class="match-unmatched" title="'+esc(s.match_reason||"下载器未匹配")+'">未匹配</span>';
+var kind=s.match_status||"";
+var hint=kind==="similar"?"近似":kind==="ambiguous"?"有歧义":
+         kind==="unverified"?"未验证":kind==="downloading"?"下载中":"";
+return '<span class="match-'+esc(kind)+'" title="'+esc(s.match_reason||"")+'">'+esc(names)+'</span>'+
+ (hint?'<span class="match-hint">'+esc(hint)+'</span>':"");
+}
 return "";
 }
 function render(){
 var dlKeys=Object.keys(dlSel);
-var f=seeds.filter(function(s){if(curTier!=="all"&&String(tierOf(s.seeders))!==curTier)return false;if(query&&(s.title||"").toLowerCase().indexOf(query)<0)return false;if(dlKeys.length&&!dlSel[s.downloader||""])return false;return true});
+var f=seeds.filter(function(s){if(curTier!=="all"&&String(tierOf(s.seeders))!==curTier)return false;if(query&&(s.title||"").toLowerCase().indexOf(query)<0)return false;if(dlKeys.length&&!(s.downloaders||[s.downloader||""]).some(function(dl){return !!dlSel[dl]}))return false;return true});
 filtered=f;
 var html="";
 for(var i=0;i<f.length;i++){var s=f[i];var t=tierOf(s.seeders);var seled=!!sel[s.title];
@@ -1452,7 +1515,10 @@ html+='<tr class="'+(seled?"sel":"")+'">';
 html+='<td><input type="checkbox" data-idx="'+i+'" '+(seled?"checked":"")+"></td>";
 for(var j=0;j<COLS.length;j++){var c=COLS[j];if(c.visible===false)continue;
 html+='<td class="'+(c.r?"right ":"")+'" data-col="'+c.k+'">'+cellVal(c,s,t)+"</td>";}
-html+='<td><a style="color:#ff8080;cursor:pointer;" data-del="'+i+'">删除</a></td></tr>';}
+html+='<td>'+(s.can_delete&&s.hash?
+'<a style="color:#ff8080;cursor:pointer;" data-del="'+i+'">删除</a>':
+'<span style="opacity:.4" title="'+esc(s.match_reason||"下载器未验证")+'">仅查看</span>')+
+'</td></tr>';}
 if(!f.length)html='<tr><td colspan="20" style="text-align:center;padding:40px;color:#888">无匹配种子</td></tr>';
 document.getElementById("tbody").innerHTML=html;
 document.querySelectorAll("#tbody input[type=checkbox]").forEach(function(cb){cb.onchange=function(){var i=+this.dataset.idx;var t=filtered[i].title;sel[t]=this.checked;renderFooter()}});
@@ -1463,6 +1529,11 @@ function renderFooter(){
 var sn=0,sgb=0;seeds.forEach(function(s){if(sel[s.title]){sn++;sgb+=+s.size||0}});
 document.getElementById("seln").textContent=sn;document.getElementById("selgb").textContent=sgb.toFixed(1);
 document.getElementById("totaln").textContent=seeds.length;document.getElementById("totalgb").textContent=seeds.reduce(function(a,b){return a+(+b.size||0)},0).toFixed(1);
+var linked=seeds.filter(function(s){return !!s.matched}).length;
+var needsReview=seeds.filter(function(s){return s.match_status==="ambiguous"||s.match_status==="similar"||s.match_status==="unverified"||s.match_status==="downloading"}).length;
+document.getElementById("linkedCount").textContent=linked;
+document.getElementById("unlinkedCount").textContent=seeds.length-linked;
+document.getElementById("verifyCount").textContent=needsReview;
 var c0=0,c1=0,c2=0;seeds.forEach(function(s){var t=tierOf(s.seeders);if(t===0)c0++;else if(t===1)c1++;else c2++});
 document.getElementById("cnt_all").textContent=seeds.length;
 document.getElementById("cnt_t0").textContent=c0;document.getElementById("cnt_t1").textContent=c1;document.getElementById("cnt_t2").textContent=c2;
@@ -1470,7 +1541,7 @@ document.getElementById("cnt_t0").textContent=c0;document.getElementById("cnt_t1
 function updateDlBtn(){var n=Object.keys(dlSel).length;document.getElementById("dlBtn").textContent=n?"筛选下载器("+n+")":"筛选下载器";}
 function buildDlList(all){
 var names={};
-seeds.forEach(function(s){var d=s.downloader||"";if(d)names[d]=1});
+seeds.forEach(function(s){(s.downloaders||[s.downloader||""]).forEach(function(d){if(d)names[d]=1})});
 var list=Object.keys(names).sort();
 if(all){dlSel={};list.forEach(function(n){dlSel[n]=true})}
 var h='';
@@ -1511,7 +1582,9 @@ await new Promise(function(resolve){setTimeout(resolve,Math.max(2000,(j.retry_af
 continue;
 }
 seeds=j.data||[];doSort();buildDlList();render();
-st.style.display="none";return;
+st.style.display="none";
+if(j.warning)showToast("站点可保种列表已加载，但下载器关联可能不全："+j.warning,"warn",12000);
+return;
 }catch(e){
 if(token!==activeLoadId)return;
 showErr((e&&e.name==="AbortError")?"接口响应超时，请检查 MoviePilot 服务":"请求失败："+e);
@@ -1622,7 +1695,7 @@ var job=await pollDeleteStatus(record.id);
 if(job.status==="verified"){
 forgetVerifiedItem(record.item);
 clearPending();
-showToast("已确认删除：" +(record.item.title||"")+"\n列表缓存已失效","good",5000);
+showToast("已确认从下载器删除：" +(record.item.title||"")+"\n站点保种资格仍保留；刷新后可能显示为「未匹配」。","good",7000);
 if(reload)load(true);
 return "verified";
 }
@@ -1643,8 +1716,8 @@ return "unknown";
 }
 async function delOne(seed){
 if(deletionBusy)return;
-if(!seed.downloader||!seed.hash){
-showToast("无法精确确认下载器或种子哈希，已拒绝删除。可以先点击刷新列表。","warn");return;
+if(!seed.can_delete||!seed.downloader||!seed.hash){
+showToast("当前种子未通过下载器、名称及 Tracker 精确核验，不能直接删除文件。","warn");return;
 }
 if(!await openDeleteDialog([seed]))return;
 await doDel([seed]);
@@ -1653,8 +1726,8 @@ async function delSel(){
 if(deletionBusy)return;
 var items=seeds.filter(function(item){return !!sel[item.title]});
 if(!items.length){showToast("请先勾选需要删除的种子。","warn");return;}
-if(items.some(function(item){return !item.downloader||!item.hash})){
-showToast("所选种子有无法确认下载器或哈希的项目，请取消勾选后再试。","warn");return;
+if(items.some(function(item){return !item.can_delete||!item.downloader||!item.hash})){
+showToast("所选种子存在未关联或匹配有歧义的项目，禁止删除，请取消勾选。","warn");return;
 }
 if(!await openDeleteDialog(items))return;
 await doDel(items);
@@ -1767,6 +1840,7 @@ buildHead();load(false);resumePendingDelete();
             self._list_cache = None
             self._list_updated_at = 0.0
             self._list_error = ""
+            self._list_warning = ""
 
     def api_delete_rescue_seed(self, title: str = "", downloader: str = "",
                                torrent_hash: str = "", confirm: bool = False,
@@ -2999,7 +3073,7 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
             return []
         items = []
         session = self._session()
-        url = f"{self._get_site_url()}/userdetails.php?id={uid}&action=7"
+        url = f"{self._get_site_url()}/userdetails.php?action=7&id={uid}"
         max_page = 0
         try:
             r = self._get_with_retry(session, url, timeout=30, retries=2, backoff=(3, 5))
@@ -3019,6 +3093,7 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
             else:
                 logs.append(f"完成页第1页获取失败（已重试）：{e}")
                 return []
+        logger.info(f"憨憨保种管理器：站点完成页 UID={uid}，预计 {max_page + 1} 页")
         for page in range(1, max_page + 1):
             try:
                 r = self._get_with_retry(session, f"{url}&page={page}",
@@ -3030,7 +3105,21 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
                 logs.append("完成页数据不完整，本次刷新作废保留上次数据")
                 return []
             time.sleep(0.5)
-        return items
+
+        # Dynamic pagination can overlap records when the user changes their
+        # rescue status during a crawl. Preserve site identity and dedupe.
+        deduped, seen = [], set()
+        for seed in items:
+            sid = seed.get("seed_id")
+            key = ("id", str(sid)) if sid is not None else (
+                "title", HHClubButler._norm_title(seed.get("title") or ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(seed)
+        logs.append(f"保种完成页共 {max_page + 1} 页，原始记录 {len(items)} 条，"
+                    f"去重后可保种记录 {len(deduped)} 条")
+        return deduped
 
     @staticmethod
     def _norm_title(s) -> str:
@@ -3043,16 +3132,31 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
         items = []
         max_page = 0
         soup = BeautifulSoup(html, "html.parser")
-        m = re.search(r"var\s+maxpage\s*=\s*(\d+)", html)
+        m = re.search(r"(?:var|let|const)\s+maxpage\s*=\s*(\d+)", html, re.I)
         if m:
             max_page = int(m.group(1))
+        # Some site themes omit the old global maxpage variable and render
+        # only clickable pagination links.
+        for a in soup.select('a[href*="page="]'):
+            href = a.get("href") or ""
+            if ("userdetails.php" in href or href.startswith("?")
+                    or href.startswith("&")) and ("action=7" in href or "action=" not in href):
+                page = re.search(r"[?&]page=(\d+)", href)
+                if page:
+                    max_page = max(max_page, int(page.group(1)))
+        if max_page > 500:
+            raise RuntimeError("站点完成页分页超过安全上限，拒绝返回可能不完整的列表")
         table = None
         for tb in soup.find_all("table"):
-            if "种子ID" in tb.get_text() and tb.select("tr.text-center"):
+            header = tb.find("tr")
+            if header and "种子ID" in header.get_text():
                 table = tb
                 break
         if not table:
-            return items, max_page
+            body = soup.get_text(" ", strip=True)
+            if any(token in body for token in ("暂无保种", "没有保种", "无记录")):
+                return items, max_page
+            raise ValueError("未找到站点保种完成页表格，请确认 Cookie/页面未跳转")
         header_tr = table.find("tr")
         headers = [th.get_text(strip=True) for th in header_tr.find_all(["th", "td"])] if header_tr else []
         idx_size = 2
@@ -3062,13 +3166,13 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
                 idx_size = i
             if "初始保种" in h:
                 idx_n = i
-        for tr in table.select("tr.text-center"):
+        for tr in table.find_all("tr"):
             tds = tr.find_all("td")
             if len(tds) <= max(idx_size, idx_n):
                 continue
-            a = tds[idx_n - 1].find("a") if len(tds) > 1 else None
-            if a is None:
-                a = tds[1].find("a")
+            # The torrent title always comes from the second column; the
+            # old idx_n-1 choice could land on the size column.
+            a = tds[1].find("a")
             title = a.get_text(strip=True) if a else tds[1].get_text(strip=True)
             size = size_to_gb(tds[idx_size].get_text(strip=True))
             n_str = tds[idx_n].get_text(strip=True)

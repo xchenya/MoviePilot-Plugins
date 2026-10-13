@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import ast
 import copy
+import re
+import runpy
 import threading
 import time
 from datetime import datetime
@@ -29,7 +31,10 @@ def _method(name: str):
                 and x.name == name)
     module = ast.fix_missing_locations(ast.Module(body=[copy.deepcopy(node)],
                                                  type_ignores=[]))
+    associate = runpy.run_path(str(ROOT / "plugins.v3/hhclubbutler/matching.py"))[
+        "associate_rescue_seeds"]
     namespace = {"time": time, "threading": threading, "datetime": datetime,
+                 "re": re, "associate_rescue_seeds": associate,
                  "logger": SimpleNamespace(info=Mock(), warning=Mock(), error=Mock())}
     exec(compile(module, f"<isolated:{name}>", "exec"), namespace)
     return namespace[name]
@@ -42,7 +47,7 @@ def _fixture():
         _list_state="idle", _list_cache=None,
         _list_updated_at=0.0, _list_started_at=0.0,
         _list_finished_at=0.0, _list_error="", _list_generation=0,
-        _list_thread=None, _list_cache_ttl=180.0,
+        _list_thread=None, _list_cache_ttl=180.0, _list_warning="",
     )
     fake._list_rescue_worker = lambda generation: _method("_list_rescue_worker")(fake, generation)
     return fake
@@ -155,67 +160,92 @@ def test_ui_uses_short_polling_and_detail_page_has_no_blocking_fetch():
     assert "?apikey=" not in code
 
 
-def test_snapshot_matches_exact_names_only_and_avoids_ambiguous_hashes():
-    collect = _method("_collect_rescue_seeds")
-    fake = SimpleNamespace()
-    fake._norm_title = lambda name: name.lower().replace(".", "").strip()
-    fake._get_manage_services = lambda: {
-        "A": SimpleNamespace(instance=SimpleNamespace(get_torrents=lambda: (
-            [{"name": "Same.Title", "hash": "1"},
-             {"name": "Unique.Title", "hash": "3"}], None))),
-        "B": SimpleNamespace(instance=SimpleNamespace(get_torrents=lambda: (
-            [{"name": "Same.Title", "hash": "2"}], None))),
-    }
-    fake._get_current_seeding = lambda logs, torrents: {
-        "seeds": [{"title": "Same.Title"}, {"title": "Unique.Title"},
-                  {"title": "Unique.Title.Extra"}]
-    }
-    fake._get_downloader_detail_map = lambda torrents: {
-        "sametitle": {"hash": "2", "downloader": "B"},
-        "uniquetitle": {"hash": "3", "downloader": "A"},
-    }
-    data = collect(fake)
-    assert "hash" not in data[0]
-    assert data[1]["hash"] == "3" and data[1]["downloader"] == "A"
-    assert len(data) == 2, "fuzzy-only site records must not appear as still seeding"
-    assert all(row["title"] != "Unique.Title.Extra" for row in data)
+def _fake_services(items_by_name):
+    out = {}
+    for name, (items, error) in items_by_name.items():
+        out[name] = SimpleNamespace(
+            type="qbittorrent",
+            config=SimpleNamespace(type="qbittorrent"),
+            instance=SimpleNamespace(get_torrents=lambda values=items, err=error: (values, err)))
+    return out
 
+
+def _site_fixture():
+    fake = SimpleNamespace(
+        _downloaders=["A", "B"], _list_warning="",
+        _fetch_completed=lambda logs: [
+            {"title": "Same.Title", "size": 8.0, "seed_id": 1},
+            {"title": "Unique.Title", "size": 9.0, "seed_id": 2},
+            {"title": "Unique.Title.Extra", "size": 10.0, "seed_id": 3},
+        ],
+        _norm_title=lambda name: str(name).lower().replace(".", ""),
+        _get_progress_ratio=lambda torrent, dltype: 1.0,
+        _extract_tracker_text=lambda torrent, dltype: "https://hhanclub.net/announce",
+    )
+    return fake
+
+
+def test_site_rows_survive_missing_or_ambiguous_downloader_associations():
+    collect = _method("_collect_rescue_seeds")
+    fake = _site_fixture()
+    fake._get_manage_services = lambda: _fake_services({
+        "A": ([{"name": "Same.Title", "hash": "1", "size": 8*1073741824},
+               {"name": "Unique.Title", "hash": "3", "size": 9*1073741824}], False),
+        "B": ([{"name": "Same.Title", "hash": "2", "size": 8*1073741824}], False),
+    })
+    result = collect(fake)
+    assert len(result) == 3
+    assert [x["seed_id"] for x in result] == [1, 2, 3]
+    assert result[0]["match_status"] == "ambiguous"
+    assert result[0]["can_delete"] is False
+    assert result[1]["hash"] == "3" and result[1]["downloader"] == "A"
+    assert result[1]["can_delete"] is True
+    assert result[2]["match_status"] == "unmatched"
+
+
+def test_no_downloaders_still_shows_every_site_eligible_row():
+    collect = _method("_collect_rescue_seeds")
+    fake = _site_fixture()
+    fake._get_manage_services = lambda: {}
+    result = collect(fake)
+    assert len(result) == 3
+    assert not any(s["can_delete"] for s in result)
+    assert "未选择" in fake._list_warning
+
+
+def test_downloader_error_does_not_erase_site_inventory():
+    collect = _method("_collect_rescue_seeds")
+    fake = _site_fixture()
+    fake._get_manage_services = lambda: _fake_services({
+        "A": (None, True), "B": ([], False),
+    })
+    result = collect(fake)
+    assert len(result) == 3
+    assert all(s["match_status"] == "unmatched" for s in result)
+    assert "读取失败" in fake._list_warning
+
+
+def test_unreadable_site_fails_closed_rather_than_reusing_partial_data():
+    collect = _method("_collect_rescue_seeds")
+    fake = _site_fixture()
+    def fails(logs):
+        logs.append("站点完成页第2页获取失败")
+        return []
+    fake._fetch_completed = fails
+    fake._get_manage_services = lambda: {}
+    try:
+        collect(fake)
+    except RuntimeError as error:
+        assert "不完整" in str(error)
+    else:
+        raise AssertionError("the site error was ignored")
 
 def test_market_metadata_marks_patch_release_unpublished():
     import json
     manifest = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))
     entry = manifest["HHClubButler"]
-    assert entry["version"] == "3.0.3"
+    assert entry["version"] == "3.0.4"
     assert entry["release"] is False
-    assert "3.0.3" in entry["history"]
+    assert "3.0.4" in entry["history"]
 
 
-def test_zero_torrents_must_not_become_site_completed_seeds():
-    collect = _method("_collect_rescue_seeds")
-    fake = SimpleNamespace()
-    fake._get_manage_services = lambda: {
-        "QB": SimpleNamespace(instance=SimpleNamespace(
-            get_torrents=lambda: ([], None)))}
-    fake._norm_title = lambda name: str(name).lower()
-    def current(logs, torrents=None):
-        # Old bug: None was mistaken for "all site completed torrents".
-        if torrents is None:
-            return {"seeds": [{"title": "Already.Deleted"}]}
-        return {"seeds": []}
-    fake._get_current_seeding = current
-    fake._get_downloader_detail_map = lambda torrents=None: {}
-    assert collect(fake) == []
-
-
-def test_unavailable_downloader_does_not_report_zero_seeds():
-    collect = _method("_collect_rescue_seeds")
-    fake = SimpleNamespace()
-    fake._get_manage_services = lambda: {
-        "QB": SimpleNamespace(instance=SimpleNamespace(
-            get_torrents=lambda: (None, "connection failed")))}
-    try:
-        collect(fake)
-    except RuntimeError as exc:
-        assert "下载器" in str(exc)
-    else:
-        raise AssertionError("failed downloader must not appear as empty")
