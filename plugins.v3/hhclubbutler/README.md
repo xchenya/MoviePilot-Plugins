@@ -94,4 +94,12 @@ Hosts 加速功能参考了 [jxxghp/MoviePilot-Plugins](https://github.com/jxxgh
 
 ## V3 迁移状态
 
-V3 版本 3.0.0。独立于 V2 代码，使用 V3 市场索引和部分 SDK 出口。**原版前端采用 API Key 拼接进 URL，V3 bearer 授权和跨窗口 HTML 页面可能不兼容，部署前需集成测试。** 此版本标记 `release=false`，暂不建议生产启用换种及删除操作。
+V3 版本 3.0.1。独立于 V2 代码，使用 V3 市场索引和部分 SDK 出口。**已改用 MoviePilot 资源 Cookie 认证独立页面，仍需实际环境联调。** 此版本标记 `release=false`，暂不建议生产启用换种及删除操作。
+
+## V3.0.1 修复说明（需真实宿主验证）
+
+- 两个独立页面使用 MoviePilot V3 登录后提供的 HttpOnly 资源 Cookie；不再把全局 API Token 放进 HTML、URL 或 JavaScript。
+- 需要先在 MoviePilot Web 界面登录，再从插件详情页打开保种管理器或结算统计表。若显示 401，请重新登录 MoviePilot。
+- 手动删除强制同时核对站点在保记录、下载器名称、精确种子哈希和 Tracker，并要求明确确认；无法精确匹配则拒绝删除。
+- 自动清理不再仅凭相似名称判断种子归属。配置停止时还原本插件写入的 Hosts 块。
+- 当前版本仍为验证版（`release=false`），尚未在真实 V3 宿主和下载器做运行联调。首次验证建议使用非生产测试环境并关闭换种与自动清理。
