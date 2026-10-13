@@ -47,7 +47,7 @@
     "name": "思齐自动收垃圾",
     "description": "保留自动收垃圾，新增可选自动搬砖、服务端每日状态与独立结果统计（未经真实联调）。",
     "labels": "站点,自动化,思齐",
-    "version": "2.1.0",
+    "version": "2.1.1",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Moviepilot_A.png",
     "author": "bfjy（V3 适配：xchenya）",
     "author_url": "https://github.com/bfjy2024/MoviePilot-Plugins",
@@ -55,6 +55,7 @@
     "system_version": ">=3.0.0",
     "release": false,
     "history": {
+      "v2.1.1": "恢复浏览器 User-Agent，优先使用站点管理 UA；状态同步独立30秒读取超时及仅查询重试一次；补充请求阶段、耗时和超时类型日志，区分同步失败与搬砖写入不确定。已验证浏览器只读状态同步，未经真实写入及宿主联调。",
       "v2.1.0": "新增默认关闭自动搬砖及1440分钟冷却；服务端每日上限/重置、串行增量校验、超时同步防重复、认证阻断、完整砖块库存与独立统计。Mock验证，未经真实站点及宿主联调。",
       "v2.0.0": "V3 移植：SDK、站点 Oper、请求 TLS 校验、线程独立状态、DOM 库存解析、鉴权 API 和回归测试。",
       "v1.0.0": "原作者 bfjy：思齐沙滩自动收集垃圾，支持定时/立即执行。"

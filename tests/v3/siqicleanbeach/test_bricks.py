@@ -46,6 +46,8 @@ def plugin():
     p._auto_brick = True
     p.update_config = Mock()
     p.post_message = Mock()
+    p._test_logger = ns["logger"]
+    p._test_site_oper = ns["SiteOper"]
     return p
 
 
@@ -291,3 +293,64 @@ def test_legacy_beach_status_json_still_collects(plugin, monkeypatch):
     posts(monkeypatch, response(dict(status="success")), response(dict(status="success", data={"collected": 4})))
     monkeypatch.setattr(requests, "get", Mock(return_value=response(text='<div class="inventory-grid"></div>')))
     assert plugin.run_clean_task()["data"]["trash"] == 4
+
+
+def test_sync_timeout_can_recover_with_one_query_retry(plugin, monkeypatch):
+    post = posts(monkeypatch, requests.ReadTimeout(), response(state(50)))
+    result = move(plugin)
+    assert result["success"] and post.call_count == 2
+    assert all(c.kwargs["data"] == {"action": "sync_game_state"} for c in post.call_args_list)
+    assert time.sleep.call_count == 1
+    assert all(c.kwargs["timeout"] == (10, 30) for c in post.call_args_list)
+
+
+def test_both_sync_timeouts_do_not_send_move_or_mark_uncertain_write(plugin, monkeypatch):
+    post = posts(monkeypatch, requests.ConnectTimeout(), requests.ReadTimeout())
+    result = move(plugin)
+    assert not result["success"] and result["message"] == "搬砖前状态同步超时，未发送搬砖请求"
+    assert post.call_count == 2 and "brick_uncertain_reset" not in plugin._stats
+    logs = str(plugin._test_logger.mock_calls)
+    assert "sync_game_state" in logs and "ReadTimeout" in logs and "耗时" in logs
+    assert "secret-cookie" not in logs
+
+
+def test_write_timeout_only_retries_followup_query(plugin, monkeypatch):
+    post = posts(monkeypatch, response(state()), requests.ReadTimeout(), requests.ReadTimeout(), response(state(8)))
+    result = move(plugin)
+    actions = [c.kwargs["data"]["action"] for c in post.call_args_list]
+    assert actions == ["sync_game_state", "move_brick", "sync_game_state", "sync_game_state"]
+    assert result["bricks_moved"] == 8 and result["recovered_from_sync"]
+    assert post.call_args_list[1].kwargs["timeout"] == (10, 15)
+    assert plugin._stats["brick_uncertain_reset"] == "server-day"
+
+
+def test_failed_followup_query_not_reported_as_synced(plugin, monkeypatch):
+    posts(monkeypatch, response(state()), requests.ReadTimeout(), requests.ReadTimeout(), requests.ReadTimeout())
+    result = move(plugin)
+    assert "状态同步失败" in result["message"] and "结果仍不确定" in result["message"]
+    assert result["bricks_moved"] == 0
+
+
+def test_site_ua_used_for_post_and_inventory(plugin, monkeypatch):
+    plugin._test_site_oper.return_value.get_by_domain.return_value = SimpleNamespace(cookie="c_secure_pass=site-secret", ua="Configured browser UA")
+    real_get_cookie = type(plugin)._SiQiCleanBeach__get_site_cookie.__get__(plugin)
+    assert real_get_cookie() == "c_secure_pass=site-secret"
+    post = posts(monkeypatch, response(state(50)))
+    get = Mock(return_value=response(text='<div class="inventory-grid"></div>'))
+    monkeypatch.setattr(requests, "get", get)
+    move(plugin)
+    plugin._SiQiCleanBeach__fetch_inventory(plugin._cookie)
+    assert post.call_args.kwargs["headers"]["user-agent"] == get.call_args.kwargs["headers"]["user-agent"] == "Configured browser UA"
+
+
+def test_browser_ua_fallback_present_on_post(plugin, monkeypatch):
+    post = posts(monkeypatch, response(state(50)))
+    move(plugin)
+    assert post.call_args.kwargs["headers"]["user-agent"].startswith("Mozilla/5.0")
+
+
+def test_live_browser_state_fixture_passes_validation(plugin):
+    observed = {"success": True, "daily_bricks": 0, "last_brick_time": 0,
+                "last_daily_reset": "2026-10-13", "server_now": 1791884577,
+                "next_brick_reset_ts": 1791907200}
+    assert plugin._SiQiCleanBeach__valid_brick_state(observed, sync=True)

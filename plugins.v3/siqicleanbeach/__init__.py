@@ -38,7 +38,7 @@ class SiQiCleanBeach(_PluginBase):
     plugin_name = "思齐自动收垃圾"
     plugin_desc = "自动清理沙滩，可选自动搬砖，支持Cron和间隔定时；未经真实联调。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Moviepilot_A.png"
-    plugin_version = "2.1.0"
+    plugin_version = "2.1.1"
     plugin_author = "bfjy（V3 适配：xchenya）"
     author_url = "https://bfjy2024.github.io/bfjy"
     plugin_config_prefix = "siqicleanbeach_"
@@ -48,6 +48,7 @@ class SiQiCleanBeach(_PluginBase):
     SITE_DOMAIN = "si-qi.xyz"
     BASE_URL = "https://si-qi.xyz"
     MOWAN_URL = f"{BASE_URL}/mowan.php"
+    USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36 Edg/148.0.0.0"
 
     _enabled = False
     _cookie = ""
@@ -97,6 +98,7 @@ class SiQiCleanBeach(_PluginBase):
         self._lock = threading.Lock()
         self._enabled = False
         self._cookie = ""
+        self._user_agent = self.USER_AGENT
         self._schedule_mode = "interval"
         self._cron = "1 */2 * * *"
         self._interval_minutes = 121
@@ -827,15 +829,20 @@ class SiQiCleanBeach(_PluginBase):
 
     def __request_action(self, cookie: str, action: str) -> Dict[str, Any]:
         """只接受 JSON；不跟随写请求重定向，也不重试写请求。"""
+        started = time.monotonic()
+        logger.info(f"思齐请求开始：action={action}")
         try:
             cookies = self.__cookie_to_dict(cookie)
             response = requests.post(
                 self.MOWAN_URL,
                 headers={"content-type": "application/x-www-form-urlencoded",
+                         "user-agent": self._user_agent, "accept": "application/json",
                          "origin": self.BASE_URL, "referer": self.MOWAN_URL},
-                cookies=cookies, data={"action": action}, timeout=15,
+                cookies=cookies, data={"action": action},
+                timeout=(10, 30 if action == "sync_game_state" else 15),
                 verify=True, allow_redirects=False,
             )
+            logger.info(f"思齐请求结束：action={action}, HTTP {response.status_code}, 耗时{time.monotonic() - started:.2f}秒")
             if response.status_code in {401, 403} or "login" in response.headers.get("Location", "").lower():
                 return {"success": False, "auth_failed": True, "message": "Cookie失效或访问被拒绝"}
             if response.status_code != 200:
@@ -862,11 +869,23 @@ class SiQiCleanBeach(_PluginBase):
                 data["auth_failed"] = bool(re.search(r"登录|cookie.*(?:失效|过期|无效|invalid|expired)|login|unauth|not logged in", message, re.I))
                 data["message"] = message or "服务端业务失败"
             return data
-        except requests.Timeout:
+        except requests.Timeout as exc:
+            logger.warning(f"思齐请求超时：action={action}, 类型={exc.__class__.__name__}, 耗时{time.monotonic() - started:.2f}秒")
             return {"success": False, "timeout": True, "message": "请求超时，操作结果待核对"}
         except (requests.RequestException, ValueError) as exc:
             # 网络异常文本可能带敏感请求信息，只保存异常类型。
             return {"success": False, "message": f"请求失败：{exc.__class__.__name__}"}
+
+    def __sync_game_state(self, cookie: str) -> Dict[str, Any]:
+        # 状态查询可安全重试一次；任何游戏写入请求均不重试。
+        for attempt in range(2):
+            result = self.__request_action(cookie, "sync_game_state")
+            if not result.get("timeout"):
+                return result
+            if attempt == 0:
+                logger.warning("思齐状态同步超时，2秒后仅重试一次状态查询")
+                time.sleep(2)
+        return {**result, "message": "状态同步连续两次超时"}
 
     def __enter_beach(self, cookie: str) -> Dict[str, Any]:
         return self.__request_action(cookie, "enter_beach")
@@ -897,8 +916,10 @@ class SiQiCleanBeach(_PluginBase):
 
     def __move_bricks(self, cookie: str) -> Dict[str, Any]:
         result = {"success": False, "message": "状态同步失败", "bricks_moved": 0}
-        state = self.__request_action(cookie, "sync_game_state")
+        state = self.__sync_game_state(cookie)
         if not state.get("success"):
+            if state.get("timeout"):
+                state["message"] = "搬砖前状态同步超时，未发送搬砖请求"
             return {**result, **state, "bricks_moved": 0}
         if not self.__valid_brick_state(state, sync=True):
             return {**result, "message": "状态同步字段缺失或异常"}
@@ -919,7 +940,7 @@ class SiQiCleanBeach(_PluginBase):
                 time.sleep(2)
             response = self.__request_action(cookie, "move_brick")
             if response.get("timeout"):
-                synced = self.__request_action(cookie, "sync_game_state")
+                synced = self.__sync_game_state(cookie)
                 if synced.get("success") and self.__valid_brick_state(synced, sync=True):
                     if synced["last_daily_reset"] == state["last_daily_reset"] and synced["daily_bricks"] > state["daily_bricks"]:
                         result["bricks_moved"] += synced["daily_bricks"] - state["daily_bricks"]
@@ -928,7 +949,8 @@ class SiQiCleanBeach(_PluginBase):
                     result.update({k: synced[k] for k in ("daily_bricks", "server_now", "last_daily_reset", "next_brick_reset_ts")})
                 self._stats["brick_uncertain_reset"] = result["last_daily_reset"]
                 return {**result, "auth_failed": synced.get("auth_failed", False),
-                        "message": "搬砖超时，已查询状态并停止；本轮不重试，待服务端每日重置"}
+                        "message": ("搬砖超时，状态已同步并停止" if synced.get("success") and self.__valid_brick_state(synced, sync=True)
+                                    else "搬砖超时，后续状态同步失败，结果仍不确定") + "；本轮不重试，待服务端每日重置"}
             if not response.get("success"):
                 # 失败也可能携带当天计数，但不把它算成本次成功增量。
                 if self.__valid_brick_state({**response, "bricks_moved": 0}):
@@ -961,7 +983,7 @@ class SiQiCleanBeach(_PluginBase):
                 self.MOWAN_URL,
                 headers={
                     "accept": "text/html,application/xhtml+xml",
-                    "user-agent": "Mozilla/5.0 (compatible; MoviePilot-SiQiCleanBeach/2.0)",
+                    "user-agent": self._user_agent,
                 },
                 cookies=self.__cookie_to_dict(cookie),
                 timeout=15,
@@ -1011,6 +1033,8 @@ class SiQiCleanBeach(_PluginBase):
         try:
             site_oper = SiteOper()
             site = site_oper.get_by_domain(self.SITE_DOMAIN)
+            ua = getattr(site, "ua", None) if site else None
+            self._user_agent = ua.strip() if isinstance(ua, str) and ua.strip() else self.USER_AGENT
             if site and site.cookie:
                 site_cookie = site.cookie
         except Exception as e:
