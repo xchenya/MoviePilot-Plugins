@@ -162,7 +162,7 @@ class HHClubButler(_PluginBase):
     plugin_name = "憨憨保种区管家"
     plugin_desc = "自动优选添加及换种工具\n保种管理器/Hosts加速"
     plugin_icon = "https://raw.githubusercontent.com/xchenya/MoviePilot-Plugins/main/plugins.v3/hhclubbutler/icon.png"
-    plugin_version = "3.0.5"
+    plugin_version = "3.0.6"
     plugin_author = "六个橙子"
     author_url = "https://github.com/SixOrg"
     plugin_config_prefix = "hhclubbutler_"
@@ -1134,7 +1134,7 @@ class HHClubButler(_PluginBase):
         self._list_warning = "；".join(warnings)
         logger.info(f"憨憨保种管理器：站点 {stats['eligible']} 条 / "
                     f"已关联 {stats['linked']} 条 / 精确 {stats['exact']} 条 / "
-                    f"近似 {stats['similar']} 条 / 未匹配 {stats['unmatched']} 条 / "
+                    f"译名 {stats['translated']} 条 / 近似 {stats['similar']} 条 / 未匹配 {stats['unmatched']} 条 / "
                     f"真正歧义 {stats['ambiguous']} 条 / 可安全删除 {stats['deletable']} 条；"
                     f"总用时 {time.monotonic()-started:.1f}s")
         logger.info(f"憨憨保种管理器：歧义归因（仅计数）："
@@ -1142,7 +1142,8 @@ class HHClubButler(_PluginBase):
                     f"站点同名={stats['ambiguity_duplicate_site_titles']}、"
                     f"近似多重命中={stats['ambiguity_shared_fuzzy']}；"
                     f"跳过下载器重复记录={stats['duplicate_downloader_rows_ignored']}、"
-                    f"阻止近似匹配占用精确任务={stats['fuzzy_exact_claims_blocked']}")
+                    f"阻止模糊占用强匹配任务={stats['fuzzy_exact_claims_blocked']}、"
+                    f"译名完整后缀匹配={stats['translation_suffix_claims']}")
         return rows
 
     def _list_rescue_worker(self, generation: int):
@@ -1355,6 +1356,7 @@ tr.sel td{background:var(--tr-sel);color:#fff}
 .match-ambiguous{color:#e59a32}
 .match-exact{color:#22c55e}
 .match-similar{color:#5aa9ff}
+.match-translated{color:#1cba96;font-weight:600}
 .right{text-align:right;font-variant-numeric:tabular-nums}
 .hide{display:none !important}
 .footer{background:var(--footer);padding:6px 14px;font-size:11px;color:var(--muted);border-top:1px solid var(--footer-border);display:flex;gap:18px;flex-wrap:wrap}
@@ -1426,6 +1428,7 @@ tr.sel td{background:var(--tr-sel);color:#fff}
 <span>已选体积 <b id="selgb">0</b> GB</span>
 <span>总体积 <b id="totalgb">0</b> GB</span>
 <span>下载器已关联 <b id="linkedCount">0</b> 个</span>
+<span>译名匹配 <b id="translatedCount">0</b> 个（仅查看）</span>
 <span>未关联 <b id="unlinkedCount">0</b> 个</span>
 <span>待核对 <b id="verifyCount">0</b> 个</span>
 <span title="这里显示憨憨站上全部可保种记录。未匹配下载器不代表站点没有资格；下载器任务删除后仍保留站点记录。">列表来源：憨憨站 · 关联仅供核对</span>
@@ -1506,7 +1509,7 @@ if(c.k==="c_dl"){
 var names=s.downloaders&&s.downloaders.length?s.downloaders.join(" / "):(s.downloader||"");
 if(!names)return '<span class="match-unmatched" title="'+esc(s.match_reason||"下载器未匹配")+'">未匹配</span>';
 var kind=s.match_status||"";
-var hint=kind==="similar"?"近似":kind==="ambiguous"?"有歧义":
+var hint=kind==="translated"?"译名匹配":kind==="similar"?"近似":kind==="ambiguous"?"有歧义":
          kind==="unverified"?"未验证":kind==="downloading"?"下载中":"";
 return '<span class="match-'+esc(kind)+'" title="'+esc(s.match_reason||"")+'">'+esc(names)+'</span>'+
  (hint?'<span class="match-hint">'+esc(hint)+'</span>':"");
@@ -1539,7 +1542,9 @@ document.getElementById("seln").textContent=sn;document.getElementById("selgb").
 document.getElementById("totaln").textContent=seeds.length;document.getElementById("totalgb").textContent=seeds.reduce(function(a,b){return a+(+b.size||0)},0).toFixed(1);
 var linked=seeds.filter(function(s){return !!s.matched}).length;
 var needsReview=seeds.filter(function(s){return s.match_status==="ambiguous"||s.match_status==="similar"||s.match_status==="unverified"||s.match_status==="downloading"}).length;
+var translated=seeds.filter(function(s){return s.match_status==="translated"}).length;
 document.getElementById("linkedCount").textContent=linked;
+document.getElementById("translatedCount").textContent=translated;
 document.getElementById("unlinkedCount").textContent=seeds.length-linked;
 document.getElementById("verifyCount").textContent=needsReview;
 var c0=0,c1=0,c2=0;seeds.forEach(function(s){var t=tierOf(s.seeders);if(t===0)c0++;else if(t===1)c1++;else c2++});
