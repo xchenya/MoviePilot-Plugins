@@ -81,7 +81,7 @@ def test_v3_metadata_and_source_license():
     }
     market = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))
     entry = market["SiQiCleanBeach"]
-    assert attrs["plugin_version"] == entry["version"] == "2.1.0"
+    assert attrs["plugin_version"] == entry["version"] == "2.1.1"
     assert entry["system_version"] == ">=3.0.0"
     assert entry["release"] is False
     assert attrs["plugin_author"].startswith("bfjy")
@@ -125,6 +125,7 @@ def test_nested_html_inventory_parsing(monkeypatch):
     plugin = cls()
     plugin.MOWAN_URL = "https://si-qi.xyz/mowan.php"
     plugin.ITEM_ICONS = {}
+    plugin._user_agent = "fixture-browser"
     response = SimpleNamespace(status_code=200, text="""
         <div class="inventory-grid">
           <div class="inventory-item"><div class="wrapper">
@@ -156,6 +157,7 @@ def test_unknown_inventory_markup_keeps_cache(monkeypatch):
     p = cls()
     p.MOWAN_URL = "https://si-qi.xyz/mowan.php"
     p.ITEM_ICONS = {}
+    p._user_agent = "fixture-browser"
     monkeypatch.setattr(
         requests, "get", lambda *args, **kwargs: SimpleNamespace(status_code=200, text="<h1>页面升级</h1>")
     )
