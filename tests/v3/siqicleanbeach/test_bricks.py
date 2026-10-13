@@ -20,6 +20,11 @@ from .test_plugin import CODE, _plugin_class
 def no_network(monkeypatch):
     monkeypatch.setattr(requests.sessions.Session, "request", Mock(side_effect=AssertionError("Live network forbidden")))
     monkeypatch.setattr(time, "sleep", Mock())
+    # Session mock forwards to each test's mocked transport, never real network.
+    def session():
+        return SimpleNamespace(post=lambda *a, **kw: requests.post(*a, **kw),
+                               get=lambda *a, **kw: requests.get(*a, **kw), close=Mock())
+    monkeypatch.setattr(requests, "Session", Mock(side_effect=session))
 
 
 @pytest.fixture
@@ -320,7 +325,7 @@ def test_write_timeout_only_retries_followup_query(plugin, monkeypatch):
     actions = [c.kwargs["data"]["action"] for c in post.call_args_list]
     assert actions == ["sync_game_state", "move_brick", "sync_game_state", "sync_game_state"]
     assert result["bricks_moved"] == 8 and result["recovered_from_sync"]
-    assert post.call_args_list[1].kwargs["timeout"] == (10, 15)
+    assert post.call_args_list[1].kwargs["timeout"] == (10, 30)
     assert plugin._stats["brick_uncertain_reset"] == "server-day"
 
 
@@ -354,3 +359,39 @@ def test_live_browser_state_fixture_passes_validation(plugin):
                 "last_daily_reset": "2026-10-13", "server_now": 1791884577,
                 "next_brick_reset_ts": 1791907200}
     assert plugin._SiQiCleanBeach__valid_brick_state(observed, sync=True)
+
+
+def test_whole_task_uses_one_session_for_clean_sync_moves_and_inventory(plugin, monkeypatch):
+    session = Mock()
+    session.post.side_effect = [response(dict(success=True)), response(dict(success=True, collected=2)),
+                                response(state(48)), response(state(49, 1)), response(state(50, 1))]
+    session.get.return_value = response(text='<div class="inventory-grid"></div>')
+    create = Mock(return_value=session)
+    monkeypatch.setattr(requests, "Session", create)
+    monkeypatch.setattr(requests, "post", Mock(side_effect=AssertionError("Must use task session")))
+    monkeypatch.setattr(requests, "get", Mock(side_effect=AssertionError("Must use task session")))
+    result = plugin.run_clean_task()
+    assert result["status"] == "completed" and result["data"]["brick"]["bricks_moved"] == 2
+    create.assert_called_once_with()
+    assert session.post.call_count == 5 and session.get.call_count == 1
+    assert all(c.kwargs["timeout"] == (10, 30) for c in session.post.call_args_list)
+    assert session.get.call_args.kwargs["timeout"] == (10, 30)
+    session.close.assert_called_once_with()
+    assert plugin._session is None and not plugin._lock.locked()
+
+
+def test_session_closed_and_lock_released_after_transport_failure(plugin, monkeypatch):
+    session = Mock()
+    session.post.side_effect = RuntimeError("secret-cookie")
+    monkeypatch.setattr(requests, "Session", Mock(return_value=session))
+    result = plugin.run_clean_task()
+    assert result["status"] == "error"
+    session.close.assert_called_once_with()
+    assert plugin._session is None and not plugin._lock.locked()
+    assert "secret-cookie" not in str(plugin._test_logger.mock_calls)
+
+
+def test_missing_cookie_never_opens_session(plugin):
+    plugin._cookie = ""
+    assert plugin.run_clean_task()["status"] == "auth_failed"
+    requests.Session.assert_not_called()
