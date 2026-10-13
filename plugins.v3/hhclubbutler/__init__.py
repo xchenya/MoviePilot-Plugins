@@ -162,7 +162,7 @@ class HHClubButler(_PluginBase):
     plugin_name = "憨憨保种区管家"
     plugin_desc = "自动优选添加及换种工具\n保种管理器/Hosts加速"
     plugin_icon = "https://raw.githubusercontent.com/xchenya/MoviePilot-Plugins/main/plugins.v3/hhclubbutler/icon.png"
-    plugin_version = "3.0.4"
+    plugin_version = "3.0.5"
     plugin_author = "六个橙子"
     author_url = "https://github.com/SixOrg"
     plugin_config_prefix = "hhclubbutler_"
@@ -1133,8 +1133,16 @@ class HHClubButler(_PluginBase):
         rows, stats = associate_rescue_seeds(completed, downloader_rows)
         self._list_warning = "；".join(warnings)
         logger.info(f"憨憨保种管理器：站点 {stats['eligible']} 条 / "
-                    f"已关联 {stats['linked']} 条 / 未匹配 {stats['unmatched']} 条 / "
-                    f"待核对 {stats['ambiguous']} 条；总用时 {time.monotonic()-started:.1f}s")
+                    f"已关联 {stats['linked']} 条 / 精确 {stats['exact']} 条 / "
+                    f"近似 {stats['similar']} 条 / 未匹配 {stats['unmatched']} 条 / "
+                    f"真正歧义 {stats['ambiguous']} 条 / 可安全删除 {stats['deletable']} 条；"
+                    f"总用时 {time.monotonic()-started:.1f}s")
+        logger.info(f"憨憨保种管理器：歧义归因（仅计数）："
+                    f"多下载任务={stats['ambiguity_multiple_tasks']}、"
+                    f"站点同名={stats['ambiguity_duplicate_site_titles']}、"
+                    f"近似多重命中={stats['ambiguity_shared_fuzzy']}；"
+                    f"跳过下载器重复记录={stats['duplicate_downloader_rows_ignored']}、"
+                    f"阻止近似匹配占用精确任务={stats['fuzzy_exact_claims_blocked']}")
         return rows
 
     def _list_rescue_worker(self, generation: int):

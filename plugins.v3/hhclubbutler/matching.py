@@ -92,91 +92,168 @@ def associate_rescue_seeds(
     site_seeds: list[dict[str, Any]],
     downloader_torrents: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Retain ALL site rows; annotate unique trustworthy downloader associations.
+    """Preserve site inventory and resolve downloader ownership safely.
 
-    Complexity is near-linear for exact matches.  A token/prefix inverted index
-    limits bounded fuzzy comparisons; no quadratic full-catalog scan is used.
+    Exact canonical title matches have precedence over fuzzy matches. A
+    downloader task used by an exact match is never borrowed as a fuzzy
+    candidate for another site row. Repeated copies of the SAME downloader
+    hash are collapsed, but distinct hashes/downloaders stay distinct.
     """
+    # Some downloader helpers may return repeated representations of the same
+    # torrent. They are not separate deletion targets; do not manufacture
+    # ambiguity from identical (downloader, hash, name) records.
+    torrents: list[dict[str, Any]] = []
+    seen_tasks: set[tuple[str, str, str]] = set()
+    duplicates_ignored = 0
+    for raw in downloader_torrents:
+        label = str(raw.get("downloader") or "").strip()
+        name_key = normalize_name(raw.get("name"))
+        info_hash = str(raw.get("hash") or "").strip().lower()
+        key = (label.casefold(), info_hash, name_key)
+        if label and info_hash and name_key and key in seen_tasks:
+            duplicates_ignored += 1
+            continue
+        if label and info_hash and name_key:
+            seen_tasks.add(key)
+        torrents.append(raw)
+
     by_exact: dict[str, list[int]] = defaultdict(list)
     by_prefix: dict[str, list[int]] = defaultdict(list)
     by_token: dict[str, list[int]] = defaultdict(list)
     counts: Counter = Counter()
     site_names = Counter(normalize_name(x.get("title")) for x in site_seeds)
 
-    for index, torrent in enumerate(downloader_torrents):
+    for index, torrent in enumerate(torrents):
         canon = normalize_name(torrent.get("name"))
         if not canon:
             continue
         by_exact[canon].append(index)
         if len(canon) >= 12:
             by_prefix[canon[:12]].append(index)
-        ts = _tokens(torrent.get("name"))
-        for token in ts:
+        for token in _tokens(torrent.get("name")):
             by_token[token].append(index)
             counts[token] += 1
 
-    entries: list[dict[str, Any]] = []
-    matches: list[list[tuple[int, str, float]]] = []
+    # First pass: reserve exact downloader tasks, regardless of whether the
+    # eventual site row is itself ambiguous (e.g. duplicate site titles).
+    exact_groups: list[list[tuple[int, str, float]]] = []
+    exact_reserved: set[int] = set()
+    exact_site_owners: Counter = Counter()
     for site in site_seeds:
+        canon = normalize_name(site.get("title"))
+        original = str(site.get("title") or "")
+        group: list[tuple[int, str, float]] = []
+        for index in by_exact.get(canon, ()):
+            hit = _match_record(site, torrents[index], original, canon, True)
+            if hit:
+                group.append((index, "exact", hit[1]))
+                exact_reserved.add(index)
+                exact_site_owners[index] += 1
+        exact_groups.append(group)
+
+    # Second pass: fuzzy suggestions are only allowed to use unclaimed tasks.
+    # A weaker suggestion must never make a correct exact match "ambiguous".
+    matches: list[list[tuple[int, str, float]]] = []
+    fuzzy_shared: Counter = Counter()
+    fuzzy_skipped_reserved = 0
+    for site, exact_group in zip(site_seeds, exact_groups):
+        if exact_group:
+            matches.append(exact_group)
+            continue
+        canon = normalize_name(site.get("title"))
+        original = str(site.get("title") or "")
+        candidates = _candidate_indices(site, by_prefix, by_token, counts)
+        scored = []
+        for index in candidates:
+            if index in exact_reserved:
+                fuzzy_skipped_reserved += 1
+                continue
+            hit = _match_record(site, torrents[index], original, canon, False)
+            if hit:
+                scored.append((index, hit[0], hit[1]))
+        selected = []
+        if scored:
+            scored.sort(key=lambda x: x[2], reverse=True)
+            top = scored[0][2]
+            selected = [hit for hit in scored if hit[2] >= top - 0.035]
+        matches.append(selected)
+        fuzzy_shared.update(index for index, _, _ in selected)
+
+    entries: list[dict[str, Any]] = []
+    stats = {
+        "eligible": len(site_seeds), "linked": 0, "exact": 0,
+        "similar": 0, "ambiguous": 0, "unmatched": 0,
+        "deletable": 0,
+        "ambiguity_multiple_tasks": 0,
+        "ambiguity_duplicate_site_titles": 0,
+        "ambiguity_shared_fuzzy": 0,
+        "duplicate_downloader_rows_ignored": duplicates_ignored,
+        "fuzzy_exact_claims_blocked": fuzzy_skipped_reserved,
+    }
+    for site, group in zip(site_seeds, matches):
         item = dict(site)
-        # Site identity and eligibility do not depend on the downloader.
+        # An unlinked site record remains part of the full eligible inventory.
         item.update({
             "downloader": "", "downloaders": [], "hash": "",
             "match_status": "unmatched", "match_reason": "下载器中暂未匹配",
             "can_delete": False, "matched": False,
         })
         entries.append(item)
-        original = str(site.get("title") or "")
-        canon = normalize_name(original)
-        selected: list[tuple[int, str, float]] = []
-        exact = by_exact.get(canon, ())
-        if exact:
-            for index in exact:
-                match = _match_record(site, downloader_torrents[index], original, canon, True)
-                if match:
-                    selected.append((index, match[0], match[1]))
-        else:
-            candidates = _candidate_indices(site, by_prefix, by_token, counts)
-            scored = []
-            for index in candidates:
-                match = _match_record(site, downloader_torrents[index], original, canon, False)
-                if match:
-                    scored.append((index, match[0], match[1]))
-            if scored:
-                scored.sort(key=lambda x: x[2], reverse=True)
-                top = scored[0][2]
-                selected = [x for x in scored if x[2] >= top - 0.035]
-        matches.append(selected)
-
-    # Never assign a downloader hash ambiguously to two different site rows.
-    reverse = Counter(index for group in matches for index, _, _ in group)
-    stats = {"eligible": len(entries), "linked": 0, "exact": 0,
-             "similar": 0, "ambiguous": 0, "unmatched": 0,
-             "deletable": 0}
-    for item, group in zip(entries, matches):
         if not group:
             stats["unmatched"] += 1
             continue
-        unique = {(downloader_torrents[index].get("downloader") or "").strip()
-                  for index, _, _ in group}
+
+        unique = {
+            str(torrents[index].get("downloader") or "").strip()
+            for index, _, _ in group
+        }
         item["downloaders"] = sorted(x for x in unique if x)
         item["downloader"] = " / ".join(item["downloaders"])
         item["matched"] = True
         stats["linked"] += 1
-        if len(group) != 1 or any(reverse[index] > 1 for index, _, _ in group) \
-                or site_names[normalize_name(item.get("title"))] != 1:
+
+        norm = normalize_name(item.get("title"))
+        if site_names[norm] > 1:
             item["match_status"] = "ambiguous"
-            item["match_reason"] = "多个候选下载器任务或站点记录，禁止直接删除"
+            item["match_reason"] = "站点存在不同种子ID但名称相同，无法确定删除对象"
             stats["ambiguous"] += 1
+            stats["ambiguity_duplicate_site_titles"] += 1
             continue
+        if len(group) > 1:
+            item["match_status"] = "ambiguous"
+            item["match_reason"] = (
+                "多个下载器中存在同名任务，无法自动选择删除目标"
+                if len(item["downloaders"]) > 1
+                else "同一下载器有多个不同哈希的同名任务，需人工核对"
+            )
+            stats["ambiguous"] += 1
+            stats["ambiguity_multiple_tasks"] += 1
+            continue
+
         index, match_type, _ = group[0]
-        torrent = downloader_torrents[index]
+        if (match_type == "exact" and exact_site_owners[index] > 1):
+            item["match_status"] = "ambiguous"
+            item["match_reason"] = "同一下载任务被多个站点条目精确命中"
+            stats["ambiguous"] += 1
+            stats["ambiguity_duplicate_site_titles"] += 1
+            continue
+        if (match_type == "similar" and fuzzy_shared[index] > 1):
+            item["match_status"] = "ambiguous"
+            item["match_reason"] = "多个站点条目近似匹配同一下载任务，未能唯一关联"
+            stats["ambiguous"] += 1
+            stats["ambiguity_shared_fuzzy"] += 1
+            continue
+
+        torrent = torrents[index]
         item["match_status"] = match_type
         stats[match_type] += 1
-        for field in ("upspeed", "dlspeed", "eta", "ratio", "path",
-                      "cur_seeders", "cur_leechers", "tracker", "added", "progress"):
+        for field in (
+            "upspeed", "dlspeed", "eta", "ratio", "path",
+            "cur_seeders", "cur_leechers", "tracker", "added", "progress"
+        ):
             if torrent.get(field) is not None:
                 item[field] = torrent[field]
+
         tracker_ok = bool(torrent.get("site_tracker"))
         progress = torrent.get("progress")
         state = str(torrent.get("state") or "").strip().lower()
@@ -197,6 +274,7 @@ def associate_rescue_seeds(
             item["match_reason"] = "Tracker 未确认是憨憨站，仅供查看"
         else:
             item["match_reason"] = "名称精确匹配且已确认憨憨站 Tracker"
+
         if (match_type == "exact" and tracker_ok and complete
                 and torrent.get("hash") and item["downloader"]):
             item["hash"] = str(torrent["hash"])
