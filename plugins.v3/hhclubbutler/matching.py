@@ -11,6 +11,7 @@ from collections import Counter, defaultdict
 from difflib import SequenceMatcher
 import re
 import unicodedata
+from urllib.parse import urlsplit
 from typing import Any
 
 
@@ -78,15 +79,40 @@ def translated_release_key(value: Any) -> str | None:
 
 
 def translated_size_matches(site: dict, torrent: dict) -> bool:
-    """Require independent positive size evidence for translation alias linking."""
+    """Both sizes must agree within one hundredth of a GiB.
+
+    The site displays decimal GB values, typically to two decimal places.
+    The previous 1.5% allowance was too broad for safely deleting torrents.
+    """
     try:
         site_gb = float(site.get("size") or 0)
         torrent_gb = float(torrent.get("size_gb") or 0)
     except (TypeError, ValueError):
         return False
-    if site_gb <= 0 or torrent_gb <= 0:
+    if not (0 < site_gb < float("inf") and 0 < torrent_gb < float("inf")):
         return False
-    return abs(site_gb - torrent_gb) <= max(0.05, site_gb * 0.015)
+    return abs(site_gb - torrent_gb) <= 0.011
+
+
+def is_trusted_hh_tracker(tracker_text: Any) -> bool:
+    """Verify actual tracker hostname, not a substring in the URL path.
+
+    A URL like https://tracker.hhanclub.net.evil/ is deliberately rejected.
+    The fallback only accepts a *standalone* hostname.
+    """
+    text = str(tracker_text or "").strip()
+    if not text:
+        return False
+    if re.fullmatch(r"tracker\.hhanclub\.net(?::\d+)?", text, re.I):
+        return True
+    for match in re.finditer(r"(?:https?|udp)://[^\s<>\]\[(){},;]+", text, re.I):
+        candidate = match.group(0).rstrip(chr(34) + chr(39) + ".")
+        try:
+            if (urlsplit(candidate).hostname or "").casefold() == "tracker.hhanclub.net":
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def _candidate_indices(
@@ -268,6 +294,7 @@ def associate_rescue_seeds(
             "downloader": "", "downloaders": [], "hash": "",
             "match_status": "unmatched", "match_reason": "下载器中暂未匹配",
             "can_delete": False, "matched": False,
+            "trusted_tracker": False,
         })
         entries.append(item)
         if not group:
@@ -327,6 +354,8 @@ def associate_rescue_seeds(
                 item[field] = torrent[field]
 
         tracker_ok = bool(torrent.get("site_tracker"))
+        trusted_tracker = bool(torrent.get("trusted_tracker"))
+        item["trusted_tracker"] = trusted_tracker
         progress = torrent.get("progress")
         state = str(torrent.get("state") or "").strip().lower()
         completed_states = {
@@ -339,20 +368,26 @@ def associate_rescue_seeds(
             item["match_status"] = "downloading" if progress is not None else "unverified"
             item["match_reason"] = ("下载任务尚未完成" if progress is not None
                                     else "下载进度未确认，禁止删除")
+        elif match_type == "translated":
+            item["match_reason"] = (
+                "已忽略中文译名：英文发布名去符号后一致、体积一致；"
+                + ("Tracker 已验证，可确认删除" if trusted_tracker
+                   else "Tracker 未验证，关联已确认但暂不可删除")
+            )
         elif not tracker_ok:
             item["match_status"] = "unverified"
             item["match_reason"] = "Tracker 未确认是憨憨站，仅供查看"
-        elif match_type == "translated":
-            item["match_reason"] = (
-                "中文译名前缀 + 完整英文发布名 + 文件大小匹配；"
-                "已关联，名称不完全相同，禁止直接删除文件"
-            )
         elif match_type == "similar":
             item["match_reason"] = "名称近似匹配，仅供查看，不允许直接删除"
         else:
             item["match_reason"] = "名称精确匹配且已确认憨憨站 Tracker"
 
-        if (match_type == "exact" and tracker_ok and complete
+        # A translated association may now be manually deleted, but only
+        # with independent confirmation from the precise HH tracker host.
+        trusted_name = match_type == "exact" or (
+            match_type == "translated" and trusted_tracker)
+        tracker_verified = tracker_ok if match_type == "exact" else trusted_tracker
+        if (trusted_name and tracker_verified and complete
                 and torrent.get("hash") and item["downloader"]):
             item["hash"] = str(torrent["hash"])
             item["can_delete"] = True
