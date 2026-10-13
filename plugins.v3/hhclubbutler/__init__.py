@@ -63,6 +63,10 @@ class RescueSeedList(BaseModel):
     success: bool
     message: str = ""
     data: list[RescueSeedItem] | None = None
+    loading: bool = False
+    elapsed_seconds: int = 0
+    updated_at: str = ""
+    retry_after_seconds: int = 3
 
 
 class SettlementRecord(BaseModel):
@@ -151,7 +155,7 @@ class HHClubButler(_PluginBase):
     plugin_name = "憨憨保种区管家"
     plugin_desc = "自动优选添加及换种工具\n保种管理器/Hosts加速"
     plugin_icon = "https://raw.githubusercontent.com/xchenya/MoviePilot-Plugins/main/plugins.v3/hhclubbutler/icon.png"
-    plugin_version = "3.0.1"
+    plugin_version = "3.0.2"
     plugin_author = "六个橙子"
     author_url = "https://github.com/SixOrg"
     plugin_config_prefix = "hhclubbutler_"
@@ -200,9 +204,25 @@ class HHClubButler(_PluginBase):
         self._scheduler = None
         self._overview_thread = None
         self._overview_stop = None
+        # Bound memory cache and a single in-flight read job per plugin instance.
+        self._list_lock = threading.Lock()
+        self._list_state = "idle"
+        self._list_cache = None
+        self._list_updated_at = 0.0
+        self._list_started_at = 0.0
+        self._list_finished_at = 0.0
+        self._list_error = ""
+        self._list_generation = 0
+        self._list_thread = None
+        self._list_cache_ttl = 180.0
+        self._overview_refresh_lock = threading.Lock()
+        self._overview_launch_lock = threading.Lock()
+        self._overview_manual_thread = None
+        self._stopped = False
 
     def init_plugin(self, config: dict = None):
         self.stop_service()
+        self._stopped = False
         config = config or {}
         self._enabled = bool(config.get("enabled"))
         self._onlyonce = bool(config.get("onlyonce"))
@@ -863,6 +883,16 @@ class HHClubButler(_PluginBase):
                 elements)
 
     def stop_service(self):
+        self._stopped = True
+        with self._list_lock:
+            # A prior worker may still be waiting on a remote site: invalidate
+            # its generation so it cannot overwrite cache after reconfiguration.
+            self._list_generation += 1
+            self._list_state = "idle"
+            self._list_cache = None
+            self._list_updated_at = 0.0
+            self._list_error = ""
+            self._list_thread = None
         try:
             if self._scheduler:
                 self._scheduler.remove_all_jobs()
@@ -908,8 +938,9 @@ class HHClubButler(_PluginBase):
                 if hours > 0:
                     wait = hours * 3600.0 - (time.time() - self._last_overview_ts)
                     if wait <= 0:
-                        self._refresh_overview()
-                        wait = hours * 3600.0
+                        ok = self._refresh_overview()
+                        # Failed refresh should retry instead of sleeping six hours.
+                        wait = hours * 3600.0 if ok else 300.0
                     stop_event.wait(min(wait, 300.0))
                 else:
                     stop_event.wait(300)
@@ -918,6 +949,14 @@ class HHClubButler(_PluginBase):
                 stop_event.wait(300)
 
     def _refresh_overview(self, manual: bool = False):
+        if self._stopped or not self._overview_refresh_lock.acquire(blocking=False):
+            return False
+        try:
+            return self._refresh_overview_impl(manual=manual)
+        finally:
+            self._overview_refresh_lock.release()
+
+    def _refresh_overview_impl(self, manual: bool = False):
         try:
             # 顺带刷新结算统计表数据：当日已成功则直接命中本地缓存，未拉取过则翻页拉取一次并落盘；
             # 与完成页刷新互相隔离，失败不影响概况
@@ -944,13 +983,8 @@ class HHClubButler(_PluginBase):
             return False
 
     def _get_overview_cached_or_refresh(self) -> dict:
-        try:
-            if self._enabled and (self._last_overview is None
-                    or (self._overview_hours > 0
-                        and time.time() - self._last_overview_ts > self._overview_hours * 3600 + 300)):
-                self._refresh_overview()
-        except Exception as e:
-            logger.error(f"概况读取失败：{e}")
+        # The plugin page and dashboard must never block on external sites.
+        # The overview scheduler handles initial and periodic refreshes.
         return self._last_overview or {
             "count": 0, "total_gb": 0.0,
             "dist": {"0-1人": {"count": 0, "gb": 0.0},
@@ -969,14 +1003,19 @@ class HHClubButler(_PluginBase):
         return {"result": self._last_result}
 
     def api_refresh_overview(self):
-        try:
-            ok = self._refresh_overview(manual=True)
-            return {"success": bool(ok),
-                    "message": "概况已刷新" if ok else "概况刷新失败，已保留上次数据",
-                    "data": None}
-        except Exception as e:
-            logger.error(f"立即刷新概况失败：{e}")
-            return {"success": False, "message": "概况刷新异常，请检查插件日志", "data": None}
+        """Start a read-only overview refresh without holding an HTTP request."""
+        if self._stopped or not self._enabled:
+            return {"success": False, "message": "插件未启用", "data": None}
+        with self._overview_launch_lock:
+            running = self._overview_manual_thread
+            if self._overview_refresh_lock.locked() or (running and running.is_alive()):
+                return {"success": True, "message": "概况正在后台刷新", "data": None}
+            worker = threading.Thread(
+                target=self._refresh_overview, kwargs={"manual": True},
+                daemon=True, name="HHClubButler-ManualOverview")
+            self._overview_manual_thread = worker
+            worker.start()
+        return {"success": True, "message": "已开始后台刷新，稍后重新查看概况", "data": None}
 
     def _prefetch_downloader_torrents(self) -> Optional[list]:
         try:
@@ -986,52 +1025,104 @@ class HHClubButler(_PluginBase):
             logger.warning(f"预取下载器种子失败：{e}")
             return None
 
-    def api_list_rescue_seeds(self):
+    def _collect_rescue_seeds(self) -> list[dict]:
+        """Slow read-only snapshot. Never call this from the HTTP request thread."""
+        t0 = time.monotonic()
+        logs = []
+        torrents = self._prefetch_downloader_torrents()
+        logger.info(f"憨憨保种管理器：下载器读取耗时 {time.monotonic() - t0:.1f}s，记录 {len(torrents or [])}")
+        cur = self._get_current_seeding(logs, torrents=torrents)
+        if cur.get("error") or cur.get("degraded"):
+            raise RuntimeError("站点完成页或下载器数据不完整")
+        logger.info(f"憨憨保种管理器：在保明细获取耗时 {time.monotonic() - t0:.1f}s，记录 {len(cur.get('seeds') or [])}")
+        details = self._get_downloader_detail_map(torrents=torrents)
+        # Exact matching is both linear-time and safer than O(N*M) fuzzy matches:
+        # ambiguous names must not inherit a hash and become deletable.
+        names = {}
+        for _, torrent in (torrents or []):
+            name = torrent.get("name") if isinstance(torrent, dict) else getattr(torrent, "name", "")
+            key = self._norm_title(name or "")
+            if key:
+                names[key] = names.get(key, 0) + 1
+        result = []
+        for item in cur.get("seeds") or []:
+            seed = dict(item)
+            key = self._norm_title(seed.get("title") or "")
+            detail = details.get(key) if names.get(key) == 1 else None
+            if detail:
+                for field in ("upspeed", "dlspeed", "eta", "ratio", "path",
+                              "cur_seeders", "cur_leechers", "tracker", "added",
+                              "progress", "hash", "downloader"):
+                    if field in detail:
+                        seed[field] = detail[field]
+            else:
+                seed.pop("hash", None)
+                seed.pop("downloader", None)
+            result.append(seed)
+        logger.info(f"憨憨保种管理器：快照总耗时 {time.monotonic() - t0:.1f}s，记录 {len(result)}")
+        return result
+
+    def _list_rescue_worker(self, generation: int):
+        """Update the in-memory snapshot atomically, keeping errors visible."""
+        started = time.monotonic()
         try:
-            torrents = self._prefetch_downloader_torrents()
-            cur = self._get_current_seeding([], torrents=torrents)
-            if cur.get("error") or cur.get("degraded"):
-                return {"success": False, "message": "站点数据获取失败，请稍后重试"}
-            seeds = list(cur.get("seeds", []) or [])
-            try:
-                detail = self._get_downloader_detail_map(torrents=torrents)
-            except Exception as e:
-                logger.warning(f"下载器详情合并失败：{e}")
-                detail = {}
-            dl_norm_map = {}
-            for dl_name, t in (torrents or []):
-                try:
-                    tname = t.get("name") if isinstance(t, dict) else getattr(t, "name", "")
-                except Exception:
-                    tname = ""
-                nt = HHClubButler._norm_title(tname)
-                if nt and nt not in dl_norm_map:
-                    dl_norm_map[nt] = dl_name
-            for s in seeds:
-                nm = HHClubButler._norm_title(s.get("title") or "")
-                dl_hit = dl_norm_map.get(nm)
-                if dl_hit is None and len(nm) >= 15:
-                    for dk, dn in dl_norm_map.items():
-                        if len(dk) >= 15 and (nm in dk or dk in nm):
-                            dl_hit = dn
-                            break
-                if dl_hit:
-                    s["downloader"] = dl_hit
-                d = detail.get(nm) or {}
-                if not d and len(nm) >= 15:
-                    for dk, dv in detail.items():
-                        if len(dk) >= 15 and (nm in dk or dk in nm):
-                            d = dv
-                            break
-                for k in ("upspeed", "dlspeed", "eta", "ratio", "path",
-                          "cur_seeders", "cur_leechers", "tracker", "added",
-                          "progress", "hash", "downloader"):
-                    if k in d:
-                        s[k] = d[k]
-            return {"success": True, "data": seeds}
+            seeds = self._collect_rescue_seeds()
         except Exception as e:
-            logger.error(f"list_rescue_seeds 失败：{e}")
-            return {"success": False, "message": str(e)}
+            logger.error(f"憨憨保种管理器后台读取失败，耗时 {time.monotonic() - started:.1f}s：{e}")
+            with self._list_lock:
+                if generation != self._list_generation or self._stopped:
+                    return
+                self._list_state = "error"
+                self._list_error = "读取保种数据失败，请检查站点 Cookie、下载器及插件日志"
+                self._list_finished_at = time.time()
+        else:
+            with self._list_lock:
+                if generation != self._list_generation or self._stopped:
+                    return
+                self._list_cache = seeds
+                self._list_updated_at = time.time()
+                self._list_finished_at = self._list_updated_at
+                self._list_state = "ready"
+                self._list_error = ""
+
+    def api_list_rescue_seeds(self, refresh: bool = False):
+        """Immediate status response; expensive I/O is coalesced in one worker."""
+        now = time.time()
+        with self._list_lock:
+            if self._stopped or not self._enabled:
+                return {"success": False, "message": "插件未启用"}
+            if self._list_state == "loading":
+                return {
+                    "success": True, "loading": True,
+                    "elapsed_seconds": max(0, int(now - self._list_started_at)),
+                    "message": "保种数据正在后台读取"}
+            if (not refresh and self._list_cache is not None
+                    and now - self._list_updated_at < self._list_cache_ttl):
+                return {"success": True, "loading": False,
+                        "data": self._list_cache,
+                        "updated_at": datetime.fromtimestamp(
+                            self._list_updated_at).strftime("%Y-%m-%d %H:%M:%S")}
+            if (not refresh and self._list_state == "error"
+                    and now - self._list_finished_at < 30):
+                return {"success": False, "message": self._list_error}
+            self._list_generation += 1
+            generation = self._list_generation
+            self._list_state = "loading"
+            self._list_started_at = now
+            self._list_error = ""
+            thread = threading.Thread(
+                target=self._list_rescue_worker, args=(generation,),
+                daemon=True, name="HHClubButler-RescueSnapshot")
+            self._list_thread = thread
+            try:
+                thread.start()
+            except Exception as e:
+                logger.error(f"启动保种列表后台任务失败：{e}")
+                self._list_state = "error"
+                self._list_error = "后台任务启动失败，请检查插件日志"
+                self._list_finished_at = time.time()
+                return {"success": False, "message": self._list_error}
+        return {"success": True, "loading": True, "message": "保种数据正在后台读取"}
 
     def _get_downloader_detail_map(self, torrents: Optional[list] = None) -> dict:
         out = {}
@@ -1331,25 +1422,47 @@ document.getElementById("dlList").innerHTML=h||'<div style="font-size:11px;color
 document.querySelectorAll("#dlList input[type=checkbox]").forEach(function(cb){cb.onchange=function(){var n=cb.dataset.dl;if(cb.checked)dlSel[n]=true;else delete dlSel[n];updateDlBtn();render()}});
 updateDlBtn();
 }
-async function load(){
-var st=document.getElementById("status");
-function showErr(msg){
-st.innerHTML='<span class="errmsg">'+esc(msg)+'</span><button class="retrybtn" onclick="load()">重试</button>';
-}
+var activeLoadId=0;
+async function load(force){
+var token=++activeLoadId;
+var st=document.getElementById("status"),started=Date.now();
 st.style.display="flex";
-var t0=Date.now(),tmr=null;
-st.innerHTML='<span>正在加载保种数据，请稍候… <b id="el">0</b> 秒</span><div class="bar"><i></i></div>';
-function tick(){var el=document.getElementById("el");if(el)el.textContent=Math.floor((Date.now()-t0)/1000);}
-tick();tmr=setInterval(tick,250);
-var ctl=(typeof AbortController!=="undefined")?new AbortController():null;
-var to=ctl?setTimeout(function(){ctl.abort()},90000):null;
+st.innerHTML='<span>正在获取保种数据… <b id="el">0</b> 秒</span><div class="bar"><i></i></div>';
+function elapsed(){return Math.floor((Date.now()-started)/1000)}
+var ticker=setInterval(function(){
+if(token!==activeLoadId)return;
+var el=document.getElementById("el");if(el)el.textContent=elapsed();
+},250);
+function showErr(msg){
+st.innerHTML='<span class="errmsg">'+esc(msg)+'</span><button class="retrybtn" onclick="load(true)">重试</button>';
+}
 try{
-var r=await fetch("/api/v1/plugin/HHClubButler/list_rescue_seeds",ctl?{signal:ctl.signal,credentials:"same-origin"}:{credentials:"same-origin"});if(!r.ok)throw Error("HTTP "+r.status);
-if(to)clearTimeout(to);
+while(token===activeLoadId){
+var ctl=(typeof AbortController!=="undefined")?new AbortController():null;
+var timeout=ctl?setTimeout(function(){ctl.abort()},15000):null;
+try{
+var url="/api/v1/plugin/HHClubButler/list_rescue_seeds"+(force?"?refresh=1":"");
+force=false;
+var r=await fetch(url,ctl?{signal:ctl.signal,credentials:"same-origin",cache:"no-store"}:{credentials:"same-origin",cache:"no-store"});
+if(!r.ok)throw Error("HTTP "+r.status);
 var j=await r.json();
-if(!j.success){if(tmr)clearInterval(tmr);showErr(j.message||"数据加载失败");return}
-seeds=j.data||[];doSort();buildDlList();render();if(tmr)clearInterval(tmr);st.style.display="none";
-}catch(e){if(to)clearTimeout(to);if(tmr)clearInterval(tmr);showErr((e&&e.name==="AbortError")?"加载超时，请稍后重试":"请求失败："+e)}}
+if(token!==activeLoadId)return;
+if(!j.success){showErr(j.message||"数据加载失败");return;}
+if(j.loading){
+if(elapsed()>480){showErr("保种数据获取时间过长，请检查 MoviePilot 日志后重试；后台任务可能仍在运行");return;}
+await new Promise(function(resolve){setTimeout(resolve,Math.max(2000,(j.retry_after_seconds||3)*1000));});
+continue;
+}
+seeds=j.data||[];doSort();buildDlList();render();
+st.style.display="none";return;
+}catch(e){
+if(token!==activeLoadId)return;
+showErr((e&&e.name==="AbortError")?"接口响应超时，请检查 MoviePilot 服务":"请求失败："+e);
+return;
+}finally{if(timeout)clearTimeout(timeout);}
+}
+}finally{clearInterval(ticker);}
+}
 async function delOne(seed){
 if(!seed.downloader||!seed.hash){alert("无法确定下载器或哈希，已拒绝删除");return;}
 if(!confirm("确认删除种子:\\n"+seed.title+"\\n\\n将同时删除下载器任务和文件!"))return;
@@ -1420,7 +1533,7 @@ var sel=document.getElementById("themeSel");
 sel.value=document.body.getAttribute("data-theme")||"dark";
 sel.onchange=function(){applyTheme(this.value)};
 document.getElementById("btnExit").onclick=function(){try{window.close()}catch(e){}setTimeout(function(){window.close()},100);if(!window.closed)alert("濡傛湭鑷姩鍏抽棴锛岃鎵嬪姩鍏抽棴鏈爣绛鹃〉")};
-buildHead();load();
+buildHead();load(false);
 </script></body></html>"""
         return html
 
