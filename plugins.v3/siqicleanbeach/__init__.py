@@ -38,7 +38,7 @@ class SiQiCleanBeach(_PluginBase):
     plugin_name = "思齐自动收垃圾"
     plugin_desc = "自动清理沙滩，可选自动搬砖，支持Cron和间隔定时；未经真实联调。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Moviepilot_A.png"
-    plugin_version = "2.1.1"
+    plugin_version = "2.1.2"
     plugin_author = "bfjy（V3 适配：xchenya）"
     author_url = "https://bfjy2024.github.io/bfjy"
     plugin_config_prefix = "siqicleanbeach_"
@@ -96,6 +96,7 @@ class SiQiCleanBeach(_PluginBase):
         super().__init__()
         # V3 支持插件分身；可变数据和运行锁均属于当前实例。
         self._lock = threading.Lock()
+        self._session = None
         self._enabled = False
         self._cookie = ""
         self._user_agent = self.USER_AGENT
@@ -775,6 +776,8 @@ class SiQiCleanBeach(_PluginBase):
             if not cookie or "c_secure_pass=" not in cookie:
                 clean = {"success": False, "auth_failed": True, "message": "缺少有效 Cookie"}
             else:
+                # 每轮共用连接池，避免50次搬砖反复建立TLS连接。
+                self._session = requests.Session()
                 clean = self.__enter_beach(cookie)
                 if clean.get("success"):
                     clean = self.__collect_trash(cookie)
@@ -824,7 +827,12 @@ class SiQiCleanBeach(_PluginBase):
                 self._stats["history"] = history[-20:]
                 self.__finish_task(result)
             finally:
-                self._lock.release()
+                try:
+                    if self._session is not None:
+                        self._session.close()
+                finally:
+                    self._session = None
+                    self._lock.release()
         return result
 
     def __request_action(self, cookie: str, action: str) -> Dict[str, Any]:
@@ -833,13 +841,14 @@ class SiQiCleanBeach(_PluginBase):
         logger.info(f"思齐请求开始：action={action}")
         try:
             cookies = self.__cookie_to_dict(cookie)
-            response = requests.post(
+            http = self._session if self._session is not None else requests
+            response = http.post(
                 self.MOWAN_URL,
                 headers={"content-type": "application/x-www-form-urlencoded",
                          "user-agent": self._user_agent, "accept": "application/json",
                          "origin": self.BASE_URL, "referer": self.MOWAN_URL},
                 cookies=cookies, data={"action": action},
-                timeout=(10, 30 if action == "sync_game_state" else 15),
+                timeout=(10, 30),
                 verify=True, allow_redirects=False,
             )
             logger.info(f"思齐请求结束：action={action}, HTTP {response.status_code}, 耗时{time.monotonic() - started:.2f}秒")
@@ -970,6 +979,7 @@ class SiQiCleanBeach(_PluginBase):
                 self._stats["brick_uncertain_reset"] = response["last_daily_reset"]
                 return {**result, "message": "状态无进展、增量不一致或跨日重置，停止"}
             result["bricks_moved"] += moved
+            logger.info(f"搬砖已确认：本次增量{moved}块，累计{result['bricks_moved']}块，今日{response['daily_bricks']}/50")
             self._stats["brick_last_run_server"] = response["server_now"]
             state = response
             if state["daily_bricks"] >= 50:
@@ -979,14 +989,15 @@ class SiQiCleanBeach(_PluginBase):
     def __fetch_inventory(self, cookie: str) -> Optional[Dict[str, Any]]:
         """从库存 DOM 解析数据，避免正则匹配嵌套 div 时截断内容。"""
         try:
-            response = requests.get(
+            http = self._session if self._session is not None else requests
+            response = http.get(
                 self.MOWAN_URL,
                 headers={
                     "accept": "text/html,application/xhtml+xml",
                     "user-agent": self._user_agent,
                 },
                 cookies=self.__cookie_to_dict(cookie),
-                timeout=15,
+                timeout=(10, 30),
                 verify=True,
                 allow_redirects=False,
             )
