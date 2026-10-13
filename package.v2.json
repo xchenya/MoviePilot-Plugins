@@ -8,7 +8,7 @@
     "author": "六个橙子",
     "author_url": "https://github.com/SixOrg",
     "level": 1,
-    "v3": true,
+    "v3": false,
     "release": true,
     "history": {
       "2.5": "新增 Hosts 加速（IP 域名写入系统 hosts，关闭自动还原）；结算统计表改版（近30日/近12个月/历史累计）；结算日志自动拉取与失败重试；手机适配、下载器筛选、加载实时读秒",
