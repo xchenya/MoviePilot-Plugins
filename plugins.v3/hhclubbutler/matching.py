@@ -47,6 +47,48 @@ def _size_compatible(site: dict, torrent: dict) -> bool | None:
     return abs(a - b) <= max(0.18, 0.06 * a)
 
 
+
+_TRANSLATED_NAME_RE = re.compile(
+    r"^\s*(?P<cn>[\u3400-\u9fff]{2,}(?:[\u3400-\u9fff ]{0,24}))"
+    r"[.\-_·|\s]+(?P<release>[A-Za-z].+)$",
+    re.I,
+)
+_RELEASE_MARKER_RE = re.compile(
+    r"\b(?:19\d{2}|20\d{2}|s\d{1,3}|e\d{1,3}|\d{3,4}p)\b",
+    re.I,
+)
+
+
+def translated_release_key(value: Any) -> str | None:
+    """Return the English release suffix ONLY for a leading Chinese-title alias.
+
+    Example: 上古情歌.A.Lifetime.Love.S01.2017... -> alifetimeloves012017...
+    No translation dictionaries or fuzzy stripping of arbitrary Han characters.
+    """
+    original = unicodedata.normalize("NFKC", str(value or "")).strip()
+    match = _TRANSLATED_NAME_RE.fullmatch(original)
+    if not match:
+        return None
+    release = match.group("release").strip()
+    normalized = normalize_name(release)
+    # Short English fragments must never become release aliases.
+    if len(normalized) < 24 or not _RELEASE_MARKER_RE.search(release):
+        return None
+    return normalized
+
+
+def translated_size_matches(site: dict, torrent: dict) -> bool:
+    """Require independent positive size evidence for translation alias linking."""
+    try:
+        site_gb = float(site.get("size") or 0)
+        torrent_gb = float(torrent.get("size_gb") or 0)
+    except (TypeError, ValueError):
+        return False
+    if site_gb <= 0 or torrent_gb <= 0:
+        return False
+    return abs(site_gb - torrent_gb) <= max(0.05, site_gb * 0.015)
+
+
 def _candidate_indices(
     site: dict, prefix: dict[str, list[int]], token_idx: dict[str, list[int]],
     token_frequencies: Counter,
@@ -118,6 +160,7 @@ def associate_rescue_seeds(
         torrents.append(raw)
 
     by_exact: dict[str, list[int]] = defaultdict(list)
+    by_translated: dict[str, list[int]] = defaultdict(list)
     by_prefix: dict[str, list[int]] = defaultdict(list)
     by_token: dict[str, list[int]] = defaultdict(list)
     counts: Counter = Counter()
@@ -128,6 +171,9 @@ def associate_rescue_seeds(
         if not canon:
             continue
         by_exact[canon].append(index)
+        english_alias = translated_release_key(torrent.get("name"))
+        if english_alias:
+            by_translated[english_alias].append(index)
         if len(canon) >= 12:
             by_prefix[canon[:12]].append(index)
         for token in _tokens(torrent.get("name")):
@@ -151,21 +197,45 @@ def associate_rescue_seeds(
                 exact_site_owners[index] += 1
         exact_groups.append(group)
 
-    # Second pass: fuzzy suggestions are only allowed to use unclaimed tasks.
-    # A weaker suggestion must never make a correct exact match "ambiguous".
+    # Intermediate priority: a known Chinese title prefix can be discarded
+    # ONLY when the remaining complete English release name equals the site
+    # release AND independently reported sizes agree closely. Keep this
+    # separate from generic fuzzy matches and do not authorize deletion.
+    translated_reserved: set[int] = set()
+    translated_site_owners: Counter = Counter()
+    strong_groups: list[list[tuple[int, str, float]]] = []
+    translated_alias_count = 0
+    for site, exact_group in zip(site_seeds, exact_groups):
+        canon = normalize_name(site.get("title"))
+        aliases = []
+        for index in by_translated.get(canon, ()):
+            if index in exact_reserved:
+                continue
+            if translated_size_matches(site, torrents[index]):
+                aliases.append((index, "translated", 1.0))
+                translated_reserved.add(index)
+                translated_site_owners[index] += 1
+                translated_alias_count += 1
+        # Multiple real tasks with exact/suffix identities for one site entry
+        # are a genuine conflict, even if in different downloaders.
+        strong_groups.append(list(exact_group) + aliases)
+
+    # Last priority: fuzzy suggestions only use unclaimed tasks. Otherwise
+    # one translated alias could be shared by several vaguely similar rows.
+    strong_reserved = exact_reserved | translated_reserved
     matches: list[list[tuple[int, str, float]]] = []
     fuzzy_shared: Counter = Counter()
     fuzzy_skipped_reserved = 0
-    for site, exact_group in zip(site_seeds, exact_groups):
-        if exact_group:
-            matches.append(exact_group)
+    for site, strong_group in zip(site_seeds, strong_groups):
+        if strong_group:
+            matches.append(strong_group)
             continue
         canon = normalize_name(site.get("title"))
         original = str(site.get("title") or "")
         candidates = _candidate_indices(site, by_prefix, by_token, counts)
         scored = []
         for index in candidates:
-            if index in exact_reserved:
+            if index in strong_reserved:
                 fuzzy_skipped_reserved += 1
                 continue
             hit = _match_record(site, torrents[index], original, canon, False)
@@ -182,13 +252,14 @@ def associate_rescue_seeds(
     entries: list[dict[str, Any]] = []
     stats = {
         "eligible": len(site_seeds), "linked": 0, "exact": 0,
-        "similar": 0, "ambiguous": 0, "unmatched": 0,
+        "translated": 0, "similar": 0, "ambiguous": 0, "unmatched": 0,
         "deletable": 0,
         "ambiguity_multiple_tasks": 0,
         "ambiguity_duplicate_site_titles": 0,
         "ambiguity_shared_fuzzy": 0,
         "duplicate_downloader_rows_ignored": duplicates_ignored,
         "fuzzy_exact_claims_blocked": fuzzy_skipped_reserved,
+        "translation_suffix_claims": translated_alias_count,
     }
     for site, group in zip(site_seeds, matches):
         item = dict(site)
@@ -231,9 +302,10 @@ def associate_rescue_seeds(
             continue
 
         index, match_type, _ = group[0]
-        if (match_type == "exact" and exact_site_owners[index] > 1):
+        if (match_type in {"exact", "translated"}
+                and (exact_site_owners[index] + translated_site_owners[index]) > 1):
             item["match_status"] = "ambiguous"
-            item["match_reason"] = "同一下载任务被多个站点条目精确命中"
+            item["match_reason"] = "同一下载任务被多个站点条目强匹配命中"
             stats["ambiguous"] += 1
             stats["ambiguity_duplicate_site_titles"] += 1
             continue
@@ -267,11 +339,16 @@ def associate_rescue_seeds(
             item["match_status"] = "downloading" if progress is not None else "unverified"
             item["match_reason"] = ("下载任务尚未完成" if progress is not None
                                     else "下载进度未确认，禁止删除")
-        elif match_type == "similar":
-            item["match_reason"] = "名称近似匹配，仅供查看，不允许直接删除"
         elif not tracker_ok:
             item["match_status"] = "unverified"
             item["match_reason"] = "Tracker 未确认是憨憨站，仅供查看"
+        elif match_type == "translated":
+            item["match_reason"] = (
+                "中文译名前缀 + 完整英文发布名 + 文件大小匹配；"
+                "已关联，名称不完全相同，禁止直接删除文件"
+            )
+        elif match_type == "similar":
+            item["match_reason"] = "名称近似匹配，仅供查看，不允许直接删除"
         else:
             item["match_reason"] = "名称精确匹配且已确认憨憨站 Tracker"
 
