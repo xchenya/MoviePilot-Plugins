@@ -10,10 +10,13 @@ xchenya 的 [MoviePilot](https://github.com/jxxghp/MoviePilot) 第三方插件�
 |---|---|---|---|
 | [癫影自动签到](./plugins.v3/dian115sign/README.md) | `plugins.v3/dian115sign` | `2.0.6` | V3 测试版；普通签已实测 |
 | [憨憨保种区管家 V3](./plugins.v3/hhclubbutler/README.md) | `plugins.v3/hhclubbutler` | `3.0.2` | V3 异步加载与超时修复验证版；未进行宿主联调 |
+| [思齐自动收垃圾 V3](./plugins.v3/siqicleanbeach/README.md) | `plugins.v3/siqicleanbeach` | `2.0.0` | V3 移植测试版；未进行思齐站点联调 |
 
 癫影签到为独立重写测试版，要求 **MoviePilot V3**；插件版本 `2.0.6` 不代表支持 MoviePilot V2。已完成真实账号普通签到验证；首次安装仍建议先运行诊断。详见插件说明与[测试说明](./tests/v3/dian115sign/README.md)。
 
 “憨憨保种区管家”移植自 [SixOrg/MoviePilot-Plugins](https://github.com/SixOrg/MoviePilot-Plugins)，原作者为六个橙子。原仓库未见明确开源许可证，公开再分发前应确认授权；本仓库不会据此声称获得原代码版权。换种及批量删除功能涉及下载器文件删除，请先做好备份并谨慎启用。
+
+“思齐自动收垃圾”移植自 [bfjy2024/MoviePilot-Plugins](https://github.com/bfjy2024/MoviePilot-Plugins/tree/main/plugins.v2/siqicleanbeach)，原作者 bfjy，依上游 GPL-3.0 许可保留署名，当前 V3 版本由 xchenya 适配维护。已添加模拟数据回归测试，但尚未完成真实思齐站点联调；请手动测试成功后再启用定时。
 
 ## 使用方法
 
