@@ -9,8 +9,11 @@ xchenya 的 [MoviePilot](https://github.com/jxxghp/MoviePilot) 第三方插件�
 | 插件 | 目录 | 版本 | 状态 |
 |---|---|---|---|
 | [癫影自动签到](./plugins.v3/dian115sign/README.md) | `plugins.v3/dian115sign` | `2.0.6` | V3 测试版；普通签已实测 |
+| [憨憨保种区管家](./plugins.v2/hhclubbutler/README.md) | `plugins.v2/hhclubbutler` | `2.5` | V2 上游移植版；声明支持 V3，尚未实测 |
 
 癫影签到为独立重写测试版，要求 **MoviePilot V3**；插件版本 `2.0.6` 不代表支持 MoviePilot V2。已完成真实账号普通签到验证；首次安装仍建议先运行诊断。详见插件说明与[测试说明](./tests/v3/dian115sign/README.md)。
+
+“憨憨保种区管家”移植自 [SixOrg/MoviePilot-Plugins](https://github.com/SixOrg/MoviePilot-Plugins)，原作者为六个橙子。原仓库未见明确开源许可证，公开再分发前应确认授权；本仓库不会据此声称获得原代码版权。换种及批量删除功能涉及下载器文件删除，请先做好备份并谨慎启用。
 
 ## 使用方法
 
