@@ -36,9 +36,9 @@ class StatsResponse(BaseModel):
 
 class SiQiCleanBeach(_PluginBase):
     plugin_name = "思齐自动收垃圾"
-    plugin_desc = "自动在思齐站点清理沙滩并收集垃圾，支持Cron和间隔定时。"
+    plugin_desc = "自动清理沙滩，可选自动搬砖，支持Cron和间隔定时；未经真实联调。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Moviepilot_A.png"
-    plugin_version = "2.0.0"
+    plugin_version = "2.1.0"
     plugin_author = "bfjy（V3 适配：xchenya）"
     author_url = "https://bfjy2024.github.io/bfjy"
     plugin_config_prefix = "siqicleanbeach_"
@@ -58,6 +58,7 @@ class SiQiCleanBeach(_PluginBase):
     _run_once = False
 
     ITEM_ICONS = {
+        "砖块": "🧱",
         "木材": "🪵",
         "塑料袋": "🛍️",
         "瓶子": "🧴",
@@ -74,6 +75,7 @@ class SiQiCleanBeach(_PluginBase):
     }
 
     ITEM_COLORS = {
+        "砖块": "#a0522d",
         "木材": "#f39c12",
         "塑料袋": "#3498db",
         "瓶子": "#1abc9c",
@@ -98,6 +100,8 @@ class SiQiCleanBeach(_PluginBase):
         self._schedule_mode = "interval"
         self._cron = "1 */2 * * *"
         self._interval_minutes = 121
+        self._auto_brick = False
+        self._brick_cooldown_minutes = 1440
         self._notify = True
         self._run_once = False
         self._inventory: Dict[str, Dict[str, Any]] = {}
@@ -128,6 +132,8 @@ class SiQiCleanBeach(_PluginBase):
         self._schedule_mode = config.get("schedule_mode", "interval")
         self._cron = (config.get("cron") or "1 */2 * * *").strip()
         self._interval_minutes = self.__safe_int(config.get("interval_minutes"), 121, min_value=1)
+        self._auto_brick = bool(config.get("auto_brick", False))
+        self._brick_cooldown_minutes = self.__safe_int(config.get("brick_cooldown_minutes"), 1440, min_value=1)
         self._notify = bool(config.get("notify", True))
         self._run_once = bool(config.get("run_once", False))
 
@@ -137,7 +143,7 @@ class SiQiCleanBeach(_PluginBase):
         
         inventory = config.get("inventory", {})
         if inventory:
-            self._inventory = {k: v for k, v in inventory.items() if k != "砖块"}
+            self._inventory = inventory
 
         logger.info(
             f"思齐自动收垃圾插件初始化完成：enabled={self._enabled}, "
@@ -148,6 +154,8 @@ class SiQiCleanBeach(_PluginBase):
             self._run_once = False
             self.update_config({
                 "enabled": self._enabled,
+                "auto_brick": self._auto_brick,
+                "brick_cooldown_minutes": self._brick_cooldown_minutes,
                 "cookie": self._cookie,
                 "schedule_mode": self._schedule_mode,
                 "cron": self._cron,
@@ -339,6 +347,17 @@ class SiQiCleanBeach(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
+                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                                {"component": "VSwitch", "props": {"model": "auto_brick", "label": "自动搬砖（默认关闭）"}}
+                            ]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                                {"component": "VTextField", "props": {"model": "brick_cooldown_minutes", "label": "搬砖冷却（分钟）", "type": "number", "min": 1, "hint": "默认1440分钟；使用服务端时间，每日最多50块。"}}
+                            ]}
+                        ]
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
                             {
                                 "component": "VCol",
                                 "props": {"cols": 12},
@@ -361,6 +380,8 @@ class SiQiCleanBeach(_PluginBase):
             }
         ], {
             "enabled": self._enabled,
+            "auto_brick": self._auto_brick,
+            "brick_cooldown_minutes": self._brick_cooldown_minutes,
             "cookie": cookie_value,
             "schedule_mode": self._schedule_mode,
             "cron": self._cron,
@@ -382,7 +403,7 @@ class SiQiCleanBeach(_PluginBase):
             except:
                 last_update = str(last_update)
 
-        filtered_inventory = {k: v for k, v in inventory.items() if k != "砖块"}
+        filtered_inventory = inventory
         
         total_items = len(filtered_inventory)
         total_count = sum(item.get("count", 0) for item in filtered_inventory.values())
@@ -421,7 +442,7 @@ class SiQiCleanBeach(_PluginBase):
                                     self.__stat_card("📦", "物品总数", f"{total_count:,}", "个", "primary"),
                                     self.__stat_card("📊", "物品种类", f"{total_items}", "种", "info"),
                                     self.__stat_card("✅", "有物品", f"{has_items_count}", "种", "success"),
-                                    self.__stat_card("🕐", "最后更新", last_update or "-", "", "warning"),
+                                    self.__stat_card("🕐", "库存刷新", last_update or "-", "", "warning"),
                                 ]
                             }
                         ]
@@ -433,7 +454,11 @@ class SiQiCleanBeach(_PluginBase):
                                 "component": "VRow",
                                 "content": [
                                     self.__info_col("⏰ 定时模式", schedule_info),
-                                    self.__info_col("📝 最后结果", stats.get("last_result", "-")[:25]),
+                                    self.__info_col("📝 最后结果", stats.get("last_result", "-")),
+                                    self.__info_col("🗑️ 清理结果", stats.get("clean_result", "-")),
+                                    self.__info_col("🧱 搬砖结果", stats.get("brick_result", "-")),
+                                    self.__info_col("🧱 本次 / 今日 / 库存", f"{stats.get('bricks_moved', 0)} / {stats.get('daily_bricks') if stats.get('daily_bricks') is not None else '未知'} / {inventory.get('砖块', {}).get('count', '未知')}"),
+                                    self.__info_col("📦 库存状态", "本次已刷新" if stats.get("inventory_refreshed") else "缓存，非本次刷新"),
                                     self.__info_col("🔔 通知", "开启" if self._notify else "关闭"),
                                     self.__info_col("🍪 Cookie", "已配置" if self._cookie else "未配置"),
                                 ]
@@ -672,7 +697,7 @@ class SiQiCleanBeach(_PluginBase):
                     time_str = str(time_str)
             
             status_color = "success" if record.get("status") == "completed" else "warning"
-            status_text = "✅ 成功" if record.get("status") == "completed" else "⚠️ 失败"
+            status_text = {"completed": "✅ 完成", "partial": "⚠️ 部分完成", "auth_failed": "🔐 认证失败"}.get(record.get("status"), "⚠️ 失败")
             result_text = record.get("result", "-")
             total_count = record.get("total_count", 0)
             
@@ -680,7 +705,7 @@ class SiQiCleanBeach(_PluginBase):
                 "component": "tr",
                 "content": [
                     {"component": "td", "text": time_str},
-                    {"component": "td", "text": result_text[:30]},
+                    {"component": "td", "text": result_text},
                     {"component": "td", "text": f"{total_count:,}" if total_count > 0 else "-"},
                     {
                         "component": "td",
@@ -738,253 +763,196 @@ class SiQiCleanBeach(_PluginBase):
         )
     def run_clean_task(self, reserved: bool = False) -> Dict[str, Any]:
         if not reserved and not self._lock.acquire(blocking=False):
-            return {"status": "running", "message": "已有收垃圾任务正在执行"}
-
+            return {"status": "running", "message": "已有任务正在执行"}
+        clean = {"success": False, "message": "未执行", "trash": 0}
+        brick = {"success": True, "message": "未开启", "bricks_moved": 0}
+        refreshed = False
+        self._stats["inventory_refreshed"] = False
         try:
             cookie = (self._cookie or self.__get_site_cookie() or "").strip()
             if not cookie or "c_secure_pass=" not in cookie:
-                result = self.__new_result(status="auth_failed", message="缺少包含 c_secure_pass 的思齐 Cookie")
-                self.__finish_task(result)
-                return result
-
-            logger.info("开始执行收垃圾任务")
-
-            enter_result = self.__enter_beach(cookie)
-            collect_success = False
-            trash_count = 0
-            
-            if enter_result.get("success"):
-                logger.info("成功进入沙滩")
-                
-                collect_result = self.__collect_trash(cookie)
-                if collect_result.get("success"):
-                    trash_count = collect_result.get("trash", 0)
-                    collect_success = True
-                    logger.info(f"收集垃圾成功：{trash_count} 个")
+                clean = {"success": False, "auth_failed": True, "message": "缺少有效 Cookie"}
+            else:
+                clean = self.__enter_beach(cookie)
+                if clean.get("success"):
+                    clean = self.__collect_trash(cookie)
+                if clean.get("auth_failed"):
+                    brick["message"] = "认证失败，停止后续请求"
+                    brick["success"] = False
+                    brick["auth_failed"] = True
                 else:
-                    logger.warning(f"收集垃圾失败：{collect_result.get('message')}")
-            else:
-                msg = enter_result.get("message", "")
-                logger.warning(f"进入沙滩失败：{msg}")
-                if "冷却" in msg:
-                    self._stats["last_result"] = f"沙滩冷却中，当前物品待刷新"
-                else:
-                    result = self.__new_result(status="failed", message=f"进入沙滩失败：{msg}")
-                    self.__fetch_and_update_inventory(cookie)
-                    self.__finish_task(result)
-                    return result
-
-            inventory_data = self.__fetch_inventory(cookie)
-            if inventory_data is not None:
-                filtered_data = {k: v for k, v in inventory_data.items() if k != "砖块"}
-                self._inventory = filtered_data
-                total_count = sum(item.get("count", 0) for item in filtered_data.values())
-                logger.info(f"更新物品数据：{len(filtered_data)} 种物品，共 {total_count} 个")
-            else:
-                total_count = sum(item.get("count", 0) for item in self._inventory.values())
-                logger.warning(f"获取物品数据失败，使用缓存数据：共 {total_count} 个")
-
-            self._stats["last_update"] = time.time()
-            self._stats["total_items_count"] = total_count
-            
-            if collect_success:
-                self._stats["last_result"] = f"收集了{trash_count}个垃圾，共{total_count}个物品"
-            elif "冷却" in enter_result.get("message", ""):
-                self._stats["last_result"] = f"沙滩冷却中，共{total_count}个物品"
-            else:
-                self._stats["last_result"] = f"未收集垃圾，共{total_count}个物品"
-
-            history = self._stats.get("history", [])
-            if collect_success:
-                result_text = f"收集{trash_count}个垃圾"
-                status = "completed"
-            elif "冷却" in enter_result.get("message", ""):
-                result_text = "沙滩冷却中"
-                status = "completed"
-            else:
-                result_text = enter_result.get("message", "未收集垃圾")
-                status = "failed"
-            
-            history.append({
-                "time": time.time(),
-                "result": result_text,
-                "total_count": total_count,
-                "status": status
-            })
-            if len(history) > 20:
-                history = history[-20:]
-            self._stats["history"] = history
-
-            if collect_success:
-                result = self.__new_result(
-                    status="completed",
-                    message=f"成功清理沙滩，收集了{trash_count}个垃圾，当前共{total_count}个物品"
-                )
-            elif "冷却" in enter_result.get("message", ""):
-                result = self.__new_result(
-                    status="completed",
-                    message=f"沙滩冷却中，当前共{total_count}个物品"
-                )
-            else:
-                result = self.__new_result(
-                    status="partial",
-                    message=f"未能收集垃圾，当前共{total_count}个物品"
-                )
-            result["data"] = {"trash": trash_count, "total_count": total_count}
-
-            self.__finish_task(result)
-            return result
-
-        except Exception as e:
-            logger.error(f"收垃圾任务异常：{e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            try:
-                cookie = (self._cookie or self.__get_site_cookie() or "").strip()
-                if cookie and "c_secure_pass=" in cookie:
-                    self.__fetch_and_update_inventory(cookie)
-            except:
-                pass
-            result = self.__new_result(status="error", message=str(e))
-            self.__finish_task(result)
-            return result
+                    if self._auto_brick:
+                        brick = self.__move_bricks(cookie)
+                    if not brick.get("auth_failed"):
+                        inventory = self.__fetch_inventory(cookie)
+                        if inventory is not None:
+                            self._inventory = inventory
+                            self._stats["last_update"] = time.time()
+                            refreshed = True
+            if clean.get("auth_failed"):
+                brick.update(success=False, auth_failed=True, message="认证失败，停止后续请求")
+            status = "auth_failed" if clean.get("auth_failed") or brick.get("auth_failed") else (
+                "completed" if (clean.get("success") or "冷却" in clean.get("message", "")) and brick.get("success") else "partial"
+            )
+        except Exception as exc:
+            logger.error(f"思齐任务异常：{exc.__class__.__name__}")
+            status = "error"
+            clean["message"] = "任务异常，请检查日志"
         finally:
-            self._lock.release()
+            try:
+                total = sum(item.get("count", 0) for item in self._inventory.values())
+                stock = self._inventory.get("砖块", {}).get("count")
+                clean_text = clean.get("message") or f"收集{clean.get('trash', 0)}个垃圾"
+                brick_text = brick.get("message", "未知")
+                daily = brick.get("daily_bricks")
+                moved = brick.get("bricks_moved", 0)
+                message = (f"清理：{clean_text}；搬砖：{brick_text}；本次{moved}块，"
+                           f"今日{daily if daily is not None else '未知'}/50，库存{stock if stock is not None else '未知'}"
+                           f"（{'本次已刷新' if refreshed else '缓存，非本次刷新'}）")
+                self._stats.update(clean_result=clean_text, brick_result=brick_text,
+                                   bricks_moved=moved, daily_bricks=daily,
+                                   inventory_refreshed=refreshed, total_items_count=total,
+                                   last_result=message, last_run=time.time())
+                result = self.__new_result(status=status, message=message)
+                result["data"] = {"clean": clean, "brick": brick, "trash": clean.get("trash", 0),
+                                  "total_count": total, "brick_inventory": stock, "inventory_refreshed": refreshed}
+                history = self._stats.get("history", [])
+                history.append({"time": result["timestamp"], "result": message, "status": status,
+                                "total_count": total, **result["data"]})
+                self._stats["history"] = history[-20:]
+                self.__finish_task(result)
+            finally:
+                self._lock.release()
+        return result
 
-    def __fetch_and_update_inventory(self, cookie: str):
+    def __request_action(self, cookie: str, action: str) -> Dict[str, Any]:
+        """只接受 JSON；不跟随写请求重定向，也不重试写请求。"""
         try:
-            inventory_data = self.__fetch_inventory(cookie)
-            if inventory_data is not None:
-                filtered_data = {k: v for k, v in inventory_data.items() if k != "砖块"}
-                self._inventory = filtered_data
-                total_count = sum(item.get("count", 0) for item in filtered_data.values())
-                self._stats["total_items_count"] = total_count
-                self._stats["last_update"] = time.time()
-                logger.info(f"物品数据已更新：{len(filtered_data)} 种，共 {total_count} 个")
-            else:
-                logger.warning("获取物品数据失败")
-        except Exception as e:
-            logger.error(f"获取物品数据异常：{e}")
+            cookies = self.__cookie_to_dict(cookie)
+            response = requests.post(
+                self.MOWAN_URL,
+                headers={"content-type": "application/x-www-form-urlencoded",
+                         "origin": self.BASE_URL, "referer": self.MOWAN_URL},
+                cookies=cookies, data={"action": action}, timeout=15,
+                verify=True, allow_redirects=False,
+            )
+            if response.status_code in {401, 403} or "login" in response.headers.get("Location", "").lower():
+                return {"success": False, "auth_failed": True, "message": "Cookie失效或访问被拒绝"}
+            if response.status_code != 200:
+                return {"success": False, "message": f"HTTP {response.status_code}"}
+            try:
+                data = response.json()
+            except ValueError:
+                soup = BeautifulSoup(response.text, "html.parser")
+                auth = bool(soup.select_one("form[action*='login'], input[type='password']"))
+                return {"success": False, "auth_failed": auth,
+                        "message": "Cookie失效，请重新登录" if auth else "返回非JSON响应"}
+            if isinstance(data, dict) and "success" not in data and action in {"enter_beach", "collect_all_trash"}:
+                # 保留原沙滩接口的 JSON status 合约，搬砖仍要求布尔 success。
+                if data.get("status") == "success":
+                    data["success"] = True
+            if not isinstance(data, dict) or not isinstance(data.get("success"), bool):
+                return {"success": False, "message": "响应缺少布尔 success 字段"}
+            message = str(data.get("message", ""))[:500]
+            for secret in [cookie, *cookies.values()]:
+                if secret:
+                    message = message.replace(secret, "[已隐藏]")
+            data["message"] = message
+            if not data["success"]:
+                data["auth_failed"] = bool(re.search(r"登录|cookie.*(?:失效|过期|无效|invalid|expired)|login|unauth|not logged in", message, re.I))
+                data["message"] = message or "服务端业务失败"
+            return data
+        except requests.Timeout:
+            return {"success": False, "timeout": True, "message": "请求超时，操作结果待核对"}
+        except (requests.RequestException, ValueError) as exc:
+            # 网络异常文本可能带敏感请求信息，只保存异常类型。
+            return {"success": False, "message": f"请求失败：{exc.__class__.__name__}"}
 
     def __enter_beach(self, cookie: str) -> Dict[str, Any]:
-        try:
-            headers = {
-                "accept": "*/*",
-                "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
-                "content-type": "application/x-www-form-urlencoded",
-                "origin": self.BASE_URL,
-                "referer": f"{self.MOWAN_URL}",
-                "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36 Edg/148.0.0.0"
-            }
-
-            data = {"action": "enter_beach"}
-
-            logger.info("发送进入沙滩请求...")
-            response = requests.post(
-                self.MOWAN_URL,
-                headers=headers,
-                cookies=self.__cookie_to_dict(cookie),
-                data=data,
-                timeout=10,
-                verify=True
-            )
-
-            logger.info(f"进入沙滩响应状态码：{response.status_code}")
-
-            if response.status_code != 200:
-                return {"success": False, "message": f"HTTP {response.status_code}"}
-
-            try:
-                result = response.json()
-                logger.debug("进入沙滩收到 JSON 响应")
-                if not isinstance(result, dict):
-                    return {"success": False, "message": "响应格式异常"}
-                if result.get("success") or result.get("status") == "success":
-                    return {"success": True}
-                return {"success": False, "message": result.get("message", "未知错误")}
-            except (ValueError, TypeError):
-                html = response.text
-                if "登录" in html or "cookie" in html.lower():
-                    return {"success": False, "message": "Cookie失效，请重新登录"}
-                if "成功" in html:
-                    return {"success": True}
-                return {"success": False, "message": "返回非JSON响应"}
-
-        except requests.Timeout:
-            logger.error("进入沙滩请求超时")
-            return {"success": False, "message": "请求超时"}
-        except Exception as e:
-            logger.error(f"进入沙滩异常：{e}")
-            return {"success": False, "message": str(e)}
+        return self.__request_action(cookie, "enter_beach")
 
     def __collect_trash(self, cookie: str) -> Dict[str, Any]:
-        try:
-            headers = {
-                "accept": "*/*",
-                "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
-                "content-type": "application/x-www-form-urlencoded",
-                "origin": self.BASE_URL,
-                "referer": f"{self.MOWAN_URL}",
-                "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36 Edg/148.0.0.0"
-            }
+        result = self.__request_action(cookie, "collect_all_trash")
+        if result.get("success"):
+            data = result.get("data")
+            count = data.get("collected") if isinstance(data, dict) else result.get("collected")
+            if count is None:
+                found = re.search(r'收集了?\s*(\d+)\s*个?垃圾', result.get("message", ""))
+                count = int(found.group(1)) if found else None
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                return {"success": False, "message": "收集响应缺少有效数量"}
+            result["trash"] = count
+        return result
 
-            data = {"action": "collect_all_trash"}
+    @staticmethod
+    def __valid_brick_state(data: Dict[str, Any], sync: bool = False) -> bool:
+        fields = ["daily_bricks", "server_now", "next_brick_reset_ts"]
+        fields += ["last_brick_time"] if sync else ["bricks_moved"]
+        if any(isinstance(data.get(k), bool) or not isinstance(data.get(k), int) or data[k] < 0 for k in fields):
+            return False
+        reset = data.get("last_daily_reset")
+        return (isinstance(reset, (str, int)) and not isinstance(reset, bool) and reset != ""
+                and 0 <= data["daily_bricks"] <= 50
+                and data["next_brick_reset_ts"] > data["server_now"] > 0)
 
-            logger.info("发送一键收集请求...")
-            response = requests.post(
-                self.MOWAN_URL,
-                headers=headers,
-                cookies=self.__cookie_to_dict(cookie),
-                data=data,
-                timeout=15,
-                verify=True
-            )
-
-            logger.info(f"收集垃圾响应状态码：{response.status_code}")
-
-            if response.status_code != 200:
-                return {"success": False, "message": f"HTTP {response.status_code}"}
-
-            try:
-                result = response.json()
-                logger.debug("收集垃圾收到 JSON 响应")
-                if not isinstance(result, dict):
-                    return {"success": False, "message": "响应格式异常"}
-                trash_count = 0
-                if "data" in result and isinstance(result["data"], dict):
-                    trash_count = result["data"].get("collected", 0)
-                elif "collected" in result:
-                    trash_count = result.get("collected", 0)
-
-                if trash_count == 0 and "message" in result:
-                    msg = str(result["message"])
-                    # 只认“收集 N 个垃圾”，不能把冷却倒计时当作物品数。
-                    found = re.search(r'收集了?\s*(\d+)\s*个?垃圾', msg)
-                    if found:
-                        trash_count = int(found.group(1))
-
-                if result.get("success") is True or result.get("status") == "success" or trash_count > 0:
-                    return {"success": True, "trash": trash_count}
-                return {"success": False, "message": result.get("message", "未知错误")}
-            except (ValueError, TypeError):
-                html = response.text
-                if "登录" in html or "cookie" in html.lower():
-                    return {"success": False, "message": "Cookie失效，请重新登录"}
-                
-                trash_match = re.search(r'收集了?\s*(\d+)\s*个?垃圾', html)
-                if trash_match:
-                    return {"success": True, "trash": int(trash_match.group(1))}
-                
-                if "成功" in html:
-                    return {"success": True, "trash": 0}
-                return {"success": False, "message": "返回非JSON响应"}
-
-        except requests.Timeout:
-            logger.error("收集垃圾请求超时")
-            return {"success": False, "message": "请求超时"}
-        except Exception as e:
-            logger.error(f"收集垃圾异常：{e}")
-            return {"success": False, "message": str(e)}
+    def __move_bricks(self, cookie: str) -> Dict[str, Any]:
+        result = {"success": False, "message": "状态同步失败", "bricks_moved": 0}
+        state = self.__request_action(cookie, "sync_game_state")
+        if not state.get("success"):
+            return {**result, **state, "bricks_moved": 0}
+        if not self.__valid_brick_state(state, sync=True):
+            return {**result, "message": "状态同步字段缺失或异常"}
+        result.update(daily_bricks=state["daily_bricks"], last_daily_reset=state["last_daily_reset"],
+                      server_now=state["server_now"], next_brick_reset_ts=state["next_brick_reset_ts"])
+        if state["daily_bricks"] >= 50:
+            return {**result, "success": True, "message": "已达每日上限，正常跳过"}
+        uncertain = self._stats.get("brick_uncertain_reset")
+        if uncertain is not None and uncertain == state["last_daily_reset"]:
+            return {**result, "message": "上次写入结果不确定，等待服务端每日重置后再执行"}
+        self._stats.pop("brick_uncertain_reset", None)
+        last_run = self._stats.get("brick_last_run_server", 0)
+        if last_run and state["server_now"] - last_run < self._brick_cooldown_minutes * 60:
+            return {**result, "success": True, "message": "搬砖冷却中，正常跳过"}
+        # 最多50次，串行间隔2秒；每次必须有服务端数量进展。
+        for attempt in range(50):
+            if attempt:
+                time.sleep(2)
+            response = self.__request_action(cookie, "move_brick")
+            if response.get("timeout"):
+                synced = self.__request_action(cookie, "sync_game_state")
+                if synced.get("success") and self.__valid_brick_state(synced, sync=True):
+                    if synced["last_daily_reset"] == state["last_daily_reset"] and synced["daily_bricks"] > state["daily_bricks"]:
+                        result["bricks_moved"] += synced["daily_bricks"] - state["daily_bricks"]
+                        result["recovered_from_sync"] = True
+                        self._stats["brick_last_run_server"] = synced["server_now"]
+                    result.update({k: synced[k] for k in ("daily_bricks", "server_now", "last_daily_reset", "next_brick_reset_ts")})
+                self._stats["brick_uncertain_reset"] = result["last_daily_reset"]
+                return {**result, "auth_failed": synced.get("auth_failed", False),
+                        "message": "搬砖超时，已查询状态并停止；本轮不重试，待服务端每日重置"}
+            if not response.get("success"):
+                # 失败也可能携带当天计数，但不把它算成本次成功增量。
+                if self.__valid_brick_state({**response, "bricks_moved": 0}):
+                    result.update({k: response[k] for k in ("daily_bricks", "server_now", "last_daily_reset", "next_brick_reset_ts")})
+                    if response["daily_bricks"] == 50 and not response.get("auth_failed"):
+                        return {**result, "success": True, "message": "已达每日上限，正常跳过"}
+                self._stats["brick_uncertain_reset"] = result["last_daily_reset"]
+                return {**result, "auth_failed": response.get("auth_failed", False), "message": response["message"]}
+            if not self.__valid_brick_state(response):
+                self._stats["brick_uncertain_reset"] = state["last_daily_reset"]
+                return {**result, "message": "搬砖响应字段缺失或异常，停止"}
+            moved = response["bricks_moved"]
+            result.update({k: response[k] for k in ("daily_bricks", "server_now", "last_daily_reset", "next_brick_reset_ts")})
+            if (response["last_daily_reset"] != state["last_daily_reset"] or moved <= 0
+                    or response["daily_bricks"] - state["daily_bricks"] != moved
+                    or response["server_now"] < state["server_now"]):
+                self._stats["brick_uncertain_reset"] = response["last_daily_reset"]
+                return {**result, "message": "状态无进展、增量不一致或跨日重置，停止"}
+            result["bricks_moved"] += moved
+            self._stats["brick_last_run_server"] = response["server_now"]
+            state = response
+            if state["daily_bricks"] >= 50:
+                return {**result, "success": True, "message": "搬砖完成，已达每日上限"}
+        return {**result, "message": "已达最大请求次数，停止"}
 
     def __fetch_inventory(self, cookie: str) -> Optional[Dict[str, Any]]:
         """从库存 DOM 解析数据，避免正则匹配嵌套 div 时截断内容。"""
@@ -998,6 +966,7 @@ class SiQiCleanBeach(_PluginBase):
                 cookies=self.__cookie_to_dict(cookie),
                 timeout=15,
                 verify=True,
+                allow_redirects=False,
             )
             if response.status_code != 200:
                 logger.warning(f"思齐库存请求 HTTP {response.status_code}")
@@ -1013,7 +982,7 @@ class SiQiCleanBeach(_PluginBase):
                 if name_node is None or count_node is None:
                     continue
                 name = name_node.get_text(" ", strip=True)
-                if not name or name == "砖块":
+                if not name:
                     continue
                 raw_count = count_node.get_text(" ", strip=True).replace(",", "")
                 matched = re.search(r"\d+", raw_count)
@@ -1045,7 +1014,7 @@ class SiQiCleanBeach(_PluginBase):
             if site and site.cookie:
                 site_cookie = site.cookie
         except Exception as e:
-            logger.error(f"获取站点 Cookie 异常：{e}")
+            logger.error(f"获取站点 Cookie 异常：{e.__class__.__name__}")
         return site_cookie
 
     @staticmethod
@@ -1082,18 +1051,6 @@ class SiQiCleanBeach(_PluginBase):
 
     def __finish_task(self, result: Dict[str, Any]):
         """无论成功、失败或鉴权失效，都更新可见的最后结果。"""
-        status = result.get("status", "error")
-        if status in {"failed", "auth_failed", "error"}:
-            self._stats["last_update"] = result.get("timestamp", time.time())
-            self._stats["last_result"] = str(result.get("message", "执行失败"))[:200]
-            history = list(self._stats.get("history", []))
-            history.append({
-                "time": time.time(),
-                "result": self._stats["last_result"],
-                "total_count": int(self._stats.get("total_items_count", 0)),
-                "status": status,
-            })
-            self._stats["history"] = history[-20:]
         self._update_stats()
         if self._notify:
             try:
@@ -1104,6 +1061,8 @@ class SiQiCleanBeach(_PluginBase):
         try:
             self.update_config({
                 "enabled": self._enabled,
+                "auto_brick": self._auto_brick,
+                "brick_cooldown_minutes": self._brick_cooldown_minutes,
                 "cookie": self._cookie,
                 "schedule_mode": self._schedule_mode,
                 "cron": self._cron,
@@ -1114,7 +1073,7 @@ class SiQiCleanBeach(_PluginBase):
                 "inventory": self._inventory
             })
         except Exception as e:
-            logger.error(f"更新统计数据失败：{e}")
+            logger.error(f"更新统计数据失败：{e.__class__.__name__}")
 
     def __send_notification(self, result: Dict[str, Any]):
         title = "🏖️【思齐自动收垃圾插件】"
