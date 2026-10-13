@@ -951,19 +951,19 @@ class SiQiCleanBeach(_PluginBase):
                 if not isinstance(result, dict):
                     return {"success": False, "message": "响应格式异常"}
                 trash_count = 0
-                if isinstance(result, dict):
-                    if "data" in result and isinstance(result["data"], dict):
-                        trash_count = result["data"].get("collected", 0)
-                    elif "collected" in result:
-                        trash_count = result.get("collected", 0)
-                    
-                    if trash_count == 0 and "message" in result:
-                        msg = str(result["message"])
-                        numbers = re.findall(r'\d+', msg)
-                        if numbers:
-                            trash_count = int(numbers[0])
+                if "data" in result and isinstance(result["data"], dict):
+                    trash_count = result["data"].get("collected", 0)
+                elif "collected" in result:
+                    trash_count = result.get("collected", 0)
 
-                if result.get("success") or result.get("status") == "success" or trash_count > 0:
+                if trash_count == 0 and "message" in result:
+                    msg = str(result["message"])
+                    # 只认“收集 N 个垃圾”，不能把冷却倒计时当作物品数。
+                    found = re.search(r'收集了?\s*(\d+)\s*个?垃圾', msg)
+                    if found:
+                        trash_count = int(found.group(1))
+
+                if result.get("success") is True or result.get("status") == "success" or trash_count > 0:
                     return {"success": True, "trash": trash_count}
                 return {"success": False, "message": result.get("message", "未知错误")}
             except (ValueError, TypeError):
@@ -1036,6 +1036,7 @@ class SiQiCleanBeach(_PluginBase):
         except Exception as exc:
             logger.error(f"思齐库存解析失败：{exc.__class__.__name__}")
             return None
+
     def __get_site_cookie(self):
         site_cookie = ""
         try:
