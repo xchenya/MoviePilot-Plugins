@@ -6,9 +6,11 @@ import copy
 import json
 import re
 import threading
+import time
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List, Tuple
 from unittest.mock import Mock
 
 import pytest
@@ -53,11 +55,15 @@ def _isolated_class(*names: str):
         "BeautifulSoup": BeautifulSoup,
         "re": re,
         "threading": threading,
+        "time": time,
+        "datetime": datetime,
+        "List": List,
+        "Tuple": Tuple,
         "Dict": Dict,
         "Optional": Optional,
         "Any": Any,
         "logger": SimpleNamespace(
-            info=Mock(), debug=Mock(), warning=Mock(), error=Mock()
+            info=Mock(), debug=Mock(), warning=Mock(), error=Mock(), exception=Mock()
         ),
     }
     exec(compile(module, str(CODE), "exec"), namespace)
@@ -75,7 +81,7 @@ def test_v3_metadata_and_source_license():
     }
     market = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))
     entry = market["SiQiCleanBeach"]
-    assert attrs["plugin_version"] == entry["version"] == "2.0.0"
+    assert attrs["plugin_version"] == entry["version"] == "2.1.0"
     assert entry["system_version"] == ">=3.0.0"
     assert entry["release"] is False
     assert attrs["plugin_author"].startswith("bfjy")
@@ -139,7 +145,7 @@ def test_nested_html_inventory_parsing(monkeypatch):
     inventory = plugin._SiQiCleanBeach__fetch_inventory("c_secure_pass=x; cf_clearance=y")
     assert inventory["木材"]["count"] == 1234
     assert inventory["旧电池"]["count"] == 7
-    assert "砖块" not in inventory
+    assert inventory["砖块"]["count"] == 22
     assert get.call_args.kwargs["verify"] is True
     assert get.call_args.kwargs["timeout"] == 15
     assert get.call_args.kwargs["cookies"]["c_secure_pass"] == "x"
