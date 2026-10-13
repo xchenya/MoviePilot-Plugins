@@ -33,7 +33,8 @@ from app.schemas.types import NotificationType
 from fastapi import Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from app.adapters.web.security.access import verify_resource_token
-from .matching import associate_rescue_seeds
+from .matching import (associate_rescue_seeds, normalize_name, translated_release_key,
+                       translated_size_matches, is_trusted_hh_tracker)
 
 import requests
 
@@ -162,7 +163,7 @@ class HHClubButler(_PluginBase):
     plugin_name = "憨憨保种区管家"
     plugin_desc = "自动优选添加及换种工具\n保种管理器/Hosts加速"
     plugin_icon = "https://raw.githubusercontent.com/xchenya/MoviePilot-Plugins/main/plugins.v3/hhclubbutler/icon.png"
-    plugin_version = "3.0.6"
+    plugin_version = "3.0.7"
     plugin_author = "六个橙子"
     author_url = "https://github.com/SixOrg"
     plugin_config_prefix = "hhclubbutler_"
@@ -1048,7 +1049,7 @@ class HHClubButler(_PluginBase):
             logger.warning(f"预取下载器种子失败：{e}")
             return None
 
-    def _collect_rescue_seeds(self) -> list[dict]:
+    def _collect_rescue_seeds(self, strict_downloaders: bool = False) -> list[dict]:
         """Complete site rescue inventory, with optional downloader annotations.
 
         This view must NEVER call _get_current_seeding: that intersection is
@@ -1068,12 +1069,18 @@ class HHClubButler(_PluginBase):
         missing = requested - set(services)
         if missing:
             warnings.append("以下已选下载器不可用：" + "、".join(sorted(missing)))
+            if strict_downloaders:
+                raise RuntimeError("管理下载器不可用，不能核实删除目标")
         if not services:
+            if strict_downloaders:
+                raise RuntimeError("未配置有效的管理下载器，不能核实删除目标")
             warnings.append("未选择可用下载器，站点清单仍会完整显示")
         for name, service in services.items():
             try:
                 torrents, error = service.instance.get_torrents()
                 if error or torrents is None:
+                    if strict_downloaders:
+                        raise RuntimeError(f"下载器 {name} 读取失败，拒绝删除")
                     warnings.append(f"{name} 种子读取失败")
                     continue
                 try:
@@ -1101,8 +1108,11 @@ class HHClubButler(_PluginBase):
                     except (ValueError, TypeError):
                         size_gb = None
                     tracker = self._extract_tracker_text(torrent, dl_type)
-                    site_tracker = any(d in tracker.casefold() for d in
-                                       ("hhanclub", "hhancclub", "hhclub", "hanclub"))
+                    trusted_tracker = is_trusted_hh_tracker(tracker)
+                    site_tracker = trusted_tracker or any(
+                        d in tracker.casefold() for d in
+                        ("hhanclub", "hhancclub", "hhclub", "hanclub")
+                    )
                     parsed_domain = re.search(r"https?://([A-Za-z0-9.:-]+)", tracker)
                     try:
                         added = g("added_on", "date_added", "dateAdded")
@@ -1116,6 +1126,7 @@ class HHClubButler(_PluginBase):
                         "progress": progress, "size_gb": size_gb,
                         "state": str(g("state", "status") or ""),
                         "site_tracker": site_tracker,
+                        "trusted_tracker": trusted_tracker,
                         "upspeed": g("upspeed", "rateUpload", "upload_speed", "uploadRate"),
                         "dlspeed": g("dlspeed", "rateDownload", "download_speed", "downloadRate"),
                         "eta": g("eta"), "ratio": g("ratio", "uploadRatio"),
@@ -1129,6 +1140,8 @@ class HHClubButler(_PluginBase):
                 logger.info(f"憨憨保种管理器：下载器 {name} 读取完成，种子 {len(torrents)} 条")
             except Exception as e:
                 logger.warning(f"憨憨保种管理器：下载器 {name} 数据解析失败：{e}")
+                if strict_downloaders:
+                    raise RuntimeError(f"下载器 {name} 数据不完整，拒绝删除") from e
                 warnings.append(f"{name} 数据解析失败")
         rows, stats = associate_rescue_seeds(completed, downloader_rows)
         self._list_warning = "；".join(warnings)
@@ -1428,7 +1441,7 @@ tr.sel td{background:var(--tr-sel);color:#fff}
 <span>已选体积 <b id="selgb">0</b> GB</span>
 <span>总体积 <b id="totalgb">0</b> GB</span>
 <span>下载器已关联 <b id="linkedCount">0</b> 个</span>
-<span>译名匹配 <b id="translatedCount">0</b> 个（仅查看）</span>
+<span>译名关联 <b id="translatedCount">0</b> 个</span>
 <span>未关联 <b id="unlinkedCount">0</b> 个</span>
 <span>待核对 <b id="verifyCount">0</b> 个</span>
 <span title="这里显示憨憨站上全部可保种记录。未匹配下载器不代表站点没有资格；下载器任务删除后仍保留站点记录。">列表来源：憨憨站 · 关联仅供核对</span>
@@ -1638,7 +1651,8 @@ var title=document.getElementById("hhConfirmTitle");
 var desc=document.getElementById("hhConfirmDesc");
 title.textContent=items.length===1?"确认删除种子":"确认批量删除";
 desc.textContent=items.length===1
-  ?"种子名称：\n"+(items[0].title||"")+"\n下载器："+(items[0].downloader||"-")
+  ?"种子名称：\n"+(items[0].title||"")+"\n下载器："+(items[0].downloader||"-")+
+   (items[0].match_status==="translated"?"\n已核验：忽略中文译名后英文发布名一致、大小一致、Tracker 属于憨憨站。":"")
   :"将删除所选 "+items.length+" 个种子，涉及的下载器任务和文件将一并删除。";
 dialogResolve=resolve;
 overlay.hidden=false;
@@ -1730,7 +1744,7 @@ return "unknown";
 async function delOne(seed){
 if(deletionBusy)return;
 if(!seed.can_delete||!seed.downloader||!seed.hash){
-showToast("当前种子未通过下载器、名称及 Tracker 精确核验，不能直接删除文件。","warn");return;
+showToast("当前种子未通过名称、大小、Tracker 和哈希的完整核验，不能直接删除文件。","warn");return;
 }
 if(!await openDeleteDialog([seed]))return;
 await doDel([seed]);
@@ -1959,45 +1973,86 @@ buildHead();load(false);resumePendingDelete();
     def _delete_rescue_exact(self, title: str = "", downloader: str = "",
                             torrent_hash: str = "", confirm: bool = False,
                             generation: int | None = None):
-        """删除必须以站点真实在保种子、下载器、精确哈希共同确认，拒绝模糊匹配。"""
+        """Delete only after fresh, unique site+downloader identity verification.
+
+        For Chinese-prefixed releases the complete English suffix and size
+        must agree, and tracker.hhanclub.net must be verified by hostname.
+        """
         if not self._enabled or self._stopped:
             return {"success": False, "state": "failed", "message": "插件未启用或正在重载，拒绝删除"}
         if generation is not None and generation != self._delete_generation:
             return {"success": False, "state": "failed", "message": "插件配置已更新，已取消旧删除操作"}
-        if not self._enabled:
-            return {"success": False, "message": "插件未启用，拒绝删除"}
         if not (confirm and title and downloader and torrent_hash):
-            return {"success": False, "message": "必须提供 title、downloader、torrent_hash 并确认删除"}
-        normalized = self._norm_title(title)
-        if not normalized or downloader not in self._downloaders:
-            return {"success": False, "message": "下载器或种子名称无效"}
+            return {"success": False, "state": "failed", "message": "必须提供完整标识和删除确认"}
+        canon = normalize_name(title)
+        if not canon or downloader not in self._downloaders:
+            return {"success": False, "state": "failed", "message": "下载器或种子名称无效"}
+        dispatched = False
         try:
-            current = self._get_current_seeding([])
-            if current.get("error") or current.get("degraded"):
-                return {"success": False, "message": "站点在保数据不完整，已中止删除"}
-            if not any(self._norm_title(seed.get("title") or "") == normalized
-                       for seed in (current.get("seeds") or [])):
-                return {"success": False, "message": "站点当前在保列表中未找到该种子"}
+            # The previous response may have been cached for 180 seconds.
+            # Require fresh site records and ALL managed downloader snapshots
+            # before making a destructive decision.
+            current = self._collect_rescue_seeds(strict_downloaders=True)
+            candidates = [row for row in current if normalize_name(row.get("title")) == canon]
+            if len(candidates) != 1:
+                return {"success": False, "state": "failed",
+                        "message": "站点记录缺失或重复，无法唯一确认删除对象"}
+            row = candidates[0]
+            match_type = row.get("match_status")
+            if (match_type not in ("exact", "translated")
+                    or not row.get("can_delete")
+                    or row.get("downloader") != downloader
+                    or str(row.get("hash") or "").casefold() != torrent_hash.casefold()):
+                return {"success": False, "state": "failed",
+                        "message": "站点与下载器最新关联未通过核验，拒绝删除"}
             service = self._get_manage_services().get(downloader)
             if not service:
-                return {"success": False, "message": "指定下载器不可用"}
+                return {"success": False, "state": "failed", "message": "指定下载器不可用"}
             torrents, error = service.instance.get_torrents()
             if error or torrents is None:
-                return {"success": False, "message": "下载器种子列表获取失败"}
-            matched = []
+                return {"success": False, "state": "failed", "message": "下载器任务读取失败，拒绝删除"}
+            matched_hashes = set()
             for torrent in torrents:
-                name = (torrent.get("name") if isinstance(torrent, dict)
-                        else getattr(torrent, "name", ""))
-                value = (torrent.get("hash") if isinstance(torrent, dict)
-                         else getattr(torrent, "hash", None) or getattr(torrent, "hashString", ""))
-                if self._norm_title(name or "") != normalized or str(value or "").lower() != torrent_hash.lower():
+                def g(*keys):
+                    for key in keys:
+                        val = (torrent.get(key) if isinstance(torrent, dict)
+                               else getattr(torrent, key, None))
+                        if val is not None:
+                            return val
+                    return None
+                remote_hash = str(g("hash", "hashString") or "").lower()
+                if remote_hash != torrent_hash.lower():
                     continue
-                tracker = self._extract_tracker_text(torrent).lower()
-                if not any(k in tracker for k in ("hhanclub", "hhclub", "hanclub")):
-                    return {"success": False, "message": "无法确认本站 Tracker，拒绝删除文件"}
-                matched.append(value)
-            if len(matched) != 1:
-                return {"success": False, "message": "未找到唯一精确匹配的下载器任务"}
+                remote_name = str(g("name") or "")
+                tracker_text = self._extract_tracker_text(torrent)
+                if match_type == "translated":
+                    if translated_release_key(remote_name) != canon:
+                        return {"success": False, "state": "failed",
+                                "message": "下载器英文发布名已经变化，拒绝删除"}
+                    if not is_trusted_hh_tracker(tracker_text):
+                        return {"success": False, "state": "failed",
+                                "message": "未能确认 tracker.hhanclub.net，拒绝删除"}
+                    size_bytes = (g("total_size") or g("totalSize") or g("size"))
+                    try:
+                        size_gb = float(size_bytes) / 1073741824 if size_bytes else 0
+                    except (ValueError, TypeError):
+                        size_gb = 0
+                    if not translated_size_matches(row, {"size_gb": size_gb}):
+                        return {"success": False, "state": "failed",
+                                "message": "下载器体积与站点不一致，拒绝删除"}
+                else:
+                    if self._norm_title(remote_name) != self._norm_title(title):
+                        return {"success": False, "state": "failed",
+                                "message": "下载器名称发生变化，拒绝删除"}
+                    if not any(x in tracker_text.casefold()
+                               for x in ("hhanclub", "hhclub", "hanclub")):
+                        return {"success": False, "state": "failed",
+                                "message": "无法确认本站 Tracker，拒绝删除"}
+                matched_hashes.add(remote_hash)
+            if len(matched_hashes) != 1:
+                return {"success": False, "state": "failed",
+                        "message": "下载器未找到唯一核验的种子哈希"}
+            matched = [torrent_hash]
             # Do not delete if this plugin was disabled/reloaded while
             # waiting for the site or downloader.
             if self._stopped or (generation is not None and generation != self._delete_generation):
