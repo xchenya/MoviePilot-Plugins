@@ -37,7 +37,7 @@ class StatsResponse(BaseModel):
 class SiQiCleanBeach(_PluginBase):
     plugin_name = "思齐自动收垃圾"
     plugin_desc = "自动在思齐站点清理沙滩并收集垃圾，支持Cron和间隔定时。"
-    plugin_icon = "Moviepilot_A.png"
+    plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Moviepilot_A.png"
     plugin_version = "2.0.0"
     plugin_author = "bfjy（V3 适配：xchenya）"
     author_url = "https://bfjy2024.github.io/bfjy"
