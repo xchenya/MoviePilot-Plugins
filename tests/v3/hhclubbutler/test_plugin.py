@@ -1,4 +1,4 @@
-"""HHClubButler V3.0.1 contracts and deletion safety without a real downloader."""
+"""HHClubButler V3.0.3 contracts and deletion safety without a real downloader."""
 from __future__ import annotations
 
 import ast
@@ -39,7 +39,7 @@ def test_v3_metadata_and_v2_fallback_disabled():
     }
     market_v3 = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))
     market_v2 = json.loads((ROOT / "package.v2.json").read_text(encoding="utf-8"))
-    assert attrs["plugin_version"] == "3.0.2"
+    assert attrs["plugin_version"] == "3.0.3"
     assert market_v3["HHClubButler"]["version"] == attrs["plugin_version"]
     assert market_v3["HHClubButler"]["system_version"] == ">=3.0.0"
     assert market_v3["HHClubButler"]["release"] is False
@@ -58,7 +58,7 @@ def test_page_endpoints_require_cookie_admin():
     api_src = ast.get_source_segment(source, api)
     assert 'page_deps = [Depends(_require_resource_admin)]' in api_src
     assert 'allow_anonymous": True, "dependencies": page_deps' in api_src
-    assert api_src.count('"allow_anonymous": True, "dependencies": page_deps') == 5
+    assert api_src.count('"allow_anonymous": True, "dependencies": page_deps') == 6
     assert '"auth": "bear"' in api_src
     assert '"/refresh_overview"' in api_src
     assert '"methods": ["POST"]' in api_src
@@ -80,23 +80,23 @@ def test_html_pages_never_embed_server_api_token():
 
 def _deletion_method():
     # Compile only the deletion method: no MoviePilot runtime, network or filesystem.
-    node = _method("api_delete_rescue_seed")
+    node = _method("_delete_rescue_exact")
     namespace = {"logger": SimpleNamespace(info=Mock(), error=Mock())}
     module = ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[]))
     exec(compile(module, "<isolated-delete-method>", "exec"), namespace)
-    return namespace["api_delete_rescue_seed"]
+    return namespace["_delete_rescue_exact"]
 
 
 def _fixture(*, hash_value="HASH123", tracker="https://hhanclub.example/announce",
              torrent_name="Sample.Movie"):
-    delete_mock = Mock()
+    delete_mock = Mock(return_value=True)
+    record = {"name": torrent_name, "hash": hash_value, "tracker": tracker}
     client = SimpleNamespace(
-        get_torrents=lambda: ([{"name": torrent_name,
-                               "hash": hash_value, "tracker": tracker}], None),
+        get_torrents=lambda: ([] if delete_mock.called else [record], None),
         delete_torrents=delete_mock,
     )
     host = SimpleNamespace(
-        _enabled=True,
+        _enabled=True, _stopped=False, _delete_generation=0,
         _downloaders=["QB"],
         _norm_title=lambda name: (name or "").casefold().replace(".", ""),
         _extract_tracker_text=lambda torrent: torrent.get("tracker", ""),

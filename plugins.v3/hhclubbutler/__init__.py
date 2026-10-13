@@ -155,7 +155,7 @@ class HHClubButler(_PluginBase):
     plugin_name = "憨憨保种区管家"
     plugin_desc = "自动优选添加及换种工具\n保种管理器/Hosts加速"
     plugin_icon = "https://raw.githubusercontent.com/xchenya/MoviePilot-Plugins/main/plugins.v3/hhclubbutler/icon.png"
-    plugin_version = "3.0.2"
+    plugin_version = "3.0.3"
     plugin_author = "六个橙子"
     author_url = "https://github.com/SixOrg"
     plugin_config_prefix = "hhclubbutler_"
@@ -215,6 +215,12 @@ class HHClubButler(_PluginBase):
         self._list_generation = 0
         self._list_thread = None
         self._list_cache_ttl = 180.0
+        # Short HTTP requests start/recover a single deletion job by request_id.
+        # Never automatically repeat a destructive command when response is lost.
+        self._delete_lock = threading.Lock()
+        self._delete_jobs = {}
+        self._delete_active_id = None
+        self._delete_generation = 0
         self._overview_refresh_lock = threading.Lock()
         self._overview_launch_lock = threading.Lock()
         self._overview_manual_thread = None
@@ -335,7 +341,11 @@ class HHClubButler(_PluginBase):
              "summary": "当前保种种子", "response_model": RescueSeedList},
             {"path": "/delete_rescue_seed", "endpoint": self.api_delete_rescue_seed,
              "methods": ["POST"], "allow_anonymous": True, "dependencies": page_deps,
-             "summary": "按下载器与哈希删除任务及文件",
+             "summary": "提交经确认的后台删除任务",
+             "response_model": OperationResult},
+            {"path": "/delete_rescue_status", "endpoint": self.api_delete_rescue_status,
+             "methods": ["GET"], "allow_anonymous": True, "dependencies": page_deps,
+             "summary": "查询删除任务状态（绝不执行删除）",
              "response_model": OperationResult},
             {"path": "/rescue_panel", "endpoint": self.api_rescue_panel,
              "methods": ["GET"], "allow_anonymous": True, "dependencies": page_deps,
@@ -884,6 +894,10 @@ class HHClubButler(_PluginBase):
 
     def stop_service(self):
         self._stopped = True
+        with self._delete_lock:
+            # Reconfiguration invalidates an in-flight job's permission to send
+            # a deletion after a potentially long site lookup.
+            self._delete_generation += 1
         with self._list_lock:
             # A prior worker may still be waiting on a remote site: invalidate
             # its generation so it cannot overwrite cache after reconfiguration.
@@ -1029,8 +1043,19 @@ class HHClubButler(_PluginBase):
         """Slow read-only snapshot. Never call this from the HTTP request thread."""
         t0 = time.monotonic()
         logs = []
-        torrents = self._prefetch_downloader_torrents()
-        logger.info(f"憨憨保种管理器：下载器读取耗时 {time.monotonic() - t0:.1f}s，记录 {len(torrents or [])}")
+        # A genuinely empty downloader is not a failed downloader.  Do not
+        # pass None to _get_current_seeding: its legacy fallback would show
+        # every site-completed torrent as if it were still in a downloader.
+        services = self._get_manage_services()
+        if not services:
+            raise RuntimeError("未配置可用下载器")
+        torrents = []
+        for name, service in services.items():
+            items, error = service.instance.get_torrents()
+            if error or items is None:
+                raise RuntimeError(f"下载器 {name} 读取种子失败")
+            torrents.extend((name, torrent) for torrent in items)
+        logger.info(f"憨憨保种管理器：下载器读取耗时 {time.monotonic() - t0:.1f}s，记录 {len(torrents)}")
         cur = self._get_current_seeding(logs, torrents=torrents)
         if cur.get("error") or cur.get("degraded"):
             raise RuntimeError("站点完成页或下载器数据不完整")
@@ -1048,6 +1073,10 @@ class HHClubButler(_PluginBase):
         for item in cur.get("seeds") or []:
             seed = dict(item)
             key = self._norm_title(seed.get("title") or "")
+            # A matching completed-page record alone does not prove a torrent
+            # is still in our downloaders. Drop fuzzy-only/stale site matches.
+            if not names.get(key):
+                continue
             detail = details.get(key) if names.get(key) == 1 else None
             if detail:
                 for field in ("upspeed", "dlspeed", "eta", "ratio", "path",
@@ -1286,6 +1315,21 @@ tr.sel td{background:var(--tr-sel);color:#fff}
 .chip{font-size:10px;padding:3px 8px}
 .btn{padding:5px 9px}
 }
+
+/* V3 confirmation overlay and notices: theme-aware, no native browser dialogs */
+.hh-overlay[hidden],.hh-toast[hidden]{display:none !important}
+.hh-overlay{position:fixed;inset:0;z-index:1500;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(0,0,0,.63);backdrop-filter:blur(5px)}
+.hh-dialog{width:min(480px,100%);background:var(--picker-bg);color:var(--fg);border:1px solid var(--input-border);border-radius:14px;box-shadow:0 26px 80px rgba(0,0,0,.45);overflow:hidden}
+.hh-dialog-head{padding:22px 24px 8px;display:flex;align-items:center;gap:10px;font-size:17px;font-weight:700}
+.hh-warning-icon{width:34px;height:34px;display:inline-flex;align-items:center;justify-content:center;border-radius:10px;background:rgba(239,68,68,.15);color:#ef4444;font-size:22px;flex:none}
+.hh-dialog-desc{padding:12px 24px 18px;white-space:pre-wrap;overflow-wrap:anywhere;max-height:42vh;overflow:auto;line-height:1.7;font-size:13px;color:var(--fg)}
+.hh-dialog-note{margin:0 24px 20px;padding:11px 12px;border-radius:8px;background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.25);color:var(--fg);line-height:1.5}
+.hh-dialog-actions{display:flex;justify-content:flex-end;gap:10px;padding:15px 24px 20px;border-top:1px solid var(--border)}
+.hh-dialog-actions .btn{padding:9px 16px;border-radius:8px;font-size:13px}
+.hh-toast{position:fixed;z-index:1600;right:20px;bottom:20px;min-width:220px;max-width:min(480px,calc(100vw - 40px));background:var(--picker-bg);color:var(--fg);border:1px solid var(--input-border);border-left:4px solid var(--btn);padding:13px 17px;border-radius:9px;box-shadow:0 12px 38px rgba(0,0,0,.30);white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.55;font-size:13px}
+.hh-toast.good{border-left-color:#22c55e}.hh-toast.bad{border-left-color:#ef4444}.hh-toast.warn{border-left-color:#f59e0b}
+.btn:disabled{opacity:.55;cursor:not-allowed}
+@media(max-width:720px){.hh-overlay{padding:12px}.hh-dialog-head{padding:18px 18px 8px}.hh-dialog-desc{padding:10px 18px 16px}.hh-dialog-note{margin:0 18px 16px}.hh-dialog-actions{padding:12px 18px 18px}}
 </style></head><body>
 <div class="topbar">
 <h1>保种管理器</h1>
@@ -1298,7 +1342,8 @@ tr.sel td{background:var(--tr-sel);color:#fff}
 <div class="qk"><span id="dlAll">全选</span><span id="dlNone">清空</span></div>
 <div id="dlList"></div></div></span>
 <input class="search" id="q" placeholder="搜索名称...">
-<button class="btn danger" id="btnDel">删除选中</button>
+<button class="btn ghost" type="button" id="btnRefresh" title="重新从站点和下载器获取最新列表">⟳ 刷新列表</button>
+<button class="btn danger" type="button" id="btnDel">删除选中</button>
 <button class="btn ghost" id="colsBtn">列选择</button>
 <select class="themebtn" id="themeSel" title="选择皮肤" style="cursor:pointer;"><option value="light">纯白</option><option value="cream">米黄暖</option><option value="sakura">樱花粉</option><option value="mint">薄荷绿</option><option value="sky">天空蓝</option><option value="lavender">薰衣草紫</option><option value="silver">银灰金属</option><option value="dark">深灰</option><option value="graphite">石墨蓝</option><option value="midnight">午夜蓝</option><option value="navy">深蓝</option><option value="plum">暗紫</option><option value="charcoal">炭灰暖</option><option value="forest">暗夜绿</option><option value="hc">高对比</option></select>
 <button class="btn ghost" id="btnExit" title="关闭管理器">退出</button>
@@ -1322,6 +1367,18 @@ tr.sel td{background:var(--tr-sel);color:#fff}
 <span>已选体积 <b id="selgb">0</b> GB</span>
 <span>总体积 <b id="totalgb">0</b> GB</span>
 </div>
+<div class="hh-overlay" id="hhConfirmOverlay" hidden>
+  <div class="hh-dialog" role="dialog" aria-modal="true" aria-labelledby="hhConfirmTitle" aria-describedby="hhConfirmDesc">
+    <div class="hh-dialog-head"><span class="hh-warning-icon" aria-hidden="true">!</span><span id="hhConfirmTitle">确认删除种子</span></div>
+    <div class="hh-dialog-desc" id="hhConfirmDesc"></div>
+    <div class="hh-dialog-note">此操作会同时移除下载器任务及相关文件，不能通过插件撤销。</div>
+    <div class="hh-dialog-actions">
+      <button class="btn ghost" type="button" id="hhCancelDelete">取消</button>
+      <button class="btn danger" type="button" id="hhAcceptDelete">确认删除文件</button>
+    </div>
+  </div>
+</div>
+<div class="hh-toast" id="hhToast" role="status" aria-live="polite" hidden></div>
 <script>
 var COLS=[
 {k:"c_sid",t:"种子ID",w:"70",r:1,sortk:"seed_id"},
@@ -1463,37 +1520,193 @@ return;
 }
 }finally{clearInterval(ticker);}
 }
-async function delOne(seed){
-if(!seed.downloader||!seed.hash){alert("无法确定下载器或哈希，已拒绝删除");return;}
-if(!confirm("确认删除种子:\\n"+seed.title+"\\n\\n将同时删除下载器任务和文件!"))return;
-await doDel([seed]);}
-async function delSel(){
-var items=seeds.filter(function(s){return sel[s.title]});
-if(!items.length){alert("未选中任何种子");return;}
-if(items.some(function(s){return !s.downloader||!s.hash;})){
-alert("所选种子含未匹配下载器或哈希的任务，请取消勾选后重试");return;}
-if(!confirm("确认删除选中的 "+items.length+" 个种子?\\n将同时删除下载器任务和文件!"))return;
-await doDel(items);}
-async function doDel(items){
-var removed={};
-for(var i=0;i<items.length;i++){
-var item=items[i],name=item.title||"";
-try{
-var params=new URLSearchParams({title:name,downloader:item.downloader,
-torrent_hash:item.hash,confirm:"true"});
-var r=await fetch("/api/v1/plugin/HHClubButler/delete_rescue_seed?"+params.toString(),
-{method:"POST",credentials:"same-origin",headers:{"X-HHClub-Request":"1"}});
-if(!r.ok)throw Error("HTTP "+r.status);
-var j=await r.json();
-if(!j.success){alert("删除失败："+name+" -> "+(j.message||"未知错误"));}
-else{removed[item.downloader+"|"+item.hash]=1;delete sel[name];}
-}catch(e){alert("删除异常："+name+" "+e);}
+var deletionBusy=false,toastTimer=null,dialogResolve=null;
+var pendingKey="hhclubbutler_delete_pending_v1";
+function showToast(message,kind,duration){
+var box=document.getElementById("hhToast");
+box.textContent=String(message||"");
+box.className="hh-toast "+(kind||"info");
+box.hidden=false;
+if(toastTimer)clearTimeout(toastTimer);
+if(duration!==0)toastTimer=setTimeout(function(){box.hidden=true;},duration||7500);
 }
-if(Object.keys(removed).length){
-seeds=seeds.filter(function(s){return !removed[(s.downloader||"")+"|"+(s.hash||"")]});
-doSort();render();
-}}
+function savePending(item){
+try{sessionStorage.setItem(pendingKey,JSON.stringify(item))}catch(e){}
+}
+function readPending(){
+try{return JSON.parse(sessionStorage.getItem(pendingKey)||"null")}catch(e){return null}
+}
+function clearPending(){
+try{sessionStorage.removeItem(pendingKey)}catch(e){}
+}
+function toggleDeletionBusy(busy){
+deletionBusy=!!busy;
+document.getElementById("btnDel").disabled=deletionBusy;
+document.getElementById("hhAcceptDelete").disabled=deletionBusy;
+}
+function openDeleteDialog(items){
+return new Promise(function(resolve){
+if(dialogResolve){resolve(false);return;}
+var overlay=document.getElementById("hhConfirmOverlay");
+var title=document.getElementById("hhConfirmTitle");
+var desc=document.getElementById("hhConfirmDesc");
+title.textContent=items.length===1?"确认删除种子":"确认批量删除";
+desc.textContent=items.length===1
+  ?"种子名称：\n"+(items[0].title||"")+"\n下载器："+(items[0].downloader||"-")
+  :"将删除所选 "+items.length+" 个种子，涉及的下载器任务和文件将一并删除。";
+dialogResolve=resolve;
+overlay.hidden=false;
+document.getElementById("hhCancelDelete").focus();
+});
+}
+function closeDeleteDialog(accepted){
+if(!dialogResolve)return;
+var resolve=dialogResolve;dialogResolve=null;
+document.getElementById("hhConfirmOverlay").hidden=true;
+resolve(!!accepted);
+}
+document.getElementById("hhCancelDelete").onclick=function(){closeDeleteDialog(false)};
+document.getElementById("hhAcceptDelete").onclick=function(){closeDeleteDialog(true)};
+document.getElementById("hhConfirmOverlay").onclick=function(e){
+if(e.target===this)closeDeleteDialog(false);
+};
+document.addEventListener("keydown",function(e){
+if(e.key==="Escape"&&dialogResolve){e.preventDefault();closeDeleteDialog(false)}
+});
+function createRequestId(){
+if(window.crypto&&window.crypto.randomUUID)return window.crypto.randomUUID();
+return Date.now().toString(36)+"-"+Math.random().toString(36).slice(2)+Math.random().toString(36).slice(2);
+}
+async function fetchJson(url,opts){
+var ctl=typeof AbortController!=="undefined"?new AbortController():null;
+var timer=ctl?setTimeout(function(){ctl.abort()},12000):null;
+try{
+var options=Object.assign({credentials:"same-origin",cache:"no-store"},opts||{});
+if(ctl)options.signal=ctl.signal;
+var response=await fetch(url,options);
+if(!response.ok)throw new Error("HTTP "+response.status);
+return await response.json();
+}finally{if(timer)clearTimeout(timer);}
+}
+async function pollDeleteStatus(id){
+var deadline=Date.now()+10*60*1000,errors=0,missing=0;
+while(Date.now()<deadline){
+try{
+var payload=await fetchJson("/api/v1/plugin/HHClubButler/delete_rescue_status?request_id="+encodeURIComponent(id));
+if(!payload.success){
+if(++missing<3){await new Promise(function(r){setTimeout(r,2000)});continue;}
+return {status:"unknown",message:payload.message||"未找到删除任务"};
+}
+var job=payload.data||{},state=job.status||"unknown";
+if(state==="verified"||state==="failed"||state==="uncertain")return job;
+if(state!=="running"&&state!=="queued")return {status:"unknown",message:"未知任务状态"};
+errors=0;missing=0;
+showToast("删除任务执行中（"+Math.floor(job.elapsed_seconds||0)+" 秒）\n"+(job.title||"")+" \n正在等待下载器确认，请勿重复提交","info",0);
+await new Promise(function(r){setTimeout(r,2500)});
+}catch(e){
+if(++errors>=3)return {status:"unknown",message:"状态查询中断："+e};
+await new Promise(function(r){setTimeout(r,2500)});
+}
+}
+return {status:"unknown",message:"等待任务结果超时；任务可能仍在后台运行"};
+}
+function forgetVerifiedItem(item){
+var hash=String(item.hash||"").toLowerCase();
+seeds=seeds.filter(function(seed){
+return !(seed.downloader===item.downloader&&String(seed.hash||"").toLowerCase()===hash);
+});
+delete sel[item.title];doSort();buildDlList();render();
+}
+async function followDeletion(record,reload){
+var job=await pollDeleteStatus(record.id);
+if(job.status==="verified"){
+forgetVerifiedItem(record.item);
+clearPending();
+showToast("已确认删除：" +(record.item.title||"")+"\n列表缓存已失效","good",5000);
+if(reload)load(true);
+return "verified";
+}
+if(job.status==="failed"){
+clearPending();
+showToast("删除未执行：" +(job.message||"请检查插件日志"),"bad",10000);
+return "failed";
+}
+if(job.status==="uncertain"){
+clearPending();
+showToast("删除状态尚未确认："+(job.message||"请重新读取下载器状态")+"\n不会自动再次删除，请刷新列表核对。","warn",12000);
+load(true);
+return "uncertain";
+}
+clearPending();
+showToast("结果未知："+(job.message||"状态查询失败")+"\n请先刷新列表并核对下载器；不会自动重新发送删除。","warn",0);
+return "unknown";
+}
+async function delOne(seed){
+if(deletionBusy)return;
+if(!seed.downloader||!seed.hash){
+showToast("无法精确确认下载器或种子哈希，已拒绝删除。可以先点击刷新列表。","warn");return;
+}
+if(!await openDeleteDialog([seed]))return;
+await doDel([seed]);
+}
+async function delSel(){
+if(deletionBusy)return;
+var items=seeds.filter(function(item){return !!sel[item.title]});
+if(!items.length){showToast("请先勾选需要删除的种子。","warn");return;}
+if(items.some(function(item){return !item.downloader||!item.hash})){
+showToast("所选种子有无法确认下载器或哈希的项目，请取消勾选后再试。","warn");return;
+}
+if(!await openDeleteDialog(items))return;
+await doDel(items);
+}
+async function doDel(items){
+if(deletionBusy)return;
+var old=readPending();
+if(old){showToast("上一次删除的结果尚未确认。请重新打开页面查询进度，避免重复提交。","warn",10000);return;}
+toggleDeletionBusy(true);
+var done=0, failed=false;
+try{
+for(var i=0;i<items.length;i++){
+var item=items[i],id=createRequestId(),record={id:id,item:item,started:Date.now()};
+savePending(record);
+showToast("正在提交删除请求：" +(item.title||"")+"\n请勿重复点击或关闭页面。","info",0);
+var submitted=null;
+try{
+var params=new URLSearchParams({title:item.title,downloader:item.downloader,
+torrent_hash:item.hash,confirm:"true",request_id:id});
+submitted=await fetchJson("/api/v1/plugin/HHClubButler/delete_rescue_seed?"+params.toString(),
+{method:"POST",headers:{"X-HHClub-Request":"1"}});
+}catch(e){
+showToast("请求提交结果未确认，正在按任务编号查询状态。\n不会重新发送删除命令。","warn",0);
+}
+if(submitted&&!submitted.success){
+clearPending();showToast("无法提交删除："+(submitted.message||"未知错误"),"bad",10000);
+failed=true;break;
+}
+var state=await followDeletion(record,false);
+if(state==="verified")done++;
+else {failed=true;break;}
+}
+if(done) {
+showToast("已确认删除 "+done+" 个种子，正在刷新最新列表。","good",7000);
+load(true);
+}
+}finally{toggleDeletionBusy(false);}
+}
+async function resumePendingDelete(){
+var record=readPending();
+if(!record||!record.id||!record.item)return;
+toggleDeletionBusy(true);
+showToast("检测到上次未完成的删除任务，仅查询其执行状态，不会重复提交。","info",0);
+try{await followDeletion(record,true)}
+finally{toggleDeletionBusy(false)}
+}
 document.getElementById("btnDel").onclick=delSel;
+document.getElementById("btnRefresh").onclick=function(){
+if(deletionBusy){showToast("请先等待删除任务结果，避免列表与任务状态冲突。","warn");return}
+showToast("正在重新获取站点与下载器种子列表…","info",3500);
+load(true);
+};
 document.getElementById("q").oninput=function(){query=this.value.trim().toLowerCase();render()};
 document.querySelectorAll(".topbar .chip").forEach(function(c){c.onclick=function(){document.querySelectorAll(".topbar .chip").forEach(function(x){x.classList.remove("active")});this.classList.add("active");curTier=this.dataset.tier;render()}});
 var dp=document.getElementById("dlpicker");
@@ -1532,14 +1745,138 @@ try{var lt=localStorage.getItem(THEME_KEY);if(lt)applyTheme(lt);else applyTheme(
 var sel=document.getElementById("themeSel");
 sel.value=document.body.getAttribute("data-theme")||"dark";
 sel.onchange=function(){applyTheme(this.value)};
-document.getElementById("btnExit").onclick=function(){try{window.close()}catch(e){}setTimeout(function(){window.close()},100);if(!window.closed)alert("濡傛湭鑷姩鍏抽棴锛岃鎵嬪姩鍏抽棴鏈爣绛鹃〉")};
-buildHead();load(false);
+document.getElementById("btnExit").onclick=function(){try{window.close()}catch(e){}setTimeout(function(){if(!window.closed)showToast("浏览器未能自动关闭窗口，请手动关闭本标签页。","info")},150)};
+buildHead();load(false);resumePendingDelete();
 </script></body></html>"""
         return html
 
+    @staticmethod
+    def _delete_job_view(job: dict) -> dict:
+        """Send only a small, safe status payload to an authenticated admin."""
+        return {
+            "request_id": job["request_id"], "status": job["status"],
+            "message": job.get("message", ""), "title": job["title"],
+            "elapsed_seconds": max(0, int(time.time() - job["created_at"])),
+        }
+
+    def _invalidate_rescue_cache(self):
+        """Do not show a stale snapshot after a dispatched deletion."""
+        with self._list_lock:
+            self._list_generation += 1
+            self._list_state = "idle"
+            self._list_cache = None
+            self._list_updated_at = 0.0
+            self._list_error = ""
+
     def api_delete_rescue_seed(self, title: str = "", downloader: str = "",
-                               torrent_hash: str = "", confirm: bool = False):
+                               torrent_hash: str = "", confirm: bool = False,
+                               request_id: str = ""):
+        """Quick idempotent admission. Network requests happen in one worker."""
+        if not confirm or not all((title, downloader, torrent_hash)):
+            return {"success": False, "message": "缺少删除确认或种子标识"}
+        if not re.fullmatch(r"[A-Za-z0-9_-]{12,80}", request_id or ""):
+            return {"success": False, "message": "删除请求标识不合法"}
+        if not self._enabled or self._stopped:
+            return {"success": False, "message": "插件未启用，拒绝删除"}
+        if downloader not in self._downloaders:
+            return {"success": False, "message": "下载器不属于本插件管理范围"}
+        with self._delete_lock:
+            existing = self._delete_jobs.get(request_id)
+            if existing:
+                if (existing["title"], existing["downloader"], existing["torrent_hash"]) != (
+                    title, downloader, torrent_hash.lower()):
+                    return {"success": False, "message": "同一请求标识不能用于不同种子"}
+                return {"success": True, "message": existing["message"],
+                        "data": self._delete_job_view(existing)}
+            active = self._delete_jobs.get(self._delete_active_id)
+            if active and active["status"] in {"queued", "running"}:
+                return {"success": False, "message": "其他删除任务仍在执行，请查看状态后再提交"}
+            # Bound the in-memory idempotency ledger while retaining active
+            # requests; a browser must never silently re-submit after 524.
+            if len(self._delete_jobs) >= 100:
+                removable = sorted(
+                    (item for item in self._delete_jobs.values()
+                     if item["status"] not in {"queued", "running"}),
+                    key=lambda item: item["created_at"])[:50]
+                for item in removable:
+                    self._delete_jobs.pop(item["request_id"], None)
+            job = {
+                "request_id": request_id, "title": title,
+                "downloader": downloader, "torrent_hash": torrent_hash.lower(),
+                "status": "queued", "message": "已接收删除请求，正在后台核验",
+                "created_at": time.time(),
+            }
+            self._delete_jobs[request_id] = job
+            self._delete_active_id = request_id
+            generation = self._delete_generation
+            worker = threading.Thread(
+                target=self._delete_rescue_worker,
+                args=(request_id, generation),
+                daemon=True, name="HHClubButler-Delete")
+            try:
+                worker.start()
+            except Exception as error:
+                logger.error(f"后台删除任务启动失败：{error}")
+                self._delete_jobs.pop(request_id, None)
+                self._delete_active_id = None
+                return {"success": False, "message": "无法启动后台删除任务，请检查插件日志"}
+            return {"success": True, "message": job["message"],
+                    "data": self._delete_job_view(job)}
+
+    def _delete_rescue_worker(self, request_id: str, generation: int):
+        with self._delete_lock:
+            job = self._delete_jobs.get(request_id)
+            if not job:
+                return
+            job["status"] = "running"
+            target = (job["title"], job["downloader"], job["torrent_hash"])
+        if not self._run_lock.acquire(blocking=False):
+            result = {"success": False, "state": "failed",
+                      "message": "其他自动优选任务正在运行，未执行删除"}
+        else:
+            try:
+                result = self._delete_rescue_exact(*target, confirm=True, generation=generation)
+            except Exception as error:
+                logger.error(f"删除后台任务出现未知异常：{error}")
+                # Do not claim a safe retry when an exception may happen
+                # after a downloader has already accepted deletion.
+                result = {"success": False, "state": "uncertain",
+                          "message": "执行结果不确定，勿重复提交，请刷新核对"}
+            finally:
+                self._run_lock.release()
+        status = result.get("state") or ("verified" if result.get("success") else "failed")
+        if status in {"verified", "uncertain"}:
+            self._invalidate_rescue_cache()
+            self._last_overview = None
+            self._last_overview_ts = 0.0
+        with self._delete_lock:
+            job = self._delete_jobs.get(request_id)
+            if job:
+                job["status"] = status
+                job["message"] = str(result.get("message") or "")
+                job["finished_at"] = time.time()
+            if self._delete_active_id == request_id:
+                self._delete_active_id = None
+
+    def api_delete_rescue_status(self, request_id: str = ""):
+        """Read-only status: MUST NOT re-issue any downloader request."""
+        if not re.fullmatch(r"[A-Za-z0-9_-]{12,80}", request_id or ""):
+            return {"success": False, "message": "删除任务标识不合法"}
+        with self._delete_lock:
+            job = self._delete_jobs.get(request_id)
+            if job is None:
+                return {"success": False, "message": "未找到删除任务；状态未知，请刷新列表核对，勿重复提交"}
+            return {"success": True, "message": job.get("message", ""),
+                    "data": self._delete_job_view(job)}
+
+    def _delete_rescue_exact(self, title: str = "", downloader: str = "",
+                            torrent_hash: str = "", confirm: bool = False,
+                            generation: int | None = None):
         """删除必须以站点真实在保种子、下载器、精确哈希共同确认，拒绝模糊匹配。"""
+        if not self._enabled or self._stopped:
+            return {"success": False, "state": "failed", "message": "插件未启用或正在重载，拒绝删除"}
+        if generation is not None and generation != self._delete_generation:
+            return {"success": False, "state": "failed", "message": "插件配置已更新，已取消旧删除操作"}
         if not self._enabled:
             return {"success": False, "message": "插件未启用，拒绝删除"}
         if not (confirm and title and downloader and torrent_hash):
@@ -1574,12 +1911,46 @@ buildHead();load(false);
                 matched.append(value)
             if len(matched) != 1:
                 return {"success": False, "message": "未找到唯一精确匹配的下载器任务"}
-            service.instance.delete_torrents(delete_file=True, ids=matched)
-            logger.info(f"憨憨保种区管家手动删除：下载器={downloader}，hash={torrent_hash[:8]}…")
-            return {"success": True, "message": f"已删除：{title}"}
+            # Do not delete if this plugin was disabled/reloaded while
+            # waiting for the site or downloader.
+            if self._stopped or (generation is not None and generation != self._delete_generation):
+                return {"success": False, "state": "failed", "message": "插件配置已变化，删除已取消"}
+            dispatched = True
+            accepted = service.instance.delete_torrents(delete_file=True, ids=matched)
+            if accepted is False:
+                return {"success": False, "state": "uncertain",
+                        "message": "下载器未确认删除指令是否执行，请刷新列表核对，不要重复点击"}
+            # The downloader APIs return bool for command acceptance, not
+            # proof of removal. Verify by checking the exact hash afterward.
+            for attempt in range(3):
+                try:
+                    after, after_error = service.instance.get_torrents()
+                except Exception:
+                    after, after_error = None, "readback_failed"
+                if after_error or after is None:
+                    return {"success": False, "state": "uncertain",
+                            "message": "删除指令已发送，但无法回读下载器状态；请刷新核对"}
+                hashes = []
+                for item in after:
+                    value = ((item.get("hash") or item.get("hashString")) if isinstance(item, dict)
+                             else getattr(item, "hash", None) or getattr(item, "hashString", None))
+                    if not value:
+                        return {"success": False, "state": "uncertain",
+                                "message": "下载器回读结果缺少种子哈希，无法确认删除"}
+                    hashes.append(str(value).lower())
+                if torrent_hash.lower() not in hashes:
+                    logger.info(f"憨憨保种区管家已确认删除：下载器={downloader}，hash={torrent_hash[:8]}…")
+                    return {"success": True, "state": "verified", "message": f"已确认删除：{title}"}
+                if attempt < 2:
+                    time.sleep(0.5)
+            return {"success": False, "state": "uncertain",
+                    "message": "删除请求已发送，但下载器仍返回该种子；请刷新核对"}
+
         except Exception as e:
-            logger.error(f"手动删除种子失败：{e}")
-            return {"success": False, "message": "删除失败，详见插件日志"}
+            logger.error(f"手动删除种子异常：{e}")
+            return {"success": False, "state": "uncertain" if dispatched else "failed",
+                    "message": "删除指令执行状态不确定，请刷新核对，勿重复删除"
+                    if dispatched else "删除前核验失败，未执行删除，请检查插件日志"}
 
     def run(self):
         # Per-instance atomic admission; one-shot, cron and API cannot run concurrently.
