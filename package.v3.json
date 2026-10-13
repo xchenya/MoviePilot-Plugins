@@ -47,7 +47,7 @@
     "description": "自动进入思齐沙滩收集垃圾，支持 Cron/间隔执行、物品库存统计和结果通知（V3 移植测试版）。",
     "labels": "站点,自动化,思齐",
     "version": "2.0.0",
-    "icon": "Moviepilot_A.png",
+    "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Moviepilot_A.png",
     "author": "bfjy（V3 适配：xchenya）",
     "author_url": "https://github.com/bfjy2024/MoviePilot-Plugins",
     "level": 2,
