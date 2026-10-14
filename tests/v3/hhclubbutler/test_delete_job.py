@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import runpy
 import re
 import threading
 import time
@@ -33,6 +34,10 @@ def _subject():
                        body=members, decorator_list=[])
     namespace = {"threading": threading, "time": time, "re": re,
                  "logger": SimpleNamespace(info=Mock(), error=Mock())}
+    helpers=runpy.run_path(str(ROOT/"plugins.v3/hhclubbutler/matching.py"))
+    namespace.update({name: helpers[name] for name in
+                      ("normalize_name","translated_release_key",
+                       "translated_size_matches","is_trusted_hh_tracker")})
     mod = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
     exec(compile(mod, "<delete-test>", "exec"), namespace)
     return namespace["DeleteSubject"]
@@ -54,6 +59,12 @@ def _fixture():
                              "hash": "HASH123"}]
     instance._list_updated_at = time.time()
     instance._list_error = ""
+    instance._collect_rescue_seeds = lambda strict_downloaders=False: [
+        {"title": "Old.Movie", "size": 8.0, "downloader": "QB",
+         "hash": "HASH123", "can_delete": True, "match_status": "exact",
+         "candidates": [{"downloader": "QB", "hash": "HASH123",
+                         "can_remove": True, "can_delete_files": True,
+                         "match_type": "exact"}]}]
     instance._last_overview = {"count": 1}
     instance._last_overview_ts = time.time()
     return instance
@@ -147,7 +158,7 @@ def test_exact_delete_waits_for_hash_to_disappear_from_downloader():
     host._extract_tracker_text = lambda t: t.get("tracker", "")
     host._get_current_seeding = lambda logs: {"seeds":[{"title":"Old.Movie"}]}
     delete = Mock(return_value=True)
-    torrent = {"name":"Old.Movie","hash":"HASH123","tracker":"https://hhanclub.net/announce"}
+    torrent = {"name":"Old.Movie","hash":"HASH123","tracker":"https://tracker.hhanclub.net/announce"}
     host._get_manage_services = lambda: {"QB": SimpleNamespace(instance=SimpleNamespace(
         get_torrents=lambda: (([] if delete.called else [torrent]), None),
         delete_torrents=delete))}
@@ -161,7 +172,7 @@ def test_delete_not_reissued_when_downloader_returns_false():
     host._extract_tracker_text = lambda t: t.get("tracker", "")
     host._get_current_seeding = lambda logs: {"seeds":[{"title":"Old.Movie"}]}
     delete = Mock(return_value=False)
-    torrent = {"name":"Old.Movie","hash":"HASH123","tracker":"https://hhanclub.net/announce"}
+    torrent = {"name":"Old.Movie","hash":"HASH123","tracker":"https://tracker.hhanclub.net/announce"}
     host._get_manage_services = lambda: {"QB": SimpleNamespace(instance=SimpleNamespace(
         get_torrents=lambda: ([torrent],None),delete_torrents=delete))}
     result = host._delete_rescue_exact("Old.Movie","QB","HASH123",True,host._delete_generation)
@@ -174,7 +185,7 @@ def test_reconfiguration_aborts_before_side_effect():
     host._extract_tracker_text = lambda t: t.get("tracker", "")
     host._get_current_seeding = lambda logs: {"seeds":[{"title":"Old.Movie"}]}
     delete = Mock(return_value=True)
-    torrent = {"name":"Old.Movie","hash":"HASH123","tracker":"https://hhanclub.net/announce"}
+    torrent = {"name":"Old.Movie","hash":"HASH123","tracker":"https://tracker.hhanclub.net/announce"}
     host._get_manage_services = lambda: {"QB": SimpleNamespace(instance=SimpleNamespace(
         get_torrents=lambda: ([torrent],None),delete_torrents=delete))}
     host._delete_generation = 2
@@ -223,7 +234,7 @@ def test_readback_without_hash_is_uncertain_not_verified():
     host._get_current_seeding = lambda logs: {"seeds": [{"title": "Old.Movie"}]}
     deletion = Mock(return_value=True)
     record = {"name": "Old.Movie", "hash": "HASH123",
-              "tracker": "https://hhanclub.net/announce"}
+              "tracker": "https://tracker.hhanclub.net/announce"}
     client = SimpleNamespace(
         get_torrents=lambda: (([{"name": "Other.Movie"}] if deletion.called
                                else [record]), None),

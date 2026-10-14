@@ -79,19 +79,20 @@ def test_two_distinct_translated_downloads_are_truly_ambiguous():
     rows, stats = _match()([_site(EN)], [
         _torrent(TR,hash_value="b"*40),
         _torrent("上古情歌 - "+EN,hash_value="c"*40)])
-    assert rows[0]["match_status"] == "ambiguous"
+    assert rows[0]["match_status"] == "cross_seed"
     assert rows[0]["can_delete"] is False
-    assert stats["ambiguity_multiple_tasks"] == 1
+    assert rows[0]["cross_seed_count"] == 2
+    assert stats["cross_seed"] == 1
 
 
 def test_full_exact_and_translated_in_two_downloaders_preserve_conflict():
     rows, stats = _match()([_site(EN)], [
         _torrent(EN,dl="qBittorrent",hash_value="d"*40),
         _torrent(TR,dl="Transmission",hash_value="e"*40)])
-    assert rows[0]["match_status"] == "ambiguous"
+    assert rows[0]["match_status"] == "cross_seed"
     assert rows[0]["downloaders"] == ["Transmission","qBittorrent"]
     assert not rows[0]["can_delete"]
-    assert stats["ambiguous"] == 1
+    assert stats["cross_seed"] == 1
 
 
 def test_bulk_translated_examples_do_not_pollute_ambiguity():

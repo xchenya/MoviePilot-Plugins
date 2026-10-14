@@ -85,7 +85,8 @@ def test_untrusted_full_exact_match_is_not_changed_by_translated_policy():
 def test_ambiguity_keeps_translated_downloads_non_deletable():
     f=_functions()["associate_rescue_seeds"]
     rows,stats=f([site()],[torrent(hash="a"*40),torrent(hash="b"*40)])
-    assert stats["ambiguous"]==1
+    assert stats["cross_seed"]==1
+    assert rows[0]["can_manage"]
     assert not rows[0]["can_delete"]
     assert not rows[0]["hash"]
 

@@ -279,7 +279,8 @@ def associate_rescue_seeds(
     stats = {
         "eligible": len(site_seeds), "linked": 0, "exact": 0,
         "translated": 0, "similar": 0, "ambiguous": 0, "unmatched": 0,
-        "deletable": 0,
+        "cross_seed": 0, "cross_seed_tasks": 0, "auxiliary_tasks": 0,
+        "removable_tasks": 0, "deletable": 0,
         "ambiguity_multiple_tasks": 0,
         "ambiguity_duplicate_site_titles": 0,
         "ambiguity_shared_fuzzy": 0,
@@ -287,62 +288,144 @@ def associate_rescue_seeds(
         "fuzzy_exact_claims_blocked": fuzzy_skipped_reserved,
         "translation_suffix_claims": translated_alias_count,
     }
+
+    def tracker_host(value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return "未识别"
+        try:
+            if "://" in text:
+                return (urlsplit(text).hostname or "未识别")[:90]
+            return text.split("/", 1)[0].split("?", 1)[0][:90]
+        except ValueError:
+            return "未识别"
+
+    completed_states = {
+        "seeding", "seed_pending", "stalledup", "uploading",
+        "pausedup", "queuedup", "forcedup",
+    }
     for site, group in zip(site_seeds, matches):
         item = dict(site)
-        # An unlinked site record remains part of the full eligible inventory.
         item.update({
             "downloader": "", "downloaders": [], "hash": "",
             "match_status": "unmatched", "match_reason": "下载器中暂未匹配",
-            "can_delete": False, "matched": False,
-            "trusted_tracker": False,
+            "can_delete": False, "can_manage": False, "matched": False,
+            "trusted_tracker": False, "candidates": [],
+            "cross_seed_count": 0, "auxiliary_count": 0,
         })
         entries.append(item)
         if not group:
             stats["unmatched"] += 1
             continue
 
-        unique = {
+        unique_clients = {
             str(torrents[index].get("downloader") or "").strip()
             for index, _, _ in group
         }
-        item["downloaders"] = sorted(x for x in unique if x)
+        item["downloaders"] = sorted(name for name in unique_clients if name)
         item["downloader"] = " / ".join(item["downloaders"])
         item["matched"] = True
+        item["cross_seed_count"] = len(group)
         stats["linked"] += 1
 
         norm = normalize_name(item.get("title"))
-        if site_names[norm] > 1:
-            item["match_status"] = "ambiguous"
-            item["match_reason"] = "站点存在不同种子ID但名称相同，无法确定删除对象"
-            stats["ambiguous"] += 1
-            stats["ambiguity_duplicate_site_titles"] += 1
-            continue
-        if len(group) > 1:
-            item["match_status"] = "ambiguous"
+        repeated_site_title = site_names[norm] > 1
+        shared_strong = any(
+            kind in {"exact", "translated"} and
+            exact_site_owners[index] + translated_site_owners[index] > 1
+            for index, kind, _ in group
+        )
+        shared_fuzzy = any(
+            kind == "similar" and fuzzy_shared[index] > 1
+            for index, kind, _ in group
+        )
+        confident = all(kind in {"exact", "translated"} for _, kind, _ in group)
+        is_cross_seed = (
+            len(group) > 1 and confident and not repeated_site_title
+            and not shared_strong and not shared_fuzzy
+        )
+        unsafe_group = repeated_site_title or shared_strong or shared_fuzzy
+        if len(group) > 1 and confident:
+            # Keep a visible count even if duplicate site titles make every
+            # candidate non-actionable.
+            item["cross_seed_count"] = len(group)
+            item["auxiliary_count"] = len(group) - 1
+        # Same release in one or more clients with distinct hashes is normal
+        # cross-seeding, NOT ambiguity. The user must explicitly choose
+        # which exact hash to remove; never delete shared payload in that mode.
+        if is_cross_seed:
+            item["match_status"] = "cross_seed"
+            item["cross_seed_count"] = len(group)
+            item["auxiliary_count"] = len(group) - 1
             item["match_reason"] = (
-                "多个下载器中存在同名任务，无法自动选择删除目标"
-                if len(item["downloaders"]) > 1
-                else "同一下载器有多个不同哈希的同名任务，需人工核对"
+                f"同名种子任务 {len(group)} 个（含辅种 {len(group) - 1} 个）；"
+                "按 Hash 选择任务，辅种仅移除任务、保留文件"
             )
+            stats["cross_seed"] += 1
+            stats["cross_seed_tasks"] += len(group)
+            stats["auxiliary_tasks"] += len(group) - 1
+        elif repeated_site_title or shared_strong or shared_fuzzy or len(group) > 1:
+            item["match_status"] = "ambiguous"
             stats["ambiguous"] += 1
-            stats["ambiguity_multiple_tasks"] += 1
+            if repeated_site_title or shared_strong:
+                item["match_reason"] = "站点同名记录无法唯一映射下载器任务"
+                stats["ambiguity_duplicate_site_titles"] += 1
+            elif shared_fuzzy:
+                item["match_reason"] = "多个不同站点种子近似匹配同一任务"
+                stats["ambiguity_shared_fuzzy"] += 1
+            else:
+                item["match_reason"] = "无法明确区分的多个近似候选"
+                stats["ambiguity_multiple_tasks"] += 1
+            unsafe_group = True
+
+        records = []
+        for index, kind, score in group:
+            torrent = torrents[index]
+            progress = torrent.get("progress")
+            state = str(torrent.get("state") or "").strip().lower()
+            completed = (progress >= 0.999 if progress is not None
+                         else state in completed_states)
+            confirmed_hh = bool(torrent.get("trusted_tracker"))
+            task_hash = str(torrent.get("hash") or "").strip()
+            task_name = str(torrent.get("name") or "")
+            client = str(torrent.get("downloader") or "").strip()
+            # A fuzzy match may be shown for diagnosis, but is not an
+            # authorized destructive identity. A confirmed name is required
+            # for even a task-only removal.
+            strong_name = kind in {"exact", "translated"}
+            can_remove = (
+                not unsafe_group and strong_name and completed
+                and bool(task_hash and client)
+            )
+            # In a cross-seed group deleting shared data can destroy files
+            # used by the remaining swarms, so prohibit payload deletion.
+            can_delete_files = (
+                can_remove and not is_cross_seed and len(group) == 1
+                and confirmed_hh
+            )
+            record = {
+                "downloader": client, "hash": task_hash,
+                "hash_short": task_hash[:12],
+                "name": task_name, "tracker": tracker_host(torrent.get("tracker")),
+                "match_type": kind, "trusted_tracker": confirmed_hh,
+                "completed": completed, "progress": progress,
+                "size_gb": torrent.get("size_gb"),
+                "can_remove": bool(can_remove),
+                "can_delete_files": bool(can_delete_files),
+            }
+            records.append(record)
+            if can_remove:
+                stats["removable_tasks"] += 1
+        records.sort(key=lambda value: (
+            not value["trusted_tracker"], value["downloader"], value["hash"]
+        ))
+        item["candidates"] = records
+        item["can_manage"] = any(c["can_remove"] for c in records)
+
+        if is_cross_seed or item["match_status"] == "ambiguous":
             continue
 
         index, match_type, _ = group[0]
-        if (match_type in {"exact", "translated"}
-                and (exact_site_owners[index] + translated_site_owners[index]) > 1):
-            item["match_status"] = "ambiguous"
-            item["match_reason"] = "同一下载任务被多个站点条目强匹配命中"
-            stats["ambiguous"] += 1
-            stats["ambiguity_duplicate_site_titles"] += 1
-            continue
-        if (match_type == "similar" and fuzzy_shared[index] > 1):
-            item["match_status"] = "ambiguous"
-            item["match_reason"] = "多个站点条目近似匹配同一下载任务，未能唯一关联"
-            stats["ambiguous"] += 1
-            stats["ambiguity_shared_fuzzy"] += 1
-            continue
-
         torrent = torrents[index]
         item["match_status"] = match_type
         stats[match_type] += 1
@@ -352,44 +435,29 @@ def associate_rescue_seeds(
         ):
             if torrent.get(field) is not None:
                 item[field] = torrent[field]
-
-        tracker_ok = bool(torrent.get("site_tracker"))
-        trusted_tracker = bool(torrent.get("trusted_tracker"))
-        item["trusted_tracker"] = trusted_tracker
-        progress = torrent.get("progress")
-        state = str(torrent.get("state") or "").strip().lower()
-        completed_states = {
-            "seeding", "seed_pending", "stalledup", "uploading",
-            "pausedup", "queuedup", "forcedup",
-        }
-        complete = (progress >= 0.999 if progress is not None
-                    else state in completed_states)
-        if not complete:
-            item["match_status"] = "downloading" if progress is not None else "unverified"
-            item["match_reason"] = ("下载任务尚未完成" if progress is not None
-                                    else "下载进度未确认，禁止删除")
+        selected = records[0]
+        item["trusted_tracker"] = selected["trusted_tracker"]
+        if not selected["completed"]:
+            item["match_status"] = "downloading" if selected["progress"] is not None else "unverified"
+            item["match_reason"] = "下载进度未核实或尚未完成"
         elif match_type == "translated":
             item["match_reason"] = (
-                "已忽略中文译名：英文发布名去符号后一致、体积一致；"
-                + ("Tracker 已验证，可确认删除" if trusted_tracker
-                   else "Tracker 未验证，关联已确认但暂不可删除")
+                "忽略中文译名后英文发布名与大小匹配；"
+                + ("Tracker 已验证，可选择删除文件" if selected["can_delete_files"]
+                   else "可人工移除任务，保留文件")
             )
-        elif not tracker_ok:
+        elif not bool(torrent.get("site_tracker")):
             item["match_status"] = "unverified"
-            item["match_reason"] = "Tracker 未确认是憨憨站，仅供查看"
+            item["match_reason"] = "Tracker 尚未确认属于憨憨站；如需操作只能保留数据"
         elif match_type == "similar":
-            item["match_reason"] = "名称近似匹配，仅供查看，不允许直接删除"
+            item["match_reason"] = "名称近似匹配，仅供查看"
         else:
-            item["match_reason"] = "名称精确匹配且已确认憨憨站 Tracker"
+            item["match_reason"] = "名称精确匹配，" + (
+                "Tracker 已验证" if selected["trusted_tracker"] else "Tracker 未验证"
+            )
 
-        # A translated association may now be manually deleted, but only
-        # with independent confirmation from the precise HH tracker host.
-        trusted_name = match_type == "exact" or (
-            match_type == "translated" and trusted_tracker)
-        tracker_verified = tracker_ok if match_type == "exact" else trusted_tracker
-        if (trusted_name and tracker_verified and complete
-                and torrent.get("hash") and item["downloader"]):
-            item["hash"] = str(torrent["hash"])
+        if selected["can_delete_files"]:
+            item["hash"] = selected["hash"]
             item["can_delete"] = True
             stats["deletable"] += 1
     return entries, stats
