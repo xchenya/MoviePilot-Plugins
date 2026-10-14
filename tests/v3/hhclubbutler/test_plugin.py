@@ -1,4 +1,4 @@
-"""HHClubButler V3.0.7 contracts and deletion safety without a real downloader."""
+"""HHClubButler V3.0.8 contracts and deletion safety without a real downloader."""
 from __future__ import annotations
 
 import ast
@@ -39,7 +39,7 @@ def test_v3_metadata_and_v2_fallback_disabled():
     }
     market_v3 = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))
     market_v2 = json.loads((ROOT / "package.v2.json").read_text(encoding="utf-8"))
-    assert attrs["plugin_version"] == "3.0.7"
+    assert attrs["plugin_version"] == "3.0.8"
     assert market_v3["HHClubButler"]["version"] == attrs["plugin_version"]
     assert market_v3["HHClubButler"]["system_version"] == ">=3.0.0"
     assert market_v3["HHClubButler"]["release"] is False
@@ -93,7 +93,7 @@ def _deletion_method():
     return namespace["_delete_rescue_exact"]
 
 
-def _fixture(*, hash_value="HASH123", tracker="https://hhanclub.example/announce",
+def _fixture(*, hash_value="HASH123", tracker="https://tracker.hhanclub.net/announce",
              torrent_name="Sample.Movie"):
     delete_mock = Mock(return_value=True)
     record = {"name": torrent_name, "hash": hash_value, "tracker": tracker}
@@ -109,7 +109,10 @@ def _fixture(*, hash_value="HASH123", tracker="https://hhanclub.example/announce
         _get_current_seeding=lambda logs: {"seeds": [{"title": "Sample.Movie"}]},
         _collect_rescue_seeds=lambda strict_downloaders=False: [
             {"title": "Sample.Movie", "size": 8.0, "downloader": "QB",
-             "hash": "HASH123", "can_delete": True, "match_status": "exact"}],
+             "hash": "HASH123", "can_delete": True, "match_status": "exact",
+             "candidates": [{"downloader": "QB", "hash": "HASH123",
+                             "can_remove": True, "can_delete_files": True,
+                             "match_type": "exact"}]}],
         _get_manage_services=lambda: {"QB": SimpleNamespace(instance=client)},
     )
     return host, delete_mock

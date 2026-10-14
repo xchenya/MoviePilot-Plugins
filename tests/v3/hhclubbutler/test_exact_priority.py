@@ -25,7 +25,7 @@ def _torrent(title: str, downloader: str = "Transmission",
              hash_value: str = "a"*40, size: float = 8.0):
     return {
         "name": title, "downloader": downloader, "hash": hash_value,
-        "size_gb": size, "site_tracker": True, "progress": 1.0,
+        "size_gb": size, "site_tracker": True, "trusted_tracker": True, "progress": 1.0,
     }
 
 
@@ -60,10 +60,11 @@ def test_same_name_but_different_hashes_remains_truly_ambiguous():
         _torrent(title,hash_value="c"*40),
         _torrent(title,hash_value="d"*40),
     ])
-    assert rows[0]["match_status"] == "ambiguous"
-    assert "同一下载器" in rows[0]["match_reason"]
-    assert not rows[0]["can_delete"]
-    assert stats["ambiguity_multiple_tasks"] == 1
+    assert rows[0]["match_status"] == "cross_seed"
+    assert rows[0]["cross_seed_count"] == 2
+    assert rows[0]["can_manage"]
+    assert all(not c["can_delete_files"] for c in rows[0]["candidates"])
+    assert stats["cross_seed"] == 1
 
 
 def test_same_hash_across_two_separate_downloaders_keeps_true_conflict():
@@ -72,10 +73,11 @@ def test_same_hash_across_two_separate_downloaders_keeps_true_conflict():
         _torrent(title,downloader="Transmission",hash_value="a"*40),
         _torrent(title,downloader="qBittorrent",hash_value="a"*40),
     ])
-    assert rows[0]["match_status"] == "ambiguous"
+    assert rows[0]["match_status"] == "cross_seed"
     assert rows[0]["downloaders"] == ["Transmission","qBittorrent"]
     assert not rows[0]["can_delete"]
-    assert stats["ambiguity_multiple_tasks"] == 1
+    assert rows[0]["cross_seed_count"] == 2
+    assert stats["cross_seed"] == 1
 
 
 def test_fuzzy_match_without_exact_claim_is_visible_but_readonly():
@@ -118,4 +120,4 @@ def test_ambiguous_breakdown_is_a_partition_of_ambiguous_count():
         + stats["ambiguity_multiple_tasks"]
         + stats["ambiguity_shared_fuzzy"]
     )
-    assert stats["exact"] == 1 and stats["ambiguous"] == 1
+    assert stats["exact"] == 1 and stats["cross_seed"] == 1 and stats["ambiguous"] == 0

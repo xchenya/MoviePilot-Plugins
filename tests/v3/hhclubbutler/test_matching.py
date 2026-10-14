@@ -23,6 +23,7 @@ def _torrent(name, downloader="qBittorrent", size=8.0, hash_value="abc123",
              site_tracker=True, progress=1.0):
     return {"name": name, "downloader": downloader, "size_gb": size,
             "hash": hash_value, "site_tracker": site_tracker,
+            "trusted_tracker": site_tracker,
             "progress": progress, "path": "/pt/" + name}
 
 
@@ -86,10 +87,12 @@ def test_duplicate_exact_torrents_display_both_downloaders_but_block_deletion():
     ])
     assert rows[0]["downloaders"] == ["Transmission", "qBittorrent"]
     assert "Transmission" in rows[0]["downloader"] and "qBittorrent" in rows[0]["downloader"]
-    assert rows[0]["match_status"] == "ambiguous"
+    assert rows[0]["match_status"] == "cross_seed"
     assert rows[0]["can_delete"] is False
+    assert rows[0]["can_manage"] is True
+    assert rows[0]["cross_seed_count"] == 2
     assert not rows[0]["hash"]
-    assert stats["ambiguous"] == 1
+    assert stats["cross_seed"] == 1
 
 
 def test_duplicate_site_titles_can_never_become_deletable():

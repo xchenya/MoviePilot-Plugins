@@ -197,10 +197,11 @@ def test_site_rows_survive_missing_or_ambiguous_downloader_associations():
     result = collect(fake)
     assert len(result) == 3
     assert [x["seed_id"] for x in result] == [1, 2, 3]
-    assert result[0]["match_status"] == "ambiguous"
+    assert result[0]["match_status"] == "cross_seed"
     assert result[0]["can_delete"] is False
-    assert result[1]["hash"] == "3" and result[1]["downloader"] == "A"
-    assert result[1]["can_delete"] is True
+    assert result[0]["cross_seed_count"] == 2
+    assert result[1]["downloader"] == "A"
+    assert result[1]["can_manage"] is True
     assert result[2]["match_status"] == "unmatched"
 
 
@@ -245,8 +246,8 @@ def test_market_metadata_marks_patch_release_unpublished():
     import json
     manifest = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))
     entry = manifest["HHClubButler"]
-    assert entry["version"] == "3.0.7"
+    assert entry["version"] == "3.0.8"
     assert entry["release"] is False
-    assert "3.0.7" in entry["history"]
+    assert "3.0.8" in entry["history"]
 
 

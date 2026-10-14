@@ -51,6 +51,21 @@ def _require_resource_admin(request: Request, identity=Depends(verify_resource_t
             raise HTTPException(status_code=403, detail="拒绝跨站修改请求")
 
 
+class RescueCopyItem(BaseModel):
+    downloader: str = ""
+    hash: str = ""
+    hash_short: str = ""
+    name: str = ""
+    tracker: str = ""
+    match_type: str = ""
+    trusted_tracker: bool = False
+    completed: bool = False
+    progress: float | None = None
+    size_gb: float | None = None
+    can_remove: bool = False
+    can_delete_files: bool = False
+
+
 class RescueSeedItem(BaseModel):
     model_config = ConfigDict(extra="allow")
     title: str = ""
@@ -63,6 +78,10 @@ class RescueSeedItem(BaseModel):
     match_status: str = "unmatched"
     match_reason: str = ""
     can_delete: bool = False
+    can_manage: bool = False
+    cross_seed_count: int = 0
+    auxiliary_count: int = 0
+    candidates: list[RescueCopyItem] = Field(default_factory=list)
     hash: str = ""
 
 
@@ -163,7 +182,7 @@ class HHClubButler(_PluginBase):
     plugin_name = "憨憨保种区管家"
     plugin_desc = "自动优选添加及换种工具\n保种管理器/Hosts加速"
     plugin_icon = "https://raw.githubusercontent.com/xchenya/MoviePilot-Plugins/main/plugins.v3/hhclubbutler/icon.png"
-    plugin_version = "3.0.7"
+    plugin_version = "3.0.8"
     plugin_author = "六个橙子"
     author_url = "https://github.com/SixOrg"
     plugin_config_prefix = "hhclubbutler_"
@@ -1148,8 +1167,9 @@ class HHClubButler(_PluginBase):
         logger.info(f"憨憨保种管理器：站点 {stats['eligible']} 条 / "
                     f"已关联 {stats['linked']} 条 / 精确 {stats['exact']} 条 / "
                     f"译名 {stats['translated']} 条 / 近似 {stats['similar']} 条 / 未匹配 {stats['unmatched']} 条 / "
-                    f"真正歧义 {stats['ambiguous']} 条 / 可安全删除 {stats['deletable']} 条；"
-                    f"总用时 {time.monotonic()-started:.1f}s")
+                    f"辅种组 {stats['cross_seed']} 条 / 额外辅种任务 {stats['auxiliary_tasks']} 个 / "
+                    f"真正歧义 {stats['ambiguous']} 条 / 可人工移除任务 {stats['removable_tasks']} 个 / "
+                    f"允许删除文件 {stats['deletable']} 条；总用时 {time.monotonic()-started:.1f}s")
         logger.info(f"憨憨保种管理器：歧义归因（仅计数）："
                     f"多下载任务={stats['ambiguity_multiple_tasks']}、"
                     f"站点同名={stats['ambiguity_duplicate_site_titles']}、"
@@ -1370,6 +1390,17 @@ tr.sel td{background:var(--tr-sel);color:#fff}
 .match-exact{color:#22c55e}
 .match-similar{color:#5aa9ff}
 .match-translated{color:#1cba96;font-weight:600}
+.match-cross_seed{color:#bd8fff;font-weight:600}
+.hh-copy-list{padding:4px 24px 20px;max-height:50vh;overflow-y:auto;display:grid;gap:8px}
+.hh-copy-row{display:flex;align-items:flex-start;gap:10px;padding:12px;border:1px solid var(--input-border);border-radius:8px;cursor:pointer}
+.hh-copy-row:has(input:checked){border-color:var(--chip-active);background:var(--chip)}
+.hh-copy-row:has(input:disabled){opacity:.50;cursor:not-allowed}
+.hh-copy-row input{margin-top:3px;accent-color:var(--chip-active)}
+.hh-copy-content{min-width:0;display:flex;flex-direction:column;gap:5px;overflow-wrap:anywhere}
+.hh-copy-primary{font-size:13px;font-weight:600}
+.hh-copy-secondary{font-size:11px;color:var(--muted2);line-height:1.5}
+@media(max-width:720px){.hh-copy-list{padding:4px 14px 16px}}
+
 .right{text-align:right;font-variant-numeric:tabular-nums}
 .hide{display:none !important}
 .footer{background:var(--footer);padding:6px 14px;font-size:11px;color:var(--muted);border-top:1px solid var(--footer-border);display:flex;gap:18px;flex-wrap:wrap}
@@ -1442,6 +1473,7 @@ tr.sel td{background:var(--tr-sel);color:#fff}
 <span>总体积 <b id="totalgb">0</b> GB</span>
 <span>下载器已关联 <b id="linkedCount">0</b> 个</span>
 <span>译名关联 <b id="translatedCount">0</b> 个</span>
+<span>辅种组 <b id="crossSeedGroups">0</b> 个 / 额外任务 <b id="auxiliaryTaskCount">0</b> 个</span>
 <span>未关联 <b id="unlinkedCount">0</b> 个</span>
 <span>待核对 <b id="verifyCount">0</b> 个</span>
 <span title="这里显示憨憨站上全部可保种记录。未匹配下载器不代表站点没有资格；下载器任务删除后仍保留站点记录。">列表来源：憨憨站 · 关联仅供核对</span>
@@ -1456,6 +1488,18 @@ tr.sel td{background:var(--tr-sel);color:#fff}
       <button class="btn danger" type="button" id="hhAcceptDelete">确认删除文件</button>
     </div>
   </div>
+</div>
+<div class="hh-overlay" id="hhCopyOverlay" hidden>
+ <div class="hh-dialog" role="dialog" aria-modal="true" aria-labelledby="hhCopyTitle">
+  <div class="hh-dialog-head"><span class="hh-warning-icon" aria-hidden="true">≡</span><span id="hhCopyTitle">选择辅种任务</span></div>
+  <div class="hh-dialog-desc" id="hhCopyDesc"></div>
+  <div class="hh-copy-list" id="hhCopyList" role="radiogroup" aria-label="选择具体辅种任务"></div>
+  <div class="hh-dialog-note">一个发布名可以有多个不同 Hash。这里每次只操作你选中的一项；辅种只移除任务，数据文件继续保留。</div>
+  <div class="hh-dialog-actions">
+   <button class="btn ghost" id="hhCloseCopies" type="button">取消</button>
+   <button class="btn danger" id="hhChooseCopy" type="button" disabled>继续确认所选任务</button>
+  </div>
+ </div>
 </div>
 <div class="hh-toast" id="hhToast" role="status" aria-live="polite" hidden></div>
 <script>
@@ -1522,7 +1566,7 @@ if(c.k==="c_dl"){
 var names=s.downloaders&&s.downloaders.length?s.downloaders.join(" / "):(s.downloader||"");
 if(!names)return '<span class="match-unmatched" title="'+esc(s.match_reason||"下载器未匹配")+'">未匹配</span>';
 var kind=s.match_status||"";
-var hint=kind==="translated"?"译名匹配":kind==="similar"?"近似":kind==="ambiguous"?"有歧义":
+var hint=kind==="cross_seed"?"辅种 "+(s.cross_seed_count||0)+" 个":kind==="translated"?"译名匹配":kind==="similar"?"近似":kind==="ambiguous"?"有歧义":
          kind==="unverified"?"未验证":kind==="downloading"?"下载中":"";
 return '<span class="match-'+esc(kind)+'" title="'+esc(s.match_reason||"")+'">'+esc(names)+'</span>'+
  (hint?'<span class="match-hint">'+esc(hint)+'</span>':"");
@@ -1539,10 +1583,12 @@ html+='<tr class="'+(seled?"sel":"")+'">';
 html+='<td><input type="checkbox" data-idx="'+i+'" '+(seled?"checked":"")+"></td>";
 for(var j=0;j<COLS.length;j++){var c=COLS[j];if(c.visible===false)continue;
 html+='<td class="'+(c.r?"right ":"")+'" data-col="'+c.k+'">'+cellVal(c,s,t)+"</td>";}
-html+='<td>'+(s.can_delete&&s.hash?
-'<a style="color:#ff8080;cursor:pointer;" data-del="'+i+'">删除</a>':
-'<span style="opacity:.4" title="'+esc(s.match_reason||"下载器未验证")+'">仅查看</span>')+
-'</td></tr>';}
+var action=s.can_manage
+ ?'<a style="color:#ff8080;cursor:pointer;" data-del="'+i+'">'+
+ (s.cross_seed_count>1?"管理辅种 ("+s.cross_seed_count+")":
+   (s.can_delete?"删除":"移除任务"))+'</a>'
+ :'<span style="opacity:.4" title="'+esc(s.match_reason||"下载器未验证")+'">仅查看</span>';
+html+='<td>'+action+'</td></tr>';}
 if(!f.length)html='<tr><td colspan="20" style="text-align:center;padding:40px;color:#888">无匹配种子</td></tr>';
 document.getElementById("tbody").innerHTML=html;
 document.querySelectorAll("#tbody input[type=checkbox]").forEach(function(cb){cb.onchange=function(){var i=+this.dataset.idx;var t=filtered[i].title;sel[t]=this.checked;renderFooter()}});
@@ -1558,6 +1604,8 @@ var needsReview=seeds.filter(function(s){return s.match_status==="ambiguous"||s.
 var translated=seeds.filter(function(s){return s.match_status==="translated"}).length;
 document.getElementById("linkedCount").textContent=linked;
 document.getElementById("translatedCount").textContent=translated;
+document.getElementById("crossSeedGroups").textContent=seeds.filter(function(s){return s.match_status==="cross_seed"}).length;
+document.getElementById("auxiliaryTaskCount").textContent=seeds.reduce(function(sum,s){return sum+(s.auxiliary_count||0)},0);
 document.getElementById("unlinkedCount").textContent=seeds.length-linked;
 document.getElementById("verifyCount").textContent=needsReview;
 var c0=0,c1=0,c2=0;seeds.forEach(function(s){var t=tierOf(s.seeders);if(t===0)c0++;else if(t===1)c1++;else c2++});
@@ -1643,16 +1691,82 @@ deletionBusy=!!busy;
 document.getElementById("btnDel").disabled=deletionBusy;
 document.getElementById("hhAcceptDelete").disabled=deletionBusy;
 }
+var copyPickerResolve=null,copyPickerChoice=null;
+function openCopyPicker(seed){
+return new Promise(function(resolve){
+if(copyPickerResolve){resolve(null);return;}
+var candidates=seed.candidates||[];
+var available=candidates.filter(function(c){return c.can_remove&&c.hash});
+if(!available.length){
+showToast("这些辅种缺少可靠的发布名、完成状态或 Hash，暂不能移除。","warn");
+resolve(null);return;
+}
+copyPickerResolve=resolve;
+copyPickerChoice=null;
+var pane=document.getElementById("hhCopyOverlay");
+var list=document.getElementById("hhCopyList");
+list.replaceChildren();
+document.getElementById("hhCopyDesc").textContent=
+"种子："+(seed.title||"")+"\n关联任务："+candidates.length+
+" 个。请选择具体 Hash；只会移除选中任务，不影响其他辅种的视频文件。";
+document.getElementById("hhChooseCopy").disabled=true;
+candidates.forEach(function(c,index){
+var label=document.createElement("label");
+label.className="hh-copy-row";
+var radio=document.createElement("input");
+radio.type="radio";radio.name="hhCopyChoice";radio.value=String(index);
+radio.disabled=!c.can_remove||!c.hash;
+var desc=document.createElement("span");desc.className="hh-copy-content";
+var primary=document.createElement("span");primary.className="hh-copy-primary";
+primary.textContent=(c.downloader||"未知下载器")+" · Hash "+(c.hash_short||String(c.hash||"").slice(0,12)||"未知");
+var secondary=document.createElement("span");secondary.className="hh-copy-secondary";
+secondary.textContent="Tracker："+(c.tracker||"未识别")+
+" · "+(c.trusted_tracker?"憨憨 Tracker 已验证":"其他站点或未验证 Tracker")+
+" · "+(c.completed?"已完成":"未完成/未知")+
+" · "+(radio.disabled?"不可操作":"仅移除任务、保留文件");
+desc.appendChild(primary);desc.appendChild(secondary);
+label.appendChild(radio);label.appendChild(desc);
+if(!radio.disabled)radio.onchange=function(){
+copyPickerChoice=c;
+document.getElementById("hhChooseCopy").disabled=false;
+};
+list.appendChild(label);
+});
+pane.hidden=false;
+document.getElementById("hhCloseCopies").focus();
+});
+}
+function closeCopyPicker(accept){
+if(!copyPickerResolve)return;
+var resolve=copyPickerResolve,selected=accept?copyPickerChoice:null;
+copyPickerResolve=null;copyPickerChoice=null;
+document.getElementById("hhCopyOverlay").hidden=true;
+resolve(selected);
+}
+document.getElementById("hhCloseCopies").onclick=function(){closeCopyPicker(false)};
+document.getElementById("hhChooseCopy").onclick=function(){closeCopyPicker(true)};
+document.getElementById("hhCopyOverlay").onclick=function(e){if(e.target===this)closeCopyPicker(false)};
+document.addEventListener("keydown",function(e){
+if(e.key==="Escape"&&copyPickerResolve){e.preventDefault();closeCopyPicker(false)}
+});
 function openDeleteDialog(items){
 return new Promise(function(resolve){
 if(dialogResolve){resolve(false);return;}
 var overlay=document.getElementById("hhConfirmOverlay");
 var title=document.getElementById("hhConfirmTitle");
 var desc=document.getElementById("hhConfirmDesc");
-title.textContent=items.length===1?"确认删除种子":"确认批量删除";
+var keepFiles=items.length===1&&items[0].delete_file===false;
+title.textContent=keepFiles?"确认移除所选任务":(items.length===1?"确认删除任务和文件":"确认批量删除");
+var note=overlay.querySelector(".hh-dialog-note");
+note.textContent=keepFiles
+ ?"仅移除选中的下载器任务，完整保留视频文件；其他辅种会继续做种。"
+ :"将删除选中的下载器任务及对应文件，文件删除不可由插件撤销。";
+document.getElementById("hhAcceptDelete").textContent=
+ keepFiles?"确认仅移除任务":"确认删除任务和文件";
 desc.textContent=items.length===1
   ?"种子名称：\n"+(items[0].title||"")+"\n下载器："+(items[0].downloader||"-")+
-   (items[0].match_status==="translated"?"\n已核验：忽略中文译名后英文发布名一致、大小一致、Tracker 属于憨憨站。":"")
+   (items[0].match_status==="translated"?"\n已匹配中文译名前缀后的完整英文发布名。":"")+
+   "\nHash："+String(items[0].hash||"").slice(0,12)
   :"将删除所选 "+items.length+" 个种子，涉及的下载器任务和文件将一并删除。";
 dialogResolve=resolve;
 overlay.hidden=false;
@@ -1711,18 +1825,37 @@ await new Promise(function(r){setTimeout(r,2500)});
 return {status:"unknown",message:"等待任务结果超时；任务可能仍在后台运行"};
 }
 function forgetVerifiedItem(item){
-var hash=String(item.hash||"").toLowerCase();
-seeds=seeds.filter(function(seed){
-return !(seed.downloader===item.downloader&&String(seed.hash||"").toLowerCase()===hash);
+// Keep the site's eligibility row even after its downloader task disappears.
+delete sel[item.title];
+var row=seeds.find(function(s){
+return (item.seed_id!=null&&s.seed_id===item.seed_id)||s.title===item.title;
 });
-delete sel[item.title];doSort();buildDlList();render();
+if(row){
+row.candidates=(row.candidates||[]).filter(function(c){
+return !(c.downloader===item.downloader&&
+        String(c.hash||"").toLowerCase()===String(item.hash||"").toLowerCase());
+});
+row.cross_seed_count=row.candidates.length;
+row.auxiliary_count=Math.max(0,row.candidates.length-1);
+row.can_manage=row.candidates.some(function(c){return !!c.can_remove});
+row.can_delete=false;row.hash="";
+if(!row.candidates.length){
+row.matched=false;row.match_status="unmatched";
+row.match_reason="下载器任务已移除，正在重新读取最新状态";
+row.downloader="";row.downloaders=[];
+}else{
+row.match_reason="已移除所选任务，正在重新读取其它辅种的状态";
+}
+}
+doSort();buildDlList();render();
 }
 async function followDeletion(record,reload){
 var job=await pollDeleteStatus(record.id);
 if(job.status==="verified"){
 forgetVerifiedItem(record.item);
 clearPending();
-showToast("已确认从下载器删除：" +(record.item.title||"")+"\n站点保种资格仍保留；刷新后可能显示为「未匹配」。","good",7000);
+showToast((record.item.delete_file===false?"已确认移除任务，文件仍保留：":"已确认删除任务和文件：")+
+(record.item.title||"")+"\n正在重新获取关联状态。","good",7000);
 if(reload)load(true);
 return "verified";
 }
@@ -1743,21 +1876,43 @@ return "unknown";
 }
 async function delOne(seed){
 if(deletionBusy)return;
-if(!seed.can_delete||!seed.downloader||!seed.hash){
-showToast("当前种子未通过名称、大小、Tracker 和哈希的完整核验，不能直接删除文件。","warn");return;
+var copies=seed.candidates||[];
+var selected=null;
+if(seed.cross_seed_count>1){
+selected=await openCopyPicker(seed);
+}else{
+selected=copies.find(function(c){return c.can_remove&&c.hash})||null;
 }
-if(!await openDeleteDialog([seed]))return;
-await doDel([seed]);
+if(!selected){
+if(seed.cross_seed_count<=1)showToast("缺少可核实的种子 Hash 或任务尚未完成，暂不可移除。","warn");
+return;
+}
+var selectedTask={
+title:seed.title,seed_id:seed.seed_id,
+downloader:selected.downloader,hash:selected.hash,
+delete_file:seed.cross_seed_count<=1&&!!selected.can_delete_files,
+match_status:selected.match_type
+};
+if(!await openDeleteDialog([selectedTask]))return;
+await doDel([selectedTask]);
 }
 async function delSel(){
 if(deletionBusy)return;
-var items=seeds.filter(function(item){return !!sel[item.title]});
+var items=seeds.filter(function(s){return !!sel[s.title]});
 if(!items.length){showToast("请先勾选需要删除的种子。","warn");return;}
-if(items.some(function(item){return !item.can_delete||!item.downloader||!item.hash})){
-showToast("所选种子存在未关联或匹配有歧义的项目，禁止删除，请取消勾选。","warn");return;
+if(items.some(function(s){return s.cross_seed_count>1})){
+showToast("所选项目包含辅种，请在对应行点击「管理辅种」，逐项选择 Hash。","warn");return;
 }
-if(!await openDeleteDialog(items))return;
-await doDel(items);
+if(items.some(function(item){return !item.can_delete||!item.downloader||!item.hash})){
+showToast("所选种子中存在不能同时删除文件的任务，请逐条确认后再操作。","warn");return;
+}
+var targets=items.map(function(item){
+return {title:item.title,seed_id:item.seed_id,
+downloader:item.downloader,hash:item.hash,
+delete_file:true,match_status:item.match_status};
+});
+if(!await openDeleteDialog(targets))return;
+await doDel(targets);
 }
 async function doDel(items){
 if(deletionBusy)return;
@@ -1769,11 +1924,14 @@ try{
 for(var i=0;i<items.length;i++){
 var item=items[i],id=createRequestId(),record={id:id,item:item,started:Date.now()};
 savePending(record);
-showToast("正在提交删除请求：" +(item.title||"")+"\n请勿重复点击或关闭页面。","info",0);
+showToast("正在提交任务操作：" +(item.title||"")+
+"\n"+(item.delete_file===false?"仅移除任务，保留文件":"同时删除任务及文件")+
+"\n请勿重复点击或关闭页面。","info",0);
 var submitted=null;
 try{
 var params=new URLSearchParams({title:item.title,downloader:item.downloader,
-torrent_hash:item.hash,confirm:"true",request_id:id});
+torrent_hash:item.hash,confirm:"true",request_id:id,
+delete_file:item.delete_file===false?"false":"true"});
 submitted=await fetchJson("/api/v1/plugin/HHClubButler/delete_rescue_seed?"+params.toString(),
 {method:"POST",headers:{"X-HHClub-Request":"1"}});
 }catch(e){
@@ -1788,7 +1946,7 @@ if(state==="verified")done++;
 else {failed=true;break;}
 }
 if(done) {
-showToast("已确认删除 "+done+" 个种子，正在刷新最新列表。","good",7000);
+showToast("已确认处理 "+done+" 个下载器任务，正在刷新关联列表。","good",7000);
 load(true);
 }
 }finally{toggleDeletionBusy(false);}
@@ -1871,7 +2029,7 @@ buildHead();load(false);resumePendingDelete();
 
     def api_delete_rescue_seed(self, title: str = "", downloader: str = "",
                                torrent_hash: str = "", confirm: bool = False,
-                               request_id: str = ""):
+                               request_id: str = "", delete_file: bool = True):
         """Quick idempotent admission. Network requests happen in one worker."""
         if not confirm or not all((title, downloader, torrent_hash)):
             return {"success": False, "message": "缺少删除确认或种子标识"}
@@ -1884,8 +2042,9 @@ buildHead();load(false);resumePendingDelete();
         with self._delete_lock:
             existing = self._delete_jobs.get(request_id)
             if existing:
-                if (existing["title"], existing["downloader"], existing["torrent_hash"]) != (
-                    title, downloader, torrent_hash.lower()):
+                if (existing["title"], existing["downloader"], existing["torrent_hash"],
+                    existing["delete_file"]) != (
+                    title, downloader, torrent_hash.lower(), bool(delete_file)):
                     return {"success": False, "message": "同一请求标识不能用于不同种子"}
                 return {"success": True, "message": existing["message"],
                         "data": self._delete_job_view(existing)}
@@ -1904,7 +2063,8 @@ buildHead();load(false);resumePendingDelete();
             job = {
                 "request_id": request_id, "title": title,
                 "downloader": downloader, "torrent_hash": torrent_hash.lower(),
-                "status": "queued", "message": "已接收删除请求，正在后台核验",
+                "delete_file": bool(delete_file),
+                "status": "queued", "message": "已接收移除任务请求，正在后台核验",
                 "created_at": time.time(),
             }
             self._delete_jobs[request_id] = job
@@ -1936,7 +2096,9 @@ buildHead();load(false);resumePendingDelete();
                       "message": "其他自动优选任务正在运行，未执行删除"}
         else:
             try:
-                result = self._delete_rescue_exact(*target, confirm=True, generation=generation)
+                result = self._delete_rescue_exact(
+                    *target, confirm=True, generation=generation,
+                    delete_file=job["delete_file"])
             except Exception as error:
                 logger.error(f"删除后台任务出现未知异常：{error}")
                 # Do not claim a safe retry when an exception may happen
@@ -1972,11 +2134,13 @@ buildHead();load(false);resumePendingDelete();
 
     def _delete_rescue_exact(self, title: str = "", downloader: str = "",
                             torrent_hash: str = "", confirm: bool = False,
-                            generation: int | None = None):
-        """Delete only after fresh, unique site+downloader identity verification.
+                            generation: int | None = None,
+                            delete_file: bool = True):
+        """Remove ONE selected downloader hash after fresh identity checking.
 
-        For Chinese-prefixed releases the complete English suffix and size
-        must agree, and tracker.hhanclub.net must be verified by hostname.
+        Multiple same-name infohashes are legitimate cross-seeding.
+        The user chooses an exact hash. Shared payloads are never removed
+        when multiple tasks are associated with the same site release.
         """
         if not self._enabled or self._stopped:
             return {"success": False, "state": "failed", "message": "插件未启用或正在重载，拒绝删除"}
@@ -1992,19 +2156,31 @@ buildHead();load(false);resumePendingDelete();
             # The previous response may have been cached for 180 seconds.
             # Require fresh site records and ALL managed downloader snapshots
             # before making a destructive decision.
-            current = self._collect_rescue_seeds(strict_downloaders=True)
+            # For task-only removal a disconnected *other* client must not
+            # block the user; no shared files will be touched. File deletion
+            # still requires every selected client to be available.
+            current = self._collect_rescue_seeds(strict_downloaders=bool(delete_file))
             candidates = [row for row in current if normalize_name(row.get("title")) == canon]
             if len(candidates) != 1:
                 return {"success": False, "state": "failed",
                         "message": "站点记录缺失或重复，无法唯一确认删除对象"}
             row = candidates[0]
-            match_type = row.get("match_status")
-            if (match_type not in ("exact", "translated")
-                    or not row.get("can_delete")
-                    or row.get("downloader") != downloader
-                    or str(row.get("hash") or "").casefold() != torrent_hash.casefold()):
+            matching_candidates = [
+                c for c in row.get("candidates", [])
+                if c.get("downloader") == downloader
+                and str(c.get("hash") or "").casefold() == torrent_hash.casefold()
+            ]
+            if len(matching_candidates) != 1 or not matching_candidates[0].get("can_remove"):
                 return {"success": False, "state": "failed",
-                        "message": "站点与下载器最新关联未通过核验，拒绝删除"}
+                        "message": "下载器哈希未在可人工管理的关联任务中找到，拒绝操作"}
+            chosen = matching_candidates[0]
+            if delete_file and not chosen.get("can_delete_files"):
+                return {"success": False, "state": "failed",
+                        "message": "存在辅种或 Tracker 未确认，禁止同时删除共享视频文件；请仅移除任务"}
+            match_type = chosen.get("match_type")
+            if match_type not in {"exact", "translated"}:
+                return {"success": False, "state": "failed",
+                        "message": "只有英文发布名完全对应的任务才可以移除"}
             service = self._get_manage_services().get(downloader)
             if not service:
                 return {"success": False, "state": "failed", "message": "指定下载器不可用"}
@@ -2028,10 +2204,10 @@ buildHead();load(false);resumePendingDelete();
                 if match_type == "translated":
                     if translated_release_key(remote_name) != canon:
                         return {"success": False, "state": "failed",
-                                "message": "下载器英文发布名已经变化，拒绝删除"}
-                    if not is_trusted_hh_tracker(tracker_text):
+                                "message": "下载器英文发布名已经变化，拒绝操作"}
+                    if delete_file and not is_trusted_hh_tracker(tracker_text):
                         return {"success": False, "state": "failed",
-                                "message": "未能确认 tracker.hhanclub.net，拒绝删除"}
+                                "message": "未确认 tracker.hhanclub.net，不允许删除文件"}
                     size_bytes = (g("total_size") or g("totalSize") or g("size"))
                     try:
                         size_gb = float(size_bytes) / 1073741824 if size_bytes else 0
@@ -2043,11 +2219,10 @@ buildHead();load(false);resumePendingDelete();
                 else:
                     if self._norm_title(remote_name) != self._norm_title(title):
                         return {"success": False, "state": "failed",
-                                "message": "下载器名称发生变化，拒绝删除"}
-                    if not any(x in tracker_text.casefold()
-                               for x in ("hhanclub", "hhclub", "hanclub")):
+                                "message": "下载器名称发生变化，拒绝操作"}
+                    if delete_file and not is_trusted_hh_tracker(tracker_text):
                         return {"success": False, "state": "failed",
-                                "message": "无法确认本站 Tracker，拒绝删除"}
+                                "message": "未确认 tracker.hhanclub.net，不允许删除文件"}
                 matched_hashes.add(remote_hash)
             if len(matched_hashes) != 1:
                 return {"success": False, "state": "failed",
@@ -2058,7 +2233,8 @@ buildHead();load(false);resumePendingDelete();
             if self._stopped or (generation is not None and generation != self._delete_generation):
                 return {"success": False, "state": "failed", "message": "插件配置已变化，删除已取消"}
             dispatched = True
-            accepted = service.instance.delete_torrents(delete_file=True, ids=matched)
+            accepted = service.instance.delete_torrents(
+                delete_file=bool(delete_file), ids=matched)
             if accepted is False:
                 return {"success": False, "state": "uncertain",
                         "message": "下载器未确认删除指令是否执行，请刷新列表核对，不要重复点击"}
@@ -2081,8 +2257,11 @@ buildHead();load(false);resumePendingDelete();
                                 "message": "下载器回读结果缺少种子哈希，无法确认删除"}
                     hashes.append(str(value).lower())
                 if torrent_hash.lower() not in hashes:
-                    logger.info(f"憨憨保种区管家已确认删除：下载器={downloader}，hash={torrent_hash[:8]}…")
-                    return {"success": True, "state": "verified", "message": f"已确认删除：{title}"}
+                    logger.info(f"憨憨保种区管家已确认移除：下载器={downloader}，"
+                                f"hash={torrent_hash[:8]}…，保留文件={not delete_file}")
+                    message = ("已移除所选任务并保留数据文件" if not delete_file
+                               else "已移除任务和数据文件")
+                    return {"success": True, "state": "verified", "message": f"{message}：{title}"}
                 if attempt < 2:
                     time.sleep(0.5)
             return {"success": False, "state": "uncertain",
