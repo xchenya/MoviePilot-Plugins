@@ -280,7 +280,7 @@ def associate_rescue_seeds(
         "eligible": len(site_seeds), "linked": 0, "exact": 0,
         "translated": 0, "similar": 0, "ambiguous": 0, "unmatched": 0,
         "cross_seed": 0, "cross_seed_tasks": 0, "auxiliary_tasks": 0,
-        "removable_tasks": 0, "deletable": 0,
+        "removable_tasks": 0, "deletable": 0, "group_delete_ready": 0,
         "ambiguity_multiple_tasks": 0,
         "ambiguity_duplicate_site_titles": 0,
         "ambiguity_shared_fuzzy": 0,
@@ -309,7 +309,8 @@ def associate_rescue_seeds(
         item.update({
             "downloader": "", "downloaders": [], "hash": "",
             "match_status": "unmatched", "match_reason": "下载器中暂未匹配",
-            "can_delete": False, "can_manage": False, "matched": False,
+            "can_delete": False, "can_manage": False, "can_delete_group": False,
+            "matched": False,
             "trusted_tracker": False, "candidates": [],
             "cross_seed_count": 0, "auxiliary_count": 0,
         })
@@ -359,7 +360,7 @@ def associate_rescue_seeds(
             item["auxiliary_count"] = len(group) - 1
             item["match_reason"] = (
                 f"同名种子任务 {len(group)} 个（含辅种 {len(group) - 1} 个）；"
-                "按 Hash 选择任务，辅种仅移除任务、保留文件"
+                "用户确认后默认删除这组全部关联任务及其文件；Tracker 状态仅供参考"
             )
             stats["cross_seed"] += 1
             stats["cross_seed_tasks"] += len(group)
@@ -410,6 +411,7 @@ def associate_rescue_seeds(
                 "match_type": kind, "trusted_tracker": confirmed_hh,
                 "completed": completed, "progress": progress,
                 "size_gb": torrent.get("size_gb"),
+                "size_verified": translated_size_matches(site, torrent),
                 "can_remove": bool(can_remove),
                 "can_delete_files": bool(can_delete_files),
             }
@@ -421,6 +423,15 @@ def associate_rescue_seeds(
         ))
         item["candidates"] = records
         item["can_manage"] = any(c["can_remove"] for c in records)
+        # Tracker is advisory only. Strong release-title evidence, actual
+        # downloader hash, completed status and tight size agreement authorize
+        # a user-confirmed group operation. Never infer from mere fuzzy title.
+        item["can_delete_group"] = bool(
+            not unsafe_group and len(records) > 0 and len(records) <= 200
+            and all(c["can_remove"] and c["size_verified"] for c in records)
+        )
+        if item["can_delete_group"]:
+            stats["group_delete_ready"] += 1
 
         if is_cross_seed or item["match_status"] == "ambiguous":
             continue
@@ -441,20 +452,11 @@ def associate_rescue_seeds(
             item["match_status"] = "downloading" if selected["progress"] is not None else "unverified"
             item["match_reason"] = "下载进度未核实或尚未完成"
         elif match_type == "translated":
-            item["match_reason"] = (
-                "忽略中文译名后英文发布名与大小匹配；"
-                + ("Tracker 已验证，可选择删除文件" if selected["can_delete_files"]
-                   else "可人工移除任务，保留文件")
-            )
-        elif not bool(torrent.get("site_tracker")):
-            item["match_status"] = "unverified"
-            item["match_reason"] = "Tracker 尚未确认属于憨憨站；如需操作只能保留数据"
+            item["match_reason"] = "忽略中文译名后完整英文发布名与体积一致"
         elif match_type == "similar":
-            item["match_reason"] = "名称近似匹配，仅供查看"
+            item["match_reason"] = "名称近似匹配，不能认定为同一份种子"
         else:
-            item["match_reason"] = "名称精确匹配，" + (
-                "Tracker 已验证" if selected["trusted_tracker"] else "Tracker 未验证"
-            )
+            item["match_reason"] = "完整发布名一致；是否可整组删除由大小、进度和 Hash 核验决定"
 
         if selected["can_delete_files"]:
             item["hash"] = selected["hash"]

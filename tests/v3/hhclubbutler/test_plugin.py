@@ -1,4 +1,4 @@
-"""HHClubButler V3.0.8 contracts and deletion safety without a real downloader."""
+"""HHClubButler V3.0.9 contracts and deletion safety without a real downloader."""
 from __future__ import annotations
 
 import ast
@@ -39,7 +39,7 @@ def test_v3_metadata_and_v2_fallback_disabled():
     }
     market_v3 = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))
     market_v2 = json.loads((ROOT / "package.v2.json").read_text(encoding="utf-8"))
-    assert attrs["plugin_version"] == "3.0.8"
+    assert attrs["plugin_version"] == "3.0.9"
     assert market_v3["HHClubButler"]["version"] == attrs["plugin_version"]
     assert market_v3["HHClubButler"]["system_version"] == ">=3.0.0"
     assert market_v3["HHClubButler"]["release"] is False
@@ -58,7 +58,7 @@ def test_page_endpoints_require_cookie_admin():
     api_src = ast.get_source_segment(source, api)
     assert 'page_deps = [Depends(_require_resource_admin)]' in api_src
     assert 'allow_anonymous": True, "dependencies": page_deps' in api_src
-    assert api_src.count('"allow_anonymous": True, "dependencies": page_deps') == 6
+    assert api_src.count('"allow_anonymous": True, "dependencies": page_deps') == 7
     assert '"auth": "bear"' in api_src
     assert '"/refresh_overview"' in api_src
     assert '"methods": ["POST"]' in api_src

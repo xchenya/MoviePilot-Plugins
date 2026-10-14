@@ -85,17 +85,18 @@ def test_job_idempotency_binds_delete_file_mode():
     assert "同一请求" in b["message"]
     remove.assert_not_called()
 
-def test_crossseed_ui_contract_selects_hash_and_preserves_data():
+def test_crossseed_ui_defaults_to_all_tasks_and_file_deletion():
     src=(ROOT/"plugins.v3/hhclubbutler/__init__.py").read_text()
-    assert 'id="hhCopyOverlay"' in src
-    assert 'id="hhCopyList"' in src
+    assert 'id="hhCopyOverlay"' not in src
     assert 'id="crossSeedGroups"' in src
     assert 'id="auxiliaryTaskCount"' in src
     assert 'data-del="' in src
-    assert 'copyPickerResolve' in src
-    assert 'delete_file:item.delete_file===false?"false":"true"' in src
-    assert "seed.cross_seed_count>1" in src
-    assert 'item.delete_file===false' in src
+    assert 'function groupFromSeed(seed)' in src
+    assert 'delete_rescue_group' in src
+    assert 'delete_file:true' in src
+    assert 'targets:item.targets' in src
+    assert '删除全部辅种及文件' in src
+    assert 'HHClubButler/delete_rescue_group' in src
 
 def test_single_verified_hh_still_can_delete_file_explicitly():
     # Existing single-copy behavior must not be silently switched to task-only.

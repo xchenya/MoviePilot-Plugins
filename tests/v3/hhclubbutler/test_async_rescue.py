@@ -246,8 +246,8 @@ def test_market_metadata_marks_patch_release_unpublished():
     import json
     manifest = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))
     entry = manifest["HHClubButler"]
-    assert entry["version"] == "3.0.8"
+    assert entry["version"] == "3.0.9"
     assert entry["release"] is False
-    assert "3.0.8" in entry["history"]
+    assert "3.0.9" in entry["history"]
 
 
