@@ -79,10 +79,27 @@ class RescueSeedItem(BaseModel):
     match_reason: str = ""
     can_delete: bool = False
     can_manage: bool = False
+    can_delete_group: bool = False
     cross_seed_count: int = 0
     auxiliary_count: int = 0
     candidates: list[RescueCopyItem] = Field(default_factory=list)
     hash: str = ""
+
+
+
+class RescueGroupTarget(BaseModel):
+    downloader: str
+    hash: str
+
+
+class RescueGroupDeleteRequest(BaseModel):
+    """Explicit all-hashes manifest from a confirmed manager-page snapshot."""
+    request_id: str
+    seed_id: int
+    title: str
+    targets: list[RescueGroupTarget] = Field(default_factory=list)
+    confirm: bool = False
+    delete_file: bool = True
 
 
 class RescueSeedList(BaseModel):
@@ -182,7 +199,7 @@ class HHClubButler(_PluginBase):
     plugin_name = "憨憨保种区管家"
     plugin_desc = "自动优选添加及换种工具\n保种管理器/Hosts加速"
     plugin_icon = "https://raw.githubusercontent.com/xchenya/MoviePilot-Plugins/main/plugins.v3/hhclubbutler/icon.png"
-    plugin_version = "3.0.8"
+    plugin_version = "3.0.9"
     plugin_author = "六个橙子"
     author_url = "https://github.com/SixOrg"
     plugin_config_prefix = "hhclubbutler_"
@@ -370,6 +387,10 @@ class HHClubButler(_PluginBase):
             {"path": "/delete_rescue_seed", "endpoint": self.api_delete_rescue_seed,
              "methods": ["POST"], "allow_anonymous": True, "dependencies": page_deps,
              "summary": "提交经确认的后台删除任务",
+             "response_model": OperationResult},
+            {"path": "/delete_rescue_group", "endpoint": self.api_delete_rescue_group,
+             "methods": ["POST"], "allow_anonymous": True, "dependencies": page_deps,
+             "summary": "按已确认的 Hash 清单删除全部辅种任务及文件",
              "response_model": OperationResult},
             {"path": "/delete_rescue_status", "endpoint": self.api_delete_rescue_status,
              "methods": ["GET"], "allow_anonymous": True, "dependencies": page_deps,
@@ -1106,6 +1127,7 @@ class HHClubButler(_PluginBase):
                     dl_type = str(service.config.type or service.type or "")
                 except Exception:
                     dl_type = ""
+                tracker_fields_seen, trusted_tracker_count = 0, 0
                 for torrent in torrents:
                     def g(*keys):
                         for key in keys:
@@ -1128,6 +1150,8 @@ class HHClubButler(_PluginBase):
                         size_gb = None
                     tracker = self._extract_tracker_text(torrent, dl_type)
                     trusted_tracker = is_trusted_hh_tracker(tracker)
+                    tracker_fields_seen += int(bool(tracker))
+                    trusted_tracker_count += int(bool(trusted_tracker))
                     site_tracker = trusted_tracker or any(
                         d in tracker.casefold() for d in
                         ("hhanclub", "hhancclub", "hhclub", "hanclub")
@@ -1156,7 +1180,9 @@ class HHClubButler(_PluginBase):
                         "tracker": parsed_domain.group(1) if parsed_domain else "",
                         "added": added_at,
                     })
-                logger.info(f"憨憨保种管理器：下载器 {name} 读取完成，种子 {len(torrents)} 条")
+                logger.info(f"憨憨保种管理器：下载器 {name} 种子 {len(torrents)} 条，"
+                            f"Tracker 字段可读 {tracker_fields_seen} 条 / "
+                            f"本站主机可识别 {trusted_tracker_count} 条（仅作诊断，不影响人工删除）")
             except Exception as e:
                 logger.warning(f"憨憨保种管理器：下载器 {name} 数据解析失败：{e}")
                 if strict_downloaders:
@@ -1448,7 +1474,7 @@ tr.sel td{background:var(--tr-sel);color:#fff}
 <div id="dlList"></div></div></span>
 <input class="search" id="q" placeholder="搜索名称...">
 <button class="btn ghost" type="button" id="btnRefresh" title="重新从站点和下载器获取最新列表">⟳ 刷新列表</button>
-<button class="btn danger" type="button" id="btnDel">删除选中</button>
+<button class="btn danger" type="button" id="btnDel" title="删除所选站点记录关联的全部辅种任务及文件（执行前需确认）">删除选中</button>
 <button class="btn ghost" id="colsBtn">列选择</button>
 <select class="themebtn" id="themeSel" title="选择皮肤" style="cursor:pointer;"><option value="light">纯白</option><option value="cream">米黄暖</option><option value="sakura">樱花粉</option><option value="mint">薄荷绿</option><option value="sky">天空蓝</option><option value="lavender">薰衣草紫</option><option value="silver">银灰金属</option><option value="dark">深灰</option><option value="graphite">石墨蓝</option><option value="midnight">午夜蓝</option><option value="navy">深蓝</option><option value="plum">暗紫</option><option value="charcoal">炭灰暖</option><option value="forest">暗夜绿</option><option value="hc">高对比</option></select>
 <button class="btn ghost" id="btnExit" title="关闭管理器">退出</button>
@@ -1488,18 +1514,6 @@ tr.sel td{background:var(--tr-sel);color:#fff}
       <button class="btn danger" type="button" id="hhAcceptDelete">确认删除文件</button>
     </div>
   </div>
-</div>
-<div class="hh-overlay" id="hhCopyOverlay" hidden>
- <div class="hh-dialog" role="dialog" aria-modal="true" aria-labelledby="hhCopyTitle">
-  <div class="hh-dialog-head"><span class="hh-warning-icon" aria-hidden="true">≡</span><span id="hhCopyTitle">选择辅种任务</span></div>
-  <div class="hh-dialog-desc" id="hhCopyDesc"></div>
-  <div class="hh-copy-list" id="hhCopyList" role="radiogroup" aria-label="选择具体辅种任务"></div>
-  <div class="hh-dialog-note">一个发布名可以有多个不同 Hash。这里每次只操作你选中的一项；辅种只移除任务，数据文件继续保留。</div>
-  <div class="hh-dialog-actions">
-   <button class="btn ghost" id="hhCloseCopies" type="button">取消</button>
-   <button class="btn danger" id="hhChooseCopy" type="button" disabled>继续确认所选任务</button>
-  </div>
- </div>
 </div>
 <div class="hh-toast" id="hhToast" role="status" aria-live="polite" hidden></div>
 <script>
@@ -1566,10 +1580,9 @@ if(c.k==="c_dl"){
 var names=s.downloaders&&s.downloaders.length?s.downloaders.join(" / "):(s.downloader||"");
 if(!names)return '<span class="match-unmatched" title="'+esc(s.match_reason||"下载器未匹配")+'">未匹配</span>';
 var kind=s.match_status||"";
-var hint=kind==="cross_seed"?"辅种 "+(s.cross_seed_count||0)+" 个":kind==="translated"?"译名匹配":kind==="similar"?"近似":kind==="ambiguous"?"有歧义":
-         kind==="unverified"?"未验证":kind==="downloading"?"下载中":"";
-return '<span class="match-'+esc(kind)+'" title="'+esc(s.match_reason||"")+'">'+esc(names)+'</span>'+
- (hint?'<span class="match-hint">'+esc(hint)+'</span>':"");
+var copies=s.cross_seed_count||0;
+return '<span title="'+esc(s.match_reason||"")+'">'+esc(names)+'</span>'+
+ (copies>1?'<span class="match-hint">辅种 '+copies+' 个</span>':"");
 }
 return "";
 }
@@ -1583,11 +1596,10 @@ html+='<tr class="'+(seled?"sel":"")+'">';
 html+='<td><input type="checkbox" data-idx="'+i+'" '+(seled?"checked":"")+"></td>";
 for(var j=0;j<COLS.length;j++){var c=COLS[j];if(c.visible===false)continue;
 html+='<td class="'+(c.r?"right ":"")+'" data-col="'+c.k+'">'+cellVal(c,s,t)+"</td>";}
-var action=s.can_manage
- ?'<a style="color:#ff8080;cursor:pointer;" data-del="'+i+'">'+
- (s.cross_seed_count>1?"管理辅种 ("+s.cross_seed_count+")":
-   (s.can_delete?"删除":"移除任务"))+'</a>'
- :'<span style="opacity:.4" title="'+esc(s.match_reason||"下载器未验证")+'">仅查看</span>';
+var action=s.can_delete_group
+ ?'<a style="color:#ff8080;cursor:pointer;" data-del="'+i+'" title="默认删除全部辅种任务及其数据文件，执行前再次确认">删除'+
+ (s.cross_seed_count>1?"全部 "+s.cross_seed_count+" 个":"")+'</a>'
+ :'<span style="opacity:.4" title="'+esc(s.match_reason||"无法完整关联全部任务")+'">仅查看</span>';
 html+='<td>'+action+'</td></tr>';}
 if(!f.length)html='<tr><td colspan="20" style="text-align:center;padding:40px;color:#888">无匹配种子</td></tr>';
 document.getElementById("tbody").innerHTML=html;
@@ -1691,85 +1703,28 @@ deletionBusy=!!busy;
 document.getElementById("btnDel").disabled=deletionBusy;
 document.getElementById("hhAcceptDelete").disabled=deletionBusy;
 }
-var copyPickerResolve=null,copyPickerChoice=null;
-function openCopyPicker(seed){
-return new Promise(function(resolve){
-if(copyPickerResolve){resolve(null);return;}
-var candidates=seed.candidates||[];
-var available=candidates.filter(function(c){return c.can_remove&&c.hash});
-if(!available.length){
-showToast("这些辅种缺少可靠的发布名、完成状态或 Hash，暂不能移除。","warn");
-resolve(null);return;
-}
-copyPickerResolve=resolve;
-copyPickerChoice=null;
-var pane=document.getElementById("hhCopyOverlay");
-var list=document.getElementById("hhCopyList");
-list.replaceChildren();
-document.getElementById("hhCopyDesc").textContent=
-"种子："+(seed.title||"")+"\n关联任务："+candidates.length+
-" 个。请选择具体 Hash；只会移除选中任务，不影响其他辅种的视频文件。";
-document.getElementById("hhChooseCopy").disabled=true;
-candidates.forEach(function(c,index){
-var label=document.createElement("label");
-label.className="hh-copy-row";
-var radio=document.createElement("input");
-radio.type="radio";radio.name="hhCopyChoice";radio.value=String(index);
-radio.disabled=!c.can_remove||!c.hash;
-var desc=document.createElement("span");desc.className="hh-copy-content";
-var primary=document.createElement("span");primary.className="hh-copy-primary";
-primary.textContent=(c.downloader||"未知下载器")+" · Hash "+(c.hash_short||String(c.hash||"").slice(0,12)||"未知");
-var secondary=document.createElement("span");secondary.className="hh-copy-secondary";
-secondary.textContent="Tracker："+(c.tracker||"未识别")+
-" · "+(c.trusted_tracker?"憨憨 Tracker 已验证":"其他站点或未验证 Tracker")+
-" · "+(c.completed?"已完成":"未完成/未知")+
-" · "+(radio.disabled?"不可操作":"仅移除任务、保留文件");
-desc.appendChild(primary);desc.appendChild(secondary);
-label.appendChild(radio);label.appendChild(desc);
-if(!radio.disabled)radio.onchange=function(){
-copyPickerChoice=c;
-document.getElementById("hhChooseCopy").disabled=false;
-};
-list.appendChild(label);
-});
-pane.hidden=false;
-document.getElementById("hhCloseCopies").focus();
-});
-}
-function closeCopyPicker(accept){
-if(!copyPickerResolve)return;
-var resolve=copyPickerResolve,selected=accept?copyPickerChoice:null;
-copyPickerResolve=null;copyPickerChoice=null;
-document.getElementById("hhCopyOverlay").hidden=true;
-resolve(selected);
-}
-document.getElementById("hhCloseCopies").onclick=function(){closeCopyPicker(false)};
-document.getElementById("hhChooseCopy").onclick=function(){closeCopyPicker(true)};
-document.getElementById("hhCopyOverlay").onclick=function(e){if(e.target===this)closeCopyPicker(false)};
-document.addEventListener("keydown",function(e){
-if(e.key==="Escape"&&copyPickerResolve){e.preventDefault();closeCopyPicker(false)}
-});
 function openDeleteDialog(items){
 return new Promise(function(resolve){
 if(dialogResolve){resolve(false);return;}
 var overlay=document.getElementById("hhConfirmOverlay");
-var title=document.getElementById("hhConfirmTitle");
-var desc=document.getElementById("hhConfirmDesc");
-var keepFiles=items.length===1&&items[0].delete_file===false;
-title.textContent=keepFiles?"确认移除所选任务":(items.length===1?"确认删除任务和文件":"确认批量删除");
-var note=overlay.querySelector(".hh-dialog-note");
-note.textContent=keepFiles
- ?"仅移除选中的下载器任务，完整保留视频文件；其他辅种会继续做种。"
- :"将删除选中的下载器任务及对应文件，文件删除不可由插件撤销。";
+var total=items.reduce(function(n,s){return n+(s.targets||[]).length},0);
+var clients={};
+items.forEach(function(s){(s.targets||[]).forEach(function(t){
+clients[t.downloader]=(clients[t.downloader]||0)+1;
+})});
+var names=Object.keys(clients).sort().map(function(k){return k+": "+clients[k]+" 个任务"}).join("；");
+document.getElementById("hhConfirmTitle").textContent="确认删除全部辅种及文件";
+document.getElementById("hhConfirmDesc").textContent=
+"保种记录："+items.length+" 条\n关联辅种任务："+total+" 个\n"+
+"下载器："+names+"\n"+
+(items.length===1?"发布名："+items[0].title+"\n":"")+
+"模式：全部移除任务，并删除各任务关联的数据文件。";
+overlay.querySelector(".hh-dialog-note").textContent=
+"高风险操作，不可撤销！所有关联的辅种任务和数据文件都会删除，可能影响其它站点的做种或硬链接以外的共享路径。"+
+"执行前后台还会重新核对全部 Hash，若清单变化则取消，不会自动扩大删除范围。";
 document.getElementById("hhAcceptDelete").textContent=
- keepFiles?"确认仅移除任务":"确认删除任务和文件";
-desc.textContent=items.length===1
-  ?"种子名称：\n"+(items[0].title||"")+"\n下载器："+(items[0].downloader||"-")+
-   (items[0].match_status==="translated"?"\n已匹配中文译名前缀后的完整英文发布名。":"")+
-   "\nHash："+String(items[0].hash||"").slice(0,12)
-  :"将删除所选 "+items.length+" 个种子，涉及的下载器任务和文件将一并删除。";
-dialogResolve=resolve;
-overlay.hidden=false;
+"确认删除 "+total+" 个任务及其文件";
+dialogResolve=resolve;overlay.hidden=false;
 document.getElementById("hhCancelDelete").focus();
 });
 }
@@ -1815,7 +1770,9 @@ var job=payload.data||{},state=job.status||"unknown";
 if(state==="verified"||state==="failed"||state==="uncertain")return job;
 if(state!=="running"&&state!=="queued")return {status:"unknown",message:"未知任务状态"};
 errors=0;missing=0;
-showToast("删除任务执行中（"+Math.floor(job.elapsed_seconds||0)+" 秒）\n"+(job.title||"")+" \n正在等待下载器确认，请勿重复提交","info",0);
+showToast("辅种删除执行中（"+Math.floor(job.elapsed_seconds||0)+" 秒）"+
+"\n已核对移除："+(job.removed_count||0)+"/"+(job.total_count||0)+
+"\n"+(job.title||"")+"\n请勿重复提交","info",0);
 await new Promise(function(r){setTimeout(r,2500)});
 }catch(e){
 if(++errors>=3)return {status:"unknown",message:"状态查询中断："+e};
@@ -1824,129 +1781,111 @@ await new Promise(function(r){setTimeout(r,2500)});
 }
 return {status:"unknown",message:"等待任务结果超时；任务可能仍在后台运行"};
 }
+function groupFromSeed(seed){
+var candidates=seed.candidates||[];
+if(!seed.can_delete_group||!candidates.length)return null;
+var targets=candidates.map(function(c){return {downloader:c.downloader,hash:c.hash}});
+if(targets.some(function(t){return !t.downloader||!t.hash}))return null;
+return {title:seed.title,seed_id:seed.seed_id,targets:targets,delete_file:true};
+}
 function forgetVerifiedItem(item){
-// Keep the site's eligibility row even after its downloader task disappears.
 delete sel[item.title];
 var row=seeds.find(function(s){
 return (item.seed_id!=null&&s.seed_id===item.seed_id)||s.title===item.title;
 });
 if(row){
-row.candidates=(row.candidates||[]).filter(function(c){
-return !(c.downloader===item.downloader&&
-        String(c.hash||"").toLowerCase()===String(item.hash||"").toLowerCase());
-});
-row.cross_seed_count=row.candidates.length;
-row.auxiliary_count=Math.max(0,row.candidates.length-1);
-row.can_manage=row.candidates.some(function(c){return !!c.can_remove});
-row.can_delete=false;row.hash="";
-if(!row.candidates.length){
-row.matched=false;row.match_status="unmatched";
-row.match_reason="下载器任务已移除，正在重新读取最新状态";
+row.candidates=[];row.cross_seed_count=0;row.auxiliary_count=0;
+row.can_manage=false;row.can_delete=false;row.can_delete_group=false;
+row.hash="";row.matched=false;row.match_status="unmatched";
+row.match_reason="关联任务删除指令已完成，正在重新读取站点和下载器";
 row.downloader="";row.downloaders=[];
-}else{
-row.match_reason="已移除所选任务，正在重新读取其它辅种的状态";
-}
 }
 doSort();buildDlList();render();
 }
 async function followDeletion(record,reload){
-var job=await pollDeleteStatus(record.id);
-if(job.status==="verified"){
-forgetVerifiedItem(record.item);
-clearPending();
-showToast((record.item.delete_file===false?"已确认移除任务，文件仍保留：":"已确认删除任务和文件：")+
-(record.item.title||"")+"\n正在重新获取关联状态。","good",7000);
+var result=await pollDeleteStatus(record.id);
+if(result.status==="verified"){
+forgetVerifiedItem(record.item);clearPending();
+showToast("下载器已确认移除全部 "+(result.removed_count||0)+
+" 个关联任务，并已收到删除文件指令。\n"+
+"注意：实际磁盘文件是否彻底删除须到下载器/存储端确认。","good",10000);
 if(reload)load(true);
 return "verified";
 }
-if(job.status==="failed"){
+if(result.status==="failed"){
 clearPending();
-showToast("删除未执行：" +(job.message||"请检查插件日志"),"bad",10000);
+showToast("删除前核验失败："+(result.message||"请检查插件日志")+
+"\n未自动重新提交。","bad",12000);
 return "failed";
 }
-if(job.status==="uncertain"){
 clearPending();
-showToast("删除状态尚未确认："+(job.message||"请重新读取下载器状态")+"\n不会自动再次删除，请刷新列表核对。","warn",12000);
+showToast("部分完成或状态未知："+(result.message||"需人工核对")+
+"\n已确认任务数："+(result.removed_count||0)+
+"/"+(result.total_count||record.item.targets.length)+
+"\n请核对下载器和磁盘文件！不会自动重发删除命令。","warn",0);
 load(true);
 return "uncertain";
 }
-clearPending();
-showToast("结果未知："+(job.message||"状态查询失败")+"\n请先刷新列表并核对下载器；不会自动重新发送删除。","warn",0);
-return "unknown";
-}
 async function delOne(seed){
 if(deletionBusy)return;
-var copies=seed.candidates||[];
-var selected=null;
-if(seed.cross_seed_count>1){
-selected=await openCopyPicker(seed);
-}else{
-selected=copies.find(function(c){return c.can_remove&&c.hash})||null;
-}
-if(!selected){
-if(seed.cross_seed_count<=1)showToast("缺少可核实的种子 Hash 或任务尚未完成，暂不可移除。","warn");
+var group=groupFromSeed(seed);
+if(!group){
+showToast("该记录不能确认全部任务的完整名称、大小或 Hash，拒绝整组删除。","warn",9000);
 return;
 }
-var selectedTask={
-title:seed.title,seed_id:seed.seed_id,
-downloader:selected.downloader,hash:selected.hash,
-delete_file:seed.cross_seed_count<=1&&!!selected.can_delete_files,
-match_status:selected.match_type
-};
-if(!await openDeleteDialog([selectedTask]))return;
-await doDel([selectedTask]);
+if(!await openDeleteDialog([group]))return;
+await doDel([group]);
 }
 async function delSel(){
 if(deletionBusy)return;
-var items=seeds.filter(function(s){return !!sel[s.title]});
-if(!items.length){showToast("请先勾选需要删除的种子。","warn");return;}
-if(items.some(function(s){return s.cross_seed_count>1})){
-showToast("所选项目包含辅种，请在对应行点击「管理辅种」，逐项选择 Hash。","warn");return;
+var chosen=seeds.filter(function(seed){return !!sel[seed.title]});
+if(!chosen.length){showToast("请先勾选需要删除的保种记录。","warn");return;}
+var groups=chosen.map(groupFromSeed);
+if(groups.some(function(group){return !group})){
+showToast("所选记录中存在无法核对全部辅种的任务；请取消这些记录再试。","warn",11000);
+return;
 }
-if(items.some(function(item){return !item.can_delete||!item.downloader||!item.hash})){
-showToast("所选种子中存在不能同时删除文件的任务，请逐条确认后再操作。","warn");return;
+if(!await openDeleteDialog(groups))return;
+await doDel(groups);
 }
-var targets=items.map(function(item){
-return {title:item.title,seed_id:item.seed_id,
-downloader:item.downloader,hash:item.hash,
-delete_file:true,match_status:item.match_status};
-});
-if(!await openDeleteDialog(targets))return;
-await doDel(targets);
-}
-async function doDel(items){
+async function doDel(groups){
 if(deletionBusy)return;
-var old=readPending();
-if(old){showToast("上一次删除的结果尚未确认。请重新打开页面查询进度，避免重复提交。","warn",10000);return;}
+if(readPending()){
+showToast("上一条删除请求状态尚未核对，请等待或重新打开页面恢复任务状态。","warn",10000);
+return;
+}
 toggleDeletionBusy(true);
-var done=0, failed=false;
+var finished=0,stopped=false;
 try{
-for(var i=0;i<items.length;i++){
-var item=items[i],id=createRequestId(),record={id:id,item:item,started:Date.now()};
+for(var i=0;i<groups.length;i++){
+var item=groups[i],record={id:createRequestId(),item:item,started:Date.now()};
 savePending(record);
-showToast("正在提交任务操作：" +(item.title||"")+
-"\n"+(item.delete_file===false?"仅移除任务，保留文件":"同时删除任务及文件")+
-"\n请勿重复点击或关闭页面。","info",0);
+showToast("正在提交第 "+(i+1)+"/"+groups.length+" 组，"+
+(item.targets||[]).length+" 个辅种任务及其文件。\n"+
+"请求提交结果不明时只查询状态，不重复删除。","info",0);
 var submitted=null;
 try{
-var params=new URLSearchParams({title:item.title,downloader:item.downloader,
-torrent_hash:item.hash,confirm:"true",request_id:id,
-delete_file:item.delete_file===false?"false":"true"});
-submitted=await fetchJson("/api/v1/plugin/HHClubButler/delete_rescue_seed?"+params.toString(),
-{method:"POST",headers:{"X-HHClub-Request":"1"}});
-}catch(e){
-showToast("请求提交结果未确认，正在按任务编号查询状态。\n不会重新发送删除命令。","warn",0);
+submitted=await fetchJson("/api/v1/plugin/HHClubButler/delete_rescue_group",{
+method:"POST",headers:{"Content-Type":"application/json","X-HHClub-Request":"1"},
+body:JSON.stringify({
+request_id:record.id,seed_id:item.seed_id,title:item.title,
+targets:item.targets,confirm:true,delete_file:true
+})});
+}catch(err){
+showToast("HTTP 请求结果未知，正在按原任务编号查询；不会再次提交删除命令。","warn",0);
 }
 if(submitted&&!submitted.success){
-clearPending();showToast("无法提交删除："+(submitted.message||"未知错误"),"bad",10000);
-failed=true;break;
+clearPending();
+showToast("服务端拒绝删除："+(submitted.message||"未知原因"),"bad",10000);
+stopped=true;break;
 }
 var state=await followDeletion(record,false);
-if(state==="verified")done++;
-else {failed=true;break;}
+if(state==="verified")finished++;
+else{stopped=true;break;}
 }
-if(done) {
-showToast("已确认处理 "+done+" 个下载器任务，正在刷新关联列表。","good",7000);
+if(finished){
+showToast("已确认处理 "+finished+" 组辅种。"+
+(stopped?"其他组已停止，需人工核对。":"正在刷新列表。"),"good",9000);
 load(true);
 }
 }finally{toggleDeletionBusy(false);}
@@ -1955,7 +1894,7 @@ async function resumePendingDelete(){
 var record=readPending();
 if(!record||!record.id||!record.item)return;
 toggleDeletionBusy(true);
-showToast("检测到上次未完成的删除任务，仅查询其执行状态，不会重复提交。","info",0);
+showToast("检测到未完成的辅种删除任务，仅恢复状态查询，不会重新发送删除。","info",0);
 try{await followDeletion(record,true)}
 finally{toggleDeletionBusy(false)}
 }
@@ -2015,6 +1954,8 @@ buildHead();load(false);resumePendingDelete();
             "request_id": job["request_id"], "status": job["status"],
             "message": job.get("message", ""), "title": job["title"],
             "elapsed_seconds": max(0, int(time.time() - job["created_at"])),
+            "total_count": job.get("total_count", 1),
+            "removed_count": job.get("removed_count", 0),
         }
 
     def _invalidate_rescue_cache(self):
@@ -2131,6 +2072,271 @@ buildHead();load(false);resumePendingDelete();
                 return {"success": False, "message": "未找到删除任务；状态未知，请刷新列表核对，勿重复提交"}
             return {"success": True, "message": job.get("message", ""),
                     "data": self._delete_job_view(job)}
+
+    def api_delete_rescue_group(self, request: RescueGroupDeleteRequest):
+        """Accept an explicitly confirmed all-hashes manifest; return immediately.
+
+        Repeating the same request_id never resubmits deletion, even if the
+        HTTP client has timed out or the downloader reported an unknown state.
+        """
+        title = str(request.title or "").strip()
+        request_id = str(request.request_id or "").strip()
+        try:
+            seed_id = int(request.seed_id)
+        except (TypeError, ValueError):
+            return {"success": False, "message": "无效站点种子 ID"}
+        if (not request.confirm or not request.delete_file or not title or seed_id <= 0
+                or not re.fullmatch(r"[A-Za-z0-9_-]{12,80}", request_id)):
+            return {"success": False, "message": "删除前必须确认站点、任务和文件"}
+        if not self._enabled or self._stopped:
+            return {"success": False, "message": "插件未启用，拒绝删除"}
+        targets = []
+        for entry in request.targets:
+            client = str(entry.downloader or "").strip()
+            infohash = str(entry.hash or "").strip().lower()
+            if (client not in self._downloaders
+                    or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", infohash)):
+                return {"success": False, "message": "包含无效下载器或 Hash"}
+            targets.append((client, infohash))
+        if not 1 <= len(targets) <= 200 or len(set(targets)) != len(targets):
+            return {"success": False, "message": "任务清单为空、重复或超过单组安全上限"}
+        canonical = tuple(sorted(targets))
+        with self._delete_lock:
+            previous = self._delete_jobs.get(request_id)
+            if previous:
+                if (previous.get("kind") != "group"
+                        or previous.get("title") != title
+                        or previous.get("seed_id") != seed_id
+                        or previous.get("targets") != canonical):
+                    return {"success": False, "message": "请求编号已绑定其他删除清单"}
+                return {"success": True, "message": previous.get("message", ""),
+                        "data": self._delete_job_view(previous)}
+            active = self._delete_jobs.get(self._delete_active_id)
+            if active and active.get("status") in ("queued", "running"):
+                return {"success": False, "message": "其他删除任务正在执行，请等待状态完成"}
+            if len(self._delete_jobs) >= 100:
+                old = sorted(
+                    (x for x in self._delete_jobs.values()
+                     if x.get("status") not in ("queued", "running")),
+                    key=lambda x: x["created_at"])
+                for item in old[:50]:
+                    self._delete_jobs.pop(item["request_id"], None)
+            job = {
+                "kind": "group", "request_id": request_id, "title": title,
+                "seed_id": seed_id, "targets": canonical,
+                "status": "queued", "message": f"已受理 {len(canonical)} 个辅种及文件的删除核验",
+                "created_at": time.time(), "total_count": len(canonical),
+                "removed_count": 0, "delete_file": True,
+            }
+            self._delete_jobs[request_id] = job
+            self._delete_active_id = request_id
+            generation = self._delete_generation
+            try:
+                threading.Thread(
+                    target=self._delete_rescue_group_worker,
+                    args=(request_id, generation),
+                    daemon=True, name="HHClubButler-GroupRemove",
+                ).start()
+            except Exception as e:
+                logger.error(f"辅种后台任务启动失败：{e}")
+                self._delete_jobs.pop(request_id, None)
+                self._delete_active_id = None
+                return {"success": False, "message": "无法启动后台删除，请检查插件日志"}
+            return {"success": True, "message": job["message"],
+                    "data": self._delete_job_view(job)}
+
+    def _delete_rescue_group_worker(self, request_id: str, generation: int):
+        with self._delete_lock:
+            job = self._delete_jobs.get(request_id)
+            if not job:
+                return
+            job["status"] = "running"
+            seed_id, title, manifest = job["seed_id"], job["title"], job["targets"]
+        if not self._run_lock.acquire(blocking=False):
+            outcome = {"state": "failed", "message": "其他优选任务正在运行，未执行删除"}
+        else:
+            try:
+                outcome = self._delete_rescue_group(
+                    seed_id=seed_id, title=title,
+                    targets=manifest, generation=generation, request_id=request_id)
+            except Exception as e:
+                logger.error(f"辅种删除后台执行异常：{e}")
+                outcome = {"state": "uncertain",
+                           "message": "删除状态不确定，不会自动重试，请查看下载器"}
+            finally:
+                self._run_lock.release()
+        with self._delete_lock:
+            item = self._delete_jobs.get(request_id)
+            if item:
+                item["status"] = outcome.get("state", "uncertain")
+                item["message"] = outcome.get("message", "操作完成，请核对")
+                item["removed_count"] = outcome.get("removed_count", 0)
+                item["finished_at"] = time.time()
+            if self._delete_active_id == request_id:
+                self._delete_active_id = None
+        if outcome.get("removed_count", 0) or outcome.get("state") in ("uncertain", "verified"):
+            self._invalidate_rescue_cache()
+            self._last_overview = None
+            self._last_overview_ts = 0.0
+
+    def _delete_rescue_group(self, seed_id: int, title: str, targets: tuple,
+                             generation: int, request_id: str = "") -> dict:
+        """Delete the *confirmed entire* hash manifest including payloads.
+
+        This is not atomic across clients. Never repeat a command once sent;
+        report partial/uncertain outcomes instead. Tracker details are only
+        for diagnostics, not a blocking prerequisite.
+        """
+        if not self._enabled or self._stopped or generation != self._delete_generation:
+            return {"state": "failed", "removed_count": 0,
+                    "message": "插件配置已变化，未开始删除"}
+        if not 1 <= len(targets) <= 200:
+            return {"state": "failed", "removed_count": 0,
+                    "message": "辅种任务数量不符合安全上限"}
+        removed_count = 0
+        try:
+            # Stage 1: fresh site eligibility + every managed downloader.
+            rows = self._collect_rescue_seeds(strict_downloaders=True)
+            eligible = [
+                row for row in rows
+                if str(row.get("seed_id")) == str(seed_id)
+                and normalize_name(row.get("title")) == normalize_name(title)
+            ]
+            if len(eligible) != 1:
+                return {"state": "failed", "removed_count": 0,
+                        "message": "站点记录发生变化，删除已取消"}
+            row = eligible[0]
+            if not row.get("can_delete_group"):
+                return {"state": "failed", "removed_count": 0,
+                        "message": "存在名称近似、大小不一致或未完成任务，不允许整组删除"}
+            current_manifest = tuple(sorted(
+                (str(c.get("downloader") or ""),
+                 str(c.get("hash") or "").lower())
+                for c in row.get("candidates", [])
+            ))
+            if current_manifest != tuple(targets):
+                return {"state": "failed", "removed_count": 0,
+                        "message": "辅种 Hash 清单已变化，请刷新页面重新确认"}
+            services = self._get_manage_services()
+            grouped = {}
+            for downloader, infohash in targets:
+                grouped.setdefault(downloader, []).append(infohash)
+            if any(name not in services for name in grouped):
+                return {"state": "failed", "removed_count": 0,
+                        "message": "管理下载器不可用，未执行删除"}
+
+            # Stage 2: read the current torrent object again and verify that
+            # each selected exact hash still denotes the same complete release.
+            # Tracker host is optional; normalized release identity + size,
+            # which the user can independently inspect, are mandatory.
+            for name, hashes in grouped.items():
+                remote, err = services[name].instance.get_torrents()
+                if err or remote is None:
+                    return {"state": "failed", "removed_count": 0,
+                            "message": f"下载器 {name} 无法读取最新数据，取消删除"}
+                wanted = set(hashes)
+                found = set()
+                for torrent in remote:
+                    def g(*keys):
+                        for key in keys:
+                            try:
+                                value = (torrent.get(key) if isinstance(torrent, dict)
+                                         else getattr(torrent, key, None))
+                                if value is not None:
+                                    return value
+                            except Exception:
+                                continue
+                        return None
+                    value = str(g("hash", "hashString") or "").lower()
+                    if value not in wanted:
+                        continue
+                    remote_name = str(g("name") or "")
+                    canonical = normalize_name(remote_name)
+                    if (canonical != normalize_name(title)
+                            and translated_release_key(remote_name) != normalize_name(title)):
+                        return {"state": "failed", "removed_count": 0,
+                                "message": f"{name} 种子名称变化，拒绝删除"}
+                    size_raw = g("total_size", "totalSize", "size")
+                    try:
+                        size_gb = float(size_raw) / 1073741824 if size_raw else 0.0
+                    except (TypeError, ValueError):
+                        size_gb = 0.0
+                    if not translated_size_matches(row, {"size_gb": size_gb}):
+                        return {"state": "failed", "removed_count": 0,
+                                "message": f"{name} 种子体积变化，拒绝删除"}
+                    progress = self._get_progress_ratio(torrent, "")
+                    status = str(g("state", "status") or "").lower()
+                    if not (progress is not None and progress >= 0.999) and status not in (
+                        "seeding", "seed_pending", "stalledup", "pausedup",
+                        "queuedup", "forcedup", "uploading",
+                    ):
+                        return {"state": "failed", "removed_count": 0,
+                                "message": f"{name} 种子未确认完成，拒绝删除"}
+                    found.add(value)
+                if found != wanted:
+                    return {"state": "failed", "removed_count": 0,
+                            "message": f"{name} 的种子 Hash 列表已变化，拒绝删除"}
+
+            # Stage 3: deletion. All client calls are one-shot; no retry.
+            for name, hashes in sorted(grouped.items()):
+                if self._stopped or generation != self._delete_generation:
+                    return {"state": "uncertain" if removed_count else "failed",
+                            "removed_count": removed_count,
+                            "message": f"配置更新已停止后续删除，已确认移除 {removed_count} 个"}
+                service = services[name]
+                logger.warning(
+                    f"憨憨保种管家：用户确认删除 {name} 上 {len(hashes)} 个辅种任务及其文件"
+                )
+                try:
+                    accepted = service.instance.delete_torrents(
+                        delete_file=True, ids=list(hashes))
+                except Exception as exc:
+                    logger.error(f"整组辅种删除命令执行状态未知：{name}，{exc}")
+                    return {"state": "uncertain", "removed_count": removed_count,
+                            "message": f"{name} 删除返回异常，无法判断是否执行；不自动重试"}
+                if accepted is False:
+                    return {"state": "uncertain", "removed_count": removed_count,
+                            "message": f"{name} 未确认删除是否执行；不自动重试"}
+                # Confirm exact hashes disappeared. This checks tasks, not
+                # independent filesystem erasure, which downloader APIs do
+                # not reliably prove.
+                confirmed = False
+                for attempt in range(3):
+                    actual, err = service.instance.get_torrents()
+                    if err or actual is None:
+                        return {"state": "uncertain", "removed_count": removed_count,
+                                "message": f"{name} 无法回读，任务及文件状态待人工核对"}
+                    remaining = set()
+                    for t in actual:
+                        hash_value = (t.get("hash") or t.get("hashString")
+                                      if isinstance(t, dict)
+                                      else getattr(t, "hash", None)
+                                      or getattr(t, "hashString", None))
+                        if hash_value:
+                            remaining.add(str(hash_value).lower())
+                    if not remaining.intersection(hashes):
+                        confirmed = True
+                        break
+                    if attempt < 2:
+                        time.sleep(0.5)
+                if not confirmed:
+                    return {"state": "uncertain", "removed_count": removed_count,
+                            "message": f"{name} 仍能读到部分 Hash，操作状态不确定"}
+                removed_count += len(hashes)
+                if request_id:
+                    with self._delete_lock:
+                        job = self._delete_jobs.get(request_id)
+                        if job:
+                            job["removed_count"] = removed_count
+                            job["message"] = f"已确认移除 {removed_count}/{len(targets)} 个任务，正在处理其它下载器"
+            return {"state": "verified", "removed_count": removed_count,
+                    "message": f"已确认移除全部 {removed_count} 个辅种任务；删除数据文件指令已发送"}
+        except Exception as exc:
+            logger.error(f"整组辅种删除异常：{exc}")
+            return {"state": "uncertain" if removed_count else "failed",
+                    "removed_count": removed_count,
+                    "message": ("删除过程部分完成，勿重复执行，请核对下载器"
+                                if removed_count else "删除前核验失败，未开始操作")}
 
     def _delete_rescue_exact(self, title: str = "", downloader: str = "",
                             torrent_hash: str = "", confirm: bool = False,
@@ -3515,46 +3721,71 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
 
     @staticmethod
     def _extract_tracker_text(t, dl_type: str = "") -> str:
+        """Best-effort extraction of Tracker announce URLs from MP V3 clients.
+
+        TR's Torrent object may expose snake_case properties, camelCase
+        fields or a raw mapping. Missing attributes must not discard other
+        available tracker fields. Tracker availability is NOT an authorization
+        prerequisite for manual bulk operations.
+        """
+        from collections.abc import Mapping
+
+        def get_value(obj, key):
+            if isinstance(obj, Mapping):
+                return obj.get(key)
+            try:
+                value = getattr(obj, key, None)
+                if value is not None and not callable(value):
+                    return value
+            except Exception:
+                pass
+            try:
+                getter = getattr(obj, "get", None)
+                if callable(getter):
+                    return getter(key)
+            except Exception:
+                pass
+            return None
+
+        names = (
+            "tracker", "trackers", "trackerList", "tracker_list",
+            "trackerStats", "tracker_stats", "announce", "announceURL",
+            "announce_url", "announceUrl", "url", "magnet_uri",
+        )
+        collected = []
+        seen = set()
+
+        def walk(value, depth=0):
+            if value is None or depth > 3 or len(collected) >= 50:
+                return
+            if isinstance(value, (list, tuple, set)):
+                for entry in value:
+                    walk(entry, depth + 1)
+                return
+            if isinstance(value, str):
+                # Ignore labels such as '** [DHT] **' and empty placeholders.
+                if "://" in value and value not in seen:
+                    collected.append(value)
+                    seen.add(value)
+                return
+            if isinstance(value, Mapping):
+                for name in names:
+                    if name in value:
+                        walk(value.get(name), depth + 1)
+                return
+            for name in names:
+                inner = get_value(value, name)
+                if inner is not None and inner is not value:
+                    walk(inner, depth + 1)
+
         try:
-            parts = []
-            if isinstance(t, dict):
-                parts.append(str(t.get("tracker") or ""))
-                tr = t.get("trackers")
-                if isinstance(tr, (list, tuple)):
-                    parts.extend(str(x) for x in tr)
-                parts.append(str(t.get("trackerList") or ""))
-                stats = t.get("trackerStats") or []
-                if isinstance(stats, list):
-                    for s in stats:
-                        if isinstance(s, dict):
-                            parts.append(str(s.get("announce") or ""))
-                parts.append(str(t.get("magnet_uri") or ""))
-            else:
-                parts.append(str(getattr(t, "tracker", "") or ""))
-                tr = getattr(t, "trackers", None)
-                if isinstance(tr, (list, tuple)):
-                    parts.extend(str(x) for x in tr)
-                parts.append(str(getattr(t, "trackerList", "") or ""))
-                stats = getattr(t, "trackerStats", None) or []
-                if isinstance(stats, list):
-                    for s in stats:
-                        try:
-                            announce = s.get("announce") if isinstance(s, dict) else getattr(s, "announce", None)
-                            if announce:
-                                parts.append(str(announce))
-                        except Exception:
-                            pass
-                try:
-                    mg = getattr(t, "magnet_uri", None) or getattr(t, "magnet", None)
-                    if callable(mg):
-                        mg = mg()
-                    if mg:
-                        parts.append(str(mg))
-                except Exception:
-                    pass
-            return " ".join(p for p in parts if p)
+            for key in names:
+                walk(get_value(t, key))
+            for holder in ("fields", "_fields", "data", "_data"):
+                walk(get_value(t, holder))
         except Exception:
-            return ""
+            return " ".join(collected)
+        return " ".join(collected)
 
     @staticmethod
     def _get_progress_ratio(t, dl_type: str = "") -> Optional[float]:
