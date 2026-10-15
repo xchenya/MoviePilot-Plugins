@@ -2,6 +2,7 @@
 import json
 import time
 import threading
+from datetime import datetime
 from unittest.mock import Mock
 
 import pytest
@@ -301,7 +302,27 @@ def test_custom_check_interval_survives_all_save_paths_and_display(plugin):
     form, defaults = plugin.get_form()
     assert defaults["check_interval_minutes"] == 25
     assert '"model": "check_interval_minutes"' in json.dumps(form)
-    assert "每25分钟本地检查" in json.dumps(plugin.get_page(), ensure_ascii=False)
+    assert "按站点冷却" in json.dumps(plugin.get_page(), ensure_ascii=False)
+
+
+@pytest.mark.parametrize("separate_results", [False, True])
+def test_panel_shows_compact_dates_and_result_without_changing_saved_details(plugin, separate_results):
+    plugin._schedule_mode = "auto"
+    due = datetime(2026, 10, 15, 18, 15, 34).timestamp()
+    brief = "清理：沙滩冷却中，请稍候！；搬砖：已达每日上限，正常跳过"
+    legacy = "旧配置执行结果"
+    plugin._stats.update(beach_due_at=due, brick_due_at=due, last_result=legacy)
+    if separate_results:
+        plugin._stats.update(clean_result="沙滩冷却中，请稍候！", brick_result="已达每日上限，正常跳过",
+                             last_result=brief + "；本次0块，今日50/50，库存2001（本次已刷新）")
+    saved_result = plugin._stats["last_result"]
+    cols = plugin.get_page()[0]["content"][2]["content"][0]["content"]
+    info = {col["content"][0]["text"]: col["content"][1]["text"] for col in cols}
+    assert info["⏰ 定时模式"] == "按站点冷却"
+    assert info["🏖️ 沙滩下次执行时间"] == info["🧱 搬砖下次执行时间"] == "2026-10-15 18:15"
+    assert info["📝 最后结果"] == (brief if separate_results else legacy)
+    assert plugin._stats["last_result"] == saved_result
+    assert "18:15:34（约" in plugin._SiQiCleanBeach__due_text("beach_due_at")
 
 
 def test_existing_auto_config_without_new_field_uses_ten_minutes(plugin):
