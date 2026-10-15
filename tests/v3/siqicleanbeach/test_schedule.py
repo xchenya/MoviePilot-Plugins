@@ -1,5 +1,7 @@
 """Server-day scheduling, independent beach cooldown, and legacy compatibility."""
 import json
+import time
+import threading
 from unittest.mock import Mock
 
 import pytest
@@ -24,12 +26,13 @@ def test_new_install_auto_and_old_config_unchanged(plugin):
     assert plugin._cron == "5 0 * * *" and plugin._schedule_mode == "cron"
 
 
-def test_auto_trigger_checks_locally_once_per_minute(plugin):
+def test_auto_trigger_checks_locally_once_per_minute(plugin, monkeypatch):
+    monkeypatch.setattr(time, "time", lambda: 1000)
     plugin._enabled, plugin._schedule_mode = True, "auto"
     service = plugin.get_service()[0]
     plugin._test_interval.assert_called_once_with(minutes=1)
     assert service["kwargs"] == {"scheduled": True}
-    plugin._stats.update(beach_due_at=10**12, brick_due_at=10**12)
+    plugin._stats.update(beach_due_at=4600, brick_due_at=4600)
     assert service["func"](**service["kwargs"])["status"] == "waiting"
     requests.Session.assert_not_called()
     plugin.update_config.assert_not_called()
@@ -41,7 +44,7 @@ def test_fixed_time_is_cron_not_auto_poll(plugin):
     plugin._cron = "5 0 * * *"
     service = plugin.get_service()[0]
     plugin._test_cron.from_crontab.assert_called_once_with("5 0 * * *")
-    assert service["kwargs"] == {}
+    assert service["kwargs"] == {"scheduled": True}
 
 
 @pytest.mark.parametrize("mode", ["auto", "cron"])
@@ -93,8 +96,9 @@ def test_auto_brick_waits_while_beach_runs(plugin, monkeypatch):
 
 
 def test_manual_run_still_checks_site_even_before_cached_due(plugin, monkeypatch):
+    monkeypatch.setattr(time, "time", lambda: 1000)
     plugin._schedule_mode = "auto"
-    plugin._stats.update(beach_due_at=10**12, brick_due_at=10**12)
+    plugin._stats.update(beach_due_at=4600, brick_due_at=4600)
     post = posts(monkeypatch, response(dict(success=False, message="冷却中")), response(state(50)))
     monkeypatch.setattr(requests, "get", Mock(return_value=response(text=html())))
     assert plugin.run_clean_task()["status"] == "completed"
@@ -111,9 +115,10 @@ def test_missing_beach_fields_falls_back_with_honest_source(plugin, monkeypatch)
     assert "回退" in plugin._stats["beach_due_source"]
 
 
-def test_due_times_survive_every_save_and_reload(plugin):
+def test_due_times_survive_every_save_and_reload(plugin, monkeypatch):
+    monkeypatch.setattr(time, "time", lambda: 1000)
     plugin._schedule_mode = "auto"
-    plugin._stats.update(beach_due_at=10**12, brick_due_at=10**12)
+    plugin._stats.update(beach_due_at=4600, brick_due_at=4600)
     plugin._update_stats()
     saved = plugin.update_config.call_args.args[0]
     plugin.init_plugin(saved)
@@ -125,7 +130,7 @@ def test_due_times_survive_every_save_and_reload(plugin):
     plugin._queue_manual_run = Mock(return_value=True)
     plugin.init_plugin(saved)
     assert plugin.update_config.call_args.args[0]["schedule_mode"] == "auto"
-    assert plugin.update_config.call_args.args[0]["stats"]["brick_due_at"] == 10**12
+    assert plugin.update_config.call_args.args[0]["stats"]["brick_due_at"] == 4600
 
 
 def test_uncertain_write_protection_still_blocks_in_auto(plugin, monkeypatch):
@@ -133,3 +138,146 @@ def test_uncertain_write_protection_still_blocks_in_auto(plugin, monkeypatch):
     plugin._stats["brick_uncertain_reset"] = "server-day"
     post = posts(monkeypatch, response(state(1)))
     assert not move(plugin)["success"] and post.call_count == 1
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf"), True, -1, "tomorrow", 10**400])
+def test_bad_cached_dates_do_not_crash_page_or_stall_scheduler(plugin, monkeypatch, invalid):
+    monkeypatch.setattr(time, "time", lambda: 1000)
+    plugin._schedule_mode = "auto"
+    plugin._stats.update(beach_due_at=invalid, brick_due_at=invalid)
+    assert "异常" in plugin._SiQiCleanBeach__due_text("brick_due_at")
+    plugin.get_page()
+    post = posts(monkeypatch, response(dict(success=False, message="冷却中")), response(state(50)))
+    monkeypatch.setattr(requests, "get", Mock(return_value=response(text=html())))
+    assert plugin.run_clean_task(scheduled=True)["status"] == "completed"
+    assert post.call_count == 2 and not plugin._lock.locked()
+
+
+@pytest.mark.parametrize("remaining", [0, -1, 172801, 10**400])
+def test_abnormal_server_reset_never_reaches_write(plugin, monkeypatch, remaining):
+    post = posts(monkeypatch, response(state(next_brick_reset_ts=2_000_000 + remaining)))
+    result = move(plugin)
+    assert not result["success"] and "字段" in result["message"]
+    assert post.call_count == 1
+
+
+@pytest.mark.parametrize("remaining", [295, 50000])
+def test_slow_inventory_does_not_shift_server_reset(plugin, monkeypatch, remaining):
+    clock = [1000]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    plugin._schedule_mode = "auto"
+    posts(monkeypatch, response(dict(success=False, message="冷却中")), response(state(50, next_brick_reset_ts=2_000_000 + remaining)))
+
+    def inventory(*args, **kwargs):
+        clock[0] += 45
+        return response(text=html())
+
+    monkeypatch.setattr(requests, "get", inventory)
+    plugin.run_clean_task(scheduled=True)
+    assert plugin._stats["brick_due_at"] == 1000 + remaining + 5
+
+
+def test_stopping_task_does_not_send_more_bricks_or_invent_uncertain_write(plugin, monkeypatch):
+    def post(*args, **kwargs):
+        action = kwargs["data"]["action"]
+        if action == "enter_beach":
+            return response(dict(success=False, message="冷却中"))
+        if action == "sync_game_state":
+            return response(state())
+        assert action == "move_brick"
+        plugin.stop_service()
+        return response(state(1, 1))
+
+    transport = Mock(side_effect=post)
+    monkeypatch.setattr(requests, "post", transport)
+    monkeypatch.setattr(requests, "get", Mock(side_effect=AssertionError("No requests after stopping")))
+    result = plugin.run_clean_task()
+    assert result["status"] == "cancelled" and result["data"]["brick"]["bricks_moved"] == 1
+    assert transport.call_count == 3 and "brick_uncertain_reset" not in plugin._stats
+    assert plugin._session is None and not plugin._lock.locked()
+
+
+def test_reloading_cancels_collection_and_keeps_fresh_runtime_state(plugin, monkeypatch):
+    def enter(*args, **kwargs):
+        plugin._stats["history"] = [{"result": "new-runtime-record"}]
+        plugin._stats["brick_uncertain_reset"] = "latest-safety-marker"
+        plugin.init_plugin({"enabled": False, "stats": {"history": [], "brick_uncertain_reset": "stale"}})
+        return response(dict(success=True))
+
+    post = Mock(side_effect=enter)
+    monkeypatch.setattr(requests, "post", post)
+    monkeypatch.setattr(requests, "get", Mock(side_effect=AssertionError("No requests after reload")))
+    result = plugin.run_clean_task()
+    assert result["status"] == "cancelled" and post.call_count == 1
+    assert plugin._stats["history"][0]["result"] == "new-runtime-record"
+    assert plugin._stats["brick_uncertain_reset"] == "latest-safety-marker"
+    assert not plugin._lock.locked()
+
+
+def test_disabled_queued_schedule_does_not_request_site(plugin):
+    plugin._enabled = False
+    assert plugin.run_clean_task(scheduled=True)["status"] == "disabled"
+    requests.Session.assert_not_called()
+
+
+def test_non_whitelisted_server_clock_expression_is_rejected(plugin):
+    markup = html().replace("Math.floor(Date.now() / 1000)", "Math.floor(Date.now() / 1000) + 600")
+    plugin._SiQiCleanBeach__read_beach_cooldown(BeautifulSoup(markup, "html.parser"))
+    assert "beach_due_at" not in plugin._stats
+
+
+@pytest.mark.parametrize("bad_item", [
+    '<div class="item-name">砖块</div><div class="item-count">未知</div>',
+    '<div class="item-name">砖块</div><div class="item-count">-5</div>',
+    '<div class="item-name">砖块</div>',
+    '<div class="item-count">22</div>',
+    '<div class="item-name">木材</div><div class="item-count">22</div>',
+])
+def test_partial_or_bad_inventory_never_overwrites_cache(plugin, monkeypatch, bad_item):
+    plugin._auto_brick = False
+    plugin._inventory = {"砖块": {"name": "砖块", "count": 42, "icon": "🧱"}}
+    plugin._stats["last_update"] = 123
+    posts(monkeypatch, response(dict(success=False, message="冷却中")))
+    markup = f'''<div class="inventory-grid"><div class="inventory-item">
+    <div class="item-name">木材</div><div class="item-count">114</div></div>
+    <div class="inventory-item">{bad_item}</div></div>'''
+    monkeypatch.setattr(requests, "get", Mock(return_value=response(text=markup)))
+    result = plugin.run_clean_task()
+    assert result["data"]["inventory_refreshed"] is False
+    assert plugin._inventory["砖块"]["count"] == 42 and "木材" not in plugin._inventory
+    assert plugin._stats["last_update"] == 123
+
+
+def test_stopping_queued_manual_task_is_not_cleared_by_worker_start(plugin, monkeypatch):
+    queued = {}
+
+    def deferred_thread(*, target, kwargs, daemon):
+        queued.update(target=target, kwargs=kwargs)
+        return Mock(start=lambda: plugin.stop_service())
+
+    monkeypatch.setattr(threading, "Thread", deferred_thread)
+    monkeypatch.setattr(requests, "post", Mock(side_effect=AssertionError("Queued stopped task must not write")))
+    assert plugin._queue_manual_run()
+    assert queued["target"](**queued["kwargs"])["status"] == "cancelled"
+    assert not plugin._lock.locked()
+
+
+def test_non_finite_legacy_minutes_fall_back_without_crashing(plugin):
+    plugin.init_plugin({"interval_minutes": float("inf"), "brick_cooldown_minutes": float("inf")})
+    assert plugin._interval_minutes == 121 and plugin._brick_cooldown_minutes == 1440
+
+
+def test_stopped_service_cannot_restart_from_already_queued_schedule(plugin):
+    plugin.stop_service()
+    assert plugin.run_clean_task(scheduled=True)["status"] == "disabled"
+    requests.Session.assert_not_called()
+
+
+def test_bad_reset_in_failed_sync_cannot_overflow_final_scheduler(plugin, monkeypatch):
+    monkeypatch.setattr(time, "time", lambda: 1000)
+    plugin._schedule_mode = "auto"
+    posts(monkeypatch, response(dict(success=False, message="冷却中")),
+          response(state(50, success=False, next_brick_reset_ts=10**400)))
+    monkeypatch.setattr(requests, "get", Mock(return_value=response(text=html())))
+    assert plugin.run_clean_task(scheduled=True)["status"] == "partial"
+    assert plugin._stats["brick_due_at"] == 1300 and not plugin._lock.locked()

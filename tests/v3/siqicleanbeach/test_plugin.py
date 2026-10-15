@@ -177,6 +177,7 @@ def test_concurrent_manual_runs_are_rejected():
     cls = _isolated_class("_queue_manual_run", "run_once_api")
     p = cls()
     p._lock = threading.Lock()
+    p._stop_event = threading.Event()
     started = threading.Event()
     unblock = threading.Event()
     completed = threading.Event()

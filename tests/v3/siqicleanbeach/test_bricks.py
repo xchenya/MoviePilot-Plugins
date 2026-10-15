@@ -2,6 +2,7 @@
 import ast
 import copy
 import json
+import math
 import threading
 import time
 from datetime import datetime
@@ -40,7 +41,7 @@ def plugin():
             method.decorator_list = []
     module = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
     ns = dict(Base=Base, requests=requests, BeautifulSoup=BeautifulSoup, threading=threading,
-              time=time, datetime=datetime, re=__import__("re"), Any=Any, Dict=Dict,
+              time=time, math=math, datetime=datetime, re=__import__("re"), Any=Any, Dict=Dict,
               List=List, Optional=Optional, Tuple=Tuple, Event=object,
               logger=Mock(), SiteOper=Mock(), NotificationType=SimpleNamespace(Plugin="plugin"),
               IntervalTrigger=Mock(), CronTrigger=Mock(), EventType=SimpleNamespace(PluginAction="action"))
@@ -49,6 +50,7 @@ def plugin():
     p._SiQiCleanBeach__get_site_cookie = Mock(return_value="")
     p._cookie = "c_secure_pass=secret-cookie"
     p._auto_brick = True
+    p._enabled = True
     p.update_config = Mock()
     p.post_message = Mock()
     p._test_logger = ns["logger"]

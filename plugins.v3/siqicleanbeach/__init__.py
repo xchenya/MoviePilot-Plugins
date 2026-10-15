@@ -4,6 +4,7 @@
 许可改造。V3 适配由 xchenya 维护；搬砖已获用户宿主日志验证，新调度未经真实联调。
 """
 import json
+import math
 import re
 import threading
 import time
@@ -96,6 +97,8 @@ class SiQiCleanBeach(_PluginBase):
         super().__init__()
         # V3 支持插件分身；可变数据和运行锁均属于当前实例。
         self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._stopped = False
         self._session = None
         self._enabled = False
         self._cookie = ""
@@ -120,6 +123,7 @@ class SiQiCleanBeach(_PluginBase):
         if not self._lock.acquire(blocking=False):
             return False
         try:
+            self._stop_event.clear()
             threading.Thread(target=self.run_clean_task, kwargs={"reserved": True}, daemon=True).start()
         except Exception:
             self._lock.release()
@@ -128,6 +132,10 @@ class SiQiCleanBeach(_PluginBase):
 
     def init_plugin(self, config: dict = None):
         config = config or {}
+        running = self._lock.locked()
+        if running:
+            self._stop_event.set()
+        self._stopped = False
         site_cookie = self.__get_site_cookie()
 
         self._enabled = bool(config.get("enabled", False))
@@ -143,11 +151,11 @@ class SiQiCleanBeach(_PluginBase):
         self._run_once = bool(config.get("run_once", False))
 
         stats = config.get("stats", {})
-        if stats:
+        if stats and not running:
             self._stats.update(stats)
         
         inventory = config.get("inventory", {})
-        if inventory:
+        if inventory and not running:
             self._inventory = inventory
 
         logger.info(
@@ -231,7 +239,7 @@ class SiQiCleanBeach(_PluginBase):
                     "name": "思齐自动收垃圾",
                     "trigger": trigger,
                     "func": self.run_clean_task,
-                    "kwargs": {}
+                    "kwargs": {"scheduled": True}
                 }]
             except Exception as e:
                 logger.warning(f"间隔触发器创建失败：{e}")
@@ -247,7 +255,7 @@ class SiQiCleanBeach(_PluginBase):
                     "name": "思齐自动收垃圾",
                     "trigger": trigger,
                     "func": self.run_clean_task,
-                    "kwargs": {}
+                    "kwargs": {"scheduled": True}
                 }]
             except ValueError as e:
                 logger.warning(f"Cron配置无效：{e}")
@@ -575,7 +583,9 @@ class SiQiCleanBeach(_PluginBase):
         ]
 
     def stop_service(self):
-        # 公共定时任务由 MoviePilot 宿主负责停止，进行中的请求有明确超时。
+        # 已发出的请求不能撤回；阻断当前任务后续请求。
+        self._stop_event.set()
+        self._stopped = True
         logger.info("思齐自动收垃圾插件停止，定时任务将由宿主取消")
 
     def __inventory_items(self, sorted_items: list) -> List[Dict[str, Any]]:
@@ -713,7 +723,7 @@ class SiQiCleanBeach(_PluginBase):
                     time_str = str(time_str)
             
             status_color = "success" if record.get("status") == "completed" else "warning"
-            status_text = {"completed": "✅ 完成", "partial": "⚠️ 部分完成", "auth_failed": "🔐 认证失败"}.get(record.get("status"), "⚠️ 失败")
+            status_text = {"completed": "✅ 完成", "partial": "⚠️ 部分完成", "auth_failed": "🔐 认证失败", "cancelled": "⏹ 已停止"}.get(record.get("status"), "⚠️ 失败")
             result_text = record.get("result", "-")
             total_count = record.get("total_count", 0)
             
@@ -777,21 +787,33 @@ class SiQiCleanBeach(_PluginBase):
             title="【思齐自动收垃圾插件】",
             text="任务已启动，完成后会发送通知。" if launched else "已有收垃圾任务正在执行或无法启动。"
         )
+    @staticmethod
+    def __valid_due(value) -> bool:
+        return (not isinstance(value, bool) and isinstance(value, (int, float))
+                and 0 < value < 253402300800 and math.isfinite(value))
+
     def __due_text(self, key: str) -> str:
         due = self._stats.get(key)
-        if not isinstance(due, (int, float)):
-            return "等待首次同步"
+        if not self.__valid_due(due):
+            return "等待首次同步" if due is None else "时间异常，等待重新同步"
         remaining = max(0, int(due - time.time()))
-        return f"{datetime.fromtimestamp(due):%Y-%m-%d %H:%M:%S}（约{remaining // 3600}:{remaining // 60 % 60:02d}:{remaining % 60:02d}）"
+        try:
+            return f"{datetime.fromtimestamp(due):%Y-%m-%d %H:%M:%S}（约{remaining // 3600}:{remaining // 60 % 60:02d}:{remaining % 60:02d}）"
+        except (ValueError, OverflowError, OSError):
+            return "时间异常，等待重新同步"
 
     def run_clean_task(self, reserved: bool = False, scheduled: bool = False) -> Dict[str, Any]:
+        if scheduled and (not self._enabled or self._stopped):
+            return {"status": "disabled", "message": "插件已关闭"}
         if not reserved and not self._lock.acquire(blocking=False):
             return {"status": "running", "message": "已有任务正在执行"}
+        if not reserved:
+            self._stop_event.clear()
         auto = scheduled and self._schedule_mode == "auto"
         now = time.time()
         beach_at, brick_at = self._stats.get("beach_due_at"), self._stats.get("brick_due_at")
-        clean_due = not auto or not isinstance(beach_at, (int, float)) or now >= beach_at
-        brick_due = self._auto_brick and (not auto or not isinstance(brick_at, (int, float)) or now >= brick_at)
+        clean_due = not auto or not self.__valid_due(beach_at) or now >= beach_at
+        brick_due = self._auto_brick and (not auto or not self.__valid_due(brick_at) or now >= brick_at)
         if auto and not clean_due and not brick_due:
             self._lock.release()
             return {"status": "waiting", "message": "等待站点冷却到期"}
@@ -822,7 +844,7 @@ class SiQiCleanBeach(_PluginBase):
                         brick = self.__move_bricks(cookie)
                     elif self._auto_brick:
                         brick["message"] = "未到下次搬砖检查时间，未发送搬砖请求"
-                    if not brick.get("auth_failed"):
+                    if not brick.get("auth_failed") and not self._stop_event.is_set():
                         inventory = self.__fetch_inventory(cookie)
                         if inventory is not None:
                             self._inventory = inventory
@@ -831,7 +853,9 @@ class SiQiCleanBeach(_PluginBase):
             if clean.get("auth_failed"):
                 brick.update(success=False, auth_failed=True, message="认证失败，停止后续请求")
             status = "auth_failed" if clean.get("auth_failed") or brick.get("auth_failed") else (
-                "completed" if (clean.get("success") or "冷却" in clean.get("message", "")) and brick.get("success") else "partial"
+                "cancelled" if clean.get("cancelled") or brick.get("cancelled") else (
+                    "completed" if (clean.get("success") or "冷却" in clean.get("message", "")) and brick.get("success") else "partial"
+                )
             )
         except Exception as exc:
             logger.error(f"思齐任务异常：{exc.__class__.__name__}")
@@ -863,12 +887,12 @@ class SiQiCleanBeach(_PluginBase):
                     self._stats["beach_due_at"] = time.time() + self._interval_minutes * 60
                     self._stats["beach_due_source"] = "未读到站点冷却，回退配置间隔"
                 if brick_due:
-                    delay = 300
-                    if (brick.get("daily_bricks") == 50 or self._stats.get("brick_uncertain_reset") is not None):
-                        reset, server = brick.get("next_brick_reset_ts"), brick.get("server_now")
-                        if isinstance(reset, int) and isinstance(server, int) and reset > server:
-                            delay = reset - server + 5
-                    self._stats["brick_due_at"] = time.time() + delay
+                    due_at = time.time() + 300
+                    if ((brick.get("daily_bricks") == 50 or self._stats.get("brick_uncertain_reset") is not None)
+                            and self.__valid_brick_state({**brick, "bricks_moved": 0})
+                            and self.__valid_due(brick.get("_received_at"))):
+                        due_at = brick["_received_at"] + brick["next_brick_reset_ts"] - brick["server_now"] + 5
+                    self._stats["brick_due_at"] = due_at
                 self.__finish_task(result)
             finally:
                 try:
@@ -881,6 +905,8 @@ class SiQiCleanBeach(_PluginBase):
 
     def __request_action(self, cookie: str, action: str) -> Dict[str, Any]:
         """只接受 JSON；不跟随写请求重定向，也不重试写请求。"""
+        if self._stop_event.is_set():
+            return {"success": False, "cancelled": True, "message": "插件停止或配置已重载，停止后续请求"}
         started = time.monotonic()
         logger.info(f"思齐请求开始：action={action}")
         try:
@@ -918,6 +944,7 @@ class SiQiCleanBeach(_PluginBase):
                 if secret:
                     message = message.replace(secret, "[已隐藏]")
             data["message"] = message
+            data["_received_at"] = time.time()
             if not data["success"]:
                 data["auth_failed"] = bool(re.search(r"登录|cookie.*(?:失效|过期|无效|invalid|expired)|login|unauth|not logged in", message, re.I))
                 data["message"] = message or "服务端业务失败"
@@ -965,7 +992,8 @@ class SiQiCleanBeach(_PluginBase):
         reset = data.get("last_daily_reset")
         return (isinstance(reset, (str, int)) and not isinstance(reset, bool) and reset != ""
                 and 0 <= data["daily_bricks"] <= 50
-                and data["next_brick_reset_ts"] > data["server_now"] > 0)
+                and data["server_now"] > 0
+                and 0 < data["next_brick_reset_ts"] - data["server_now"] <= 172800)
 
     def __move_bricks(self, cookie: str) -> Dict[str, Any]:
         result = {"success": False, "message": "状态同步失败", "bricks_moved": 0}
@@ -977,7 +1005,8 @@ class SiQiCleanBeach(_PluginBase):
         if not self.__valid_brick_state(state, sync=True):
             return {**result, "message": "状态同步字段缺失或异常"}
         result.update(daily_bricks=state["daily_bricks"], last_daily_reset=state["last_daily_reset"],
-                      server_now=state["server_now"], next_brick_reset_ts=state["next_brick_reset_ts"])
+                      server_now=state["server_now"], next_brick_reset_ts=state["next_brick_reset_ts"],
+                      _received_at=state["_received_at"])
         if state["daily_bricks"] >= 50:
             return {**result, "success": True, "message": "已达每日上限，正常跳过"}
         uncertain = self._stats.get("brick_uncertain_reset")
@@ -999,15 +1028,17 @@ class SiQiCleanBeach(_PluginBase):
                         result["bricks_moved"] += synced["daily_bricks"] - state["daily_bricks"]
                         result["recovered_from_sync"] = True
                         self._stats["brick_last_run_server"] = synced["server_now"]
-                    result.update({k: synced[k] for k in ("daily_bricks", "server_now", "last_daily_reset", "next_brick_reset_ts")})
+                    result.update({k: synced[k] for k in ("daily_bricks", "server_now", "last_daily_reset", "next_brick_reset_ts", "_received_at")})
                 self._stats["brick_uncertain_reset"] = result["last_daily_reset"]
                 return {**result, "auth_failed": synced.get("auth_failed", False),
                         "message": ("搬砖超时，状态已同步并停止" if synced.get("success") and self.__valid_brick_state(synced, sync=True)
                                     else "搬砖超时，后续状态同步失败，结果仍不确定") + "；本轮不重试，待服务端每日重置"}
+            if response.get("cancelled"):
+                return {**result, "cancelled": True, "message": response["message"]}
             if not response.get("success"):
                 # 失败也可能携带当天计数，但不把它算成本次成功增量。
                 if self.__valid_brick_state({**response, "bricks_moved": 0}):
-                    result.update({k: response[k] for k in ("daily_bricks", "server_now", "last_daily_reset", "next_brick_reset_ts")})
+                    result.update({k: response[k] for k in ("daily_bricks", "server_now", "last_daily_reset", "next_brick_reset_ts", "_received_at")})
                     if response["daily_bricks"] == 50 and not response.get("auth_failed"):
                         return {**result, "success": True, "message": "已达每日上限，正常跳过"}
                 self._stats["brick_uncertain_reset"] = result["last_daily_reset"]
@@ -1016,7 +1047,7 @@ class SiQiCleanBeach(_PluginBase):
                 self._stats["brick_uncertain_reset"] = state["last_daily_reset"]
                 return {**result, "message": "搬砖响应字段缺失或异常，停止"}
             moved = response["bricks_moved"]
-            result.update({k: response[k] for k in ("daily_bricks", "server_now", "last_daily_reset", "next_brick_reset_ts")})
+            result.update({k: response[k] for k in ("daily_bricks", "server_now", "last_daily_reset", "next_brick_reset_ts", "_received_at")})
             if (response["last_daily_reset"] != state["last_daily_reset"] or moved <= 0
                     or response["daily_bricks"] - state["daily_bricks"] != moved
                     or response["server_now"] < state["server_now"]):
@@ -1058,13 +1089,15 @@ class SiQiCleanBeach(_PluginBase):
                 name_node = item.select_one(".item-name")
                 count_node = item.select_one(".item-count")
                 if name_node is None or count_node is None:
-                    continue
+                    logger.warning("库存条目字段缺失，保留本地缓存")
+                    return None
                 name = name_node.get_text(" ", strip=True)
-                if not name:
-                    continue
-                raw_count = count_node.get_text(" ", strip=True).replace(",", "")
-                matched = re.search(r"\d+", raw_count)
-                count = int(matched.group()) if matched else 0
+                raw_count = count_node.get_text(" ", strip=True)
+                matched = re.fullmatch(r"(\d+|\d{1,3}(?:,\d{3})+)\s*(?:个|块)?", raw_count)
+                if not name or name in inventory or not matched:
+                    logger.warning("库存条目名称或数量异常，保留本地缓存")
+                    return None
+                count = int(matched.group(1).replace(",", ""))
                 icon_node = item.select_one(".item-icon")
                 inventory[name] = {
                     "name": name,
@@ -1091,7 +1124,7 @@ class SiQiCleanBeach(_PluginBase):
             if not bootstrap:
                 continue
             source = bootstrap.group(1)
-            server_time = re.search(r"\bserverTimeOffset\s*:\s*(\d+)\s*-\s*Math\.floor\(Date\.now\(\)\s*/\s*1000\)", source)
+            server_time = re.search(r"\bserverTimeOffset\s*:\s*(\d+)\s*-\s*Math\.floor\(Date\.now\(\)\s*/\s*1000\)\s*(?=,|\Z)", source)
             if not server_time:
                 continue
             values = {"serverTimeOffset": int(server_time.group(1))}
@@ -1140,7 +1173,7 @@ class SiQiCleanBeach(_PluginBase):
     def __safe_int(value: Any, default: int, min_value: int = None) -> int:
         try:
             result = int(value) if value is not None else default
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, OverflowError):
             result = default
         if min_value is not None:
             result = max(result, min_value)
@@ -1185,6 +1218,7 @@ class SiQiCleanBeach(_PluginBase):
         status_map = {
             "completed": "✅ 成功",
             "partial": "⚠️ 部分成功",
+            "cancelled": "⏹ 已停止",
             "failed": "❌ 失败",
             "auth_failed": "🔐 认证失败",
             "error": "💥 异常"
