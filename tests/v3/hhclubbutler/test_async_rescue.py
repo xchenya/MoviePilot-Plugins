@@ -180,6 +180,7 @@ def _site_fixture():
             {"title": "Unique.Title.Extra", "size": 10.0, "seed_id": 3},
         ],
         _norm_title=lambda name: str(name).lower().replace(".", ""),
+        _append_downloader_incomplete=lambda rows, torrents: rows,
         _get_progress_ratio=lambda torrent, dltype: 1.0,
         _extract_tracker_text=lambda torrent, dltype: "https://hhanclub.net/announce",
     )
@@ -246,8 +247,8 @@ def test_market_metadata_marks_patch_release_unpublished():
     import json
     manifest = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))
     entry = manifest["HHClubButler"]
-    assert entry["version"] == "3.0.9"
+    assert entry["version"] == "3.0.10"
     assert entry["release"] is False
-    assert "3.0.9" in entry["history"]
+    assert "3.0.10" in entry["history"]
 
 

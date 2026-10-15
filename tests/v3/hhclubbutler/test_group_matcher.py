@@ -40,9 +40,11 @@ def test_group_does_not_delete_if_one_hash_missing():
     data,_=associated([site()],[t("a"*40),t("")])
     assert not data[0]["can_delete_group"]
 
-def test_unfinished_task_prevents_group_data_deletion():
+def test_unfinished_task_can_be_manually_deleted_with_verified_group():
     data,_=associated([site()],[t("a"*40,progress=1),t("b"*40,progress=0.3)])
-    assert not data[0]["can_delete_group"]
+    assert data[0]["can_delete_group"]
+    assert data[0]["cross_seed_count"] == 2
+    assert any(not copy["completed"] for copy in data[0]["candidates"])
 
 def test_duplicate_site_titles_disable_group_authorization():
     data,_=associated([site(1),site(2)],[t("a"*40),t("b"*40)])

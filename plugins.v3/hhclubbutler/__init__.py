@@ -199,7 +199,7 @@ class HHClubButler(_PluginBase):
     plugin_name = "憨憨保种区管家"
     plugin_desc = "自动优选添加及换种工具\n保种管理器/Hosts加速"
     plugin_icon = "https://raw.githubusercontent.com/xchenya/MoviePilot-Plugins/main/plugins.v3/hhclubbutler/icon.png"
-    plugin_version = "3.0.9"
+    plugin_version = "3.0.10"
     plugin_author = "六个橙子"
     author_url = "https://github.com/SixOrg"
     plugin_config_prefix = "hhclubbutler_"
@@ -1189,7 +1189,11 @@ class HHClubButler(_PluginBase):
                     raise RuntimeError(f"下载器 {name} 数据不完整，拒绝删除") from e
                 warnings.append(f"{name} 数据解析失败")
         rows, stats = associate_rescue_seeds(completed, downloader_rows)
+        rows = self._append_downloader_incomplete(rows, downloader_rows)
+        extra = sum(1 for row in rows if row.get("source") == "downloader")
         self._list_warning = "；".join(warnings)
+        if extra:
+            logger.info(f"憨憨保种管理器：另有 {extra} 组未进入站点完成页的下载器未完成任务")
         logger.info(f"憨憨保种管理器：站点 {stats['eligible']} 条 / "
                     f"已关联 {stats['linked']} 条 / 精确 {stats['exact']} 条 / "
                     f"译名 {stats['translated']} 条 / 近似 {stats['similar']} 条 / 未匹配 {stats['unmatched']} 条 / "
@@ -1204,6 +1208,80 @@ class HHClubButler(_PluginBase):
                     f"阻止模糊占用强匹配任务={stats['fuzzy_exact_claims_blocked']}、"
                     f"译名完整后缀匹配={stats['translation_suffix_claims']}")
         return rows
+
+    @staticmethod
+    def _append_downloader_incomplete(site_rows: list[dict],
+                                      downloader_rows: list[dict]) -> list[dict]:
+        """Offer unmatched unfinished downloads as a distinct, non-site inventory.
+
+        Site eligibility is NEVER synthesized. Negative stable IDs distinguish
+        this download-client-only group from positive HH completed-page IDs.
+        Group only by full normalized task name and two-decimal total GiB;
+        do not let a size-only match pull in unrelated files.
+        """
+        import hashlib
+        already = {
+            (str(c.get("downloader") or ""), str(c.get("hash") or "").lower())
+            for row in site_rows for c in row.get("candidates", [])
+        }
+        groups = {}
+        for task in downloader_rows:
+            key = (str(task.get("downloader") or ""),
+                   str(task.get("hash") or "").lower())
+            if key in already or not key[0] or not key[1]:
+                continue
+            name = str(task.get("name") or "")
+            size = task.get("size_gb")
+            progress = task.get("progress")
+            try:
+                size = float(size)
+                progress = float(progress)
+            except (ValueError, TypeError):
+                continue
+            if size <= 0 or not 0 <= progress <= 1:
+                continue
+            signature = (normalize_name(name), round(size, 2))
+            if not signature[0]:
+                continue
+            group = groups.setdefault(signature, [])
+            if key not in {(d.get("downloader"), str(d.get("hash") or "").lower())
+                           for d in group}:
+                group.append(task)
+
+        supplemental = []
+        for (normalized, size), candidates in groups.items():
+            # Group all exact same-release hashes when at least one has not
+            # finished. Other completed siblings are included in the manifest
+            # so the user's "remove all cross-seeds" choice remains complete.
+            if not any(float(task["progress"]) < 0.999 for task in candidates):
+                continue
+            # Stable negative JS-safe integer; page fetches can be repeated
+            # without reassigning IDs during the same download.
+            fingerprint = f"{normalized}\0{size:.2f}".encode("utf-8")
+            synthetic = -int.from_bytes(
+                hashlib.sha256(fingerprint).digest()[:6], "big") - 1
+            source = {
+                "title": str(candidates[0]["name"]),
+                "size": size,
+                "seed_id": synthetic,
+                "seeders": -1,
+                "completed_at": "",
+                "qualified": "未完成下载",
+                "source": "downloader",
+            }
+            matched, _ = associate_rescue_seeds([source], candidates)
+            entry = matched[0]
+            entry["source"] = "downloader"
+            entry["qualified"] = "未完成下载"
+            entry["match_reason"] = (
+                "尚未进入站点完成页的下载器任务；用户主动确认后可清理未完成文件"
+                if entry.get("can_delete_group") else
+                "下载器未完成任务，因名称/体积/哈希无法确认，暂不允许删除"
+            )
+            supplemental.append(entry)
+        supplemental.sort(key=lambda row: (str(row.get("downloader")),
+                                           str(row.get("title"))))
+        return site_rows + supplemental
 
     def _list_rescue_worker(self, generation: int):
         """Update the in-memory snapshot atomically, keeping errors visible."""
@@ -1465,6 +1543,7 @@ tr.sel td{background:var(--tr-sel);color:#fff}
 <div class="topbar">
 <h1>保种管理器</h1>
 <span class="chip active" data-tier="all"><i class="dot" style="background:#9e9e9e"></i>全部 <b id="cnt_all">0</b></span>
+<span class="chip" data-tier="incomplete" title="下载器中尚未完成、且没有进入站点完成页的任务"><i class="dot" style="background:#ffb020"></i>下载器未完成 <b id="cnt_incomplete">0</b></span>
 <span class="chip" data-tier="0"><i class="dot" style="background:#22c55e"></i>0-1人 <b id="cnt_t0">0</b></span>
 <span class="chip" data-tier="1"><i class="dot" style="background:#4da3ff"></i>2-3人 <b id="cnt_t1">0</b></span>
 <span class="chip" data-tier="2"><i class="dot" style="background:#ff6b6b"></i>4-5人 <b id="cnt_t2">0</b></span>
@@ -1497,12 +1576,13 @@ tr.sel td{background:var(--tr-sel);color:#fff}
 <span>已选 <b id="seln">0</b> 个 / 共 <b id="totaln">0</b> 个</span>
 <span>已选体积 <b id="selgb">0</b> GB</span>
 <span>总体积 <b id="totalgb">0</b> GB</span>
+<span>站点保种资格 <b id="siteCount">0</b> 条 / 下载器未完成 <b id="downloadCount">0</b> 组</span>
 <span>下载器已关联 <b id="linkedCount">0</b> 个</span>
 <span>译名关联 <b id="translatedCount">0</b> 个</span>
 <span>辅种组 <b id="crossSeedGroups">0</b> 个 / 额外任务 <b id="auxiliaryTaskCount">0</b> 个</span>
 <span>未关联 <b id="unlinkedCount">0</b> 个</span>
 <span>待核对 <b id="verifyCount">0</b> 个</span>
-<span title="这里显示憨憨站上全部可保种记录。未匹配下载器不代表站点没有资格；下载器任务删除后仍保留站点记录。">列表来源：憨憨站 · 关联仅供核对</span>
+<span title="正数种子ID来自站点完成页；标注未完成的项目直接来自已选下载器，且不计入站点保种资格。">列表：站点资格 + 下载器未完成</span>
 </div>
 <div class="hh-overlay" id="hhConfirmOverlay" hidden>
   <div class="hh-dialog" role="dialog" aria-modal="true" aria-labelledby="hhConfirmTitle" aria-describedby="hhConfirmDesc">
@@ -1532,7 +1612,8 @@ var COLS=[
 ];
 var seeds=[],filtered=[],sel={},dlSel={};
 var curTier="all",sortKey="size",sortDir=-1,query="";
-function tierOf(n){n=+n||0;return n<=1?0:(n<=3?1:2)}
+function tierOf(n){n=+n||0;return n<0?-1:(n<=1?0:(n<=3?1:2))}
+function selectedKey(seed){return String(seed.seed_id!=null?seed.seed_id:seed.title)}
 function fmtSize(gb){if(!isFinite(gb))return "-";gb=+gb;if(gb>=1024)return(gb/1024).toFixed(2)+" TB";return gb.toFixed(2)+" GB"}
 function esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;")}
 function buildHead(){
@@ -1556,7 +1637,7 @@ function tmv(ev){var dx=ev.touches[0].clientX-sx;if(Math.abs(dx)>1)dragMoved=tru
 function tup(ev){document.removeEventListener("touchmove",tmv);document.removeEventListener("touchend",tup);document.body.style.cursor='';if(dragMoved&&ev){ev.stopPropagation();ev.preventDefault()}}
 document.addEventListener("touchmove",tmv);document.addEventListener("touchend",tup)}});
 document.querySelectorAll("th[data-sortk]").forEach(function(th){th.onclick=function(ev){if(dragMoved){dragMoved=false;return}var sk=this.dataset.sortk;if(sortKey===sk){sortDir=-sortDir}else{sortKey=sk;sortDir=-1}doSort();buildHead();render()}});
-document.getElementById("chkAll").onchange=function(){var v=this.checked;filtered.forEach(function(s){sel[s.title]=v});render()};
+document.getElementById("chkAll").onchange=function(){var v=this.checked;filtered.forEach(function(s){sel[selectedKey(s)]=v});render()};
 }
 function doSort(){
 seeds.sort(function(a,b){
@@ -1566,12 +1647,14 @@ return(va-vb)*sortDir;
 });
 }
 function cellVal(c,s,t){
-if(c.k==="c_sid")return s.seed_id||"-";
+if(c.k==="c_sid")return s.source==="downloader"?"下载器":s.seed_id||"-";
 if(c.k==="c_name")return '<span title="'+esc(s.title)+'">'+esc(s.title)+"</span>";
 if(c.k==="c_size")return fmtSize(s.size);
-if(c.k==="c_init")return s.seeders;
+if(c.k==="c_init")return s.source==="downloader"?"-":s.seeders;
 if(c.k==="c_now")return s.now_seeders!=null?s.now_seeders:"-";
-if(c.k==="c_tier")return '<span class="'+["tier0","tier1","tier2"][t]+'">'+["0-1人","2-3人","4-5人"][t]+"</span>";
+if(c.k==="c_tier")return s.source==="downloader"?
+'<span style="color:#ffb020">下载中</span>':
+'<span class="'+["tier0","tier1","tier2"][t]+'">'+["0-1人","2-3人","4-5人"][t]+"</span>";
 if(c.k==="c_done_at")return esc(s.completed_at||"-");
 if(c.k==="c_last_settle")return esc(s.last_settle||"-");
 if(c.k==="c_today_hours")return esc(s.today_hours||"-");
@@ -1588,10 +1671,15 @@ return "";
 }
 function render(){
 var dlKeys=Object.keys(dlSel);
-var f=seeds.filter(function(s){if(curTier!=="all"&&String(tierOf(s.seeders))!==curTier)return false;if(query&&(s.title||"").toLowerCase().indexOf(query)<0)return false;if(dlKeys.length&&!(s.downloaders||[s.downloader||""]).some(function(dl){return !!dlSel[dl]}))return false;return true});
+var f=seeds.filter(function(s){
+if(curTier==="incomplete"&&s.source!=="downloader")return false;
+if(curTier!=="all"&&curTier!=="incomplete"&&(s.source==="downloader"||String(tierOf(s.seeders))!==curTier))return false;
+if(query&&(s.title||"").toLowerCase().indexOf(query)<0)return false;
+if(dlKeys.length&&!(s.downloaders||[s.downloader||""]).some(function(dl){return !!dlSel[dl]}))return false;
+return true;});
 filtered=f;
 var html="";
-for(var i=0;i<f.length;i++){var s=f[i];var t=tierOf(s.seeders);var seled=!!sel[s.title];
+for(var i=0;i<f.length;i++){var s=f[i];var t=tierOf(s.seeders);var seled=!!sel[selectedKey(s)];
 html+='<tr class="'+(seled?"sel":"")+'">';
 html+='<td><input type="checkbox" data-idx="'+i+'" '+(seled?"checked":"")+"></td>";
 for(var j=0;j<COLS.length;j++){var c=COLS[j];if(c.visible===false)continue;
@@ -1603,14 +1691,18 @@ var action=s.can_delete_group
 html+='<td>'+action+'</td></tr>';}
 if(!f.length)html='<tr><td colspan="20" style="text-align:center;padding:40px;color:#888">无匹配种子</td></tr>';
 document.getElementById("tbody").innerHTML=html;
-document.querySelectorAll("#tbody input[type=checkbox]").forEach(function(cb){cb.onchange=function(){var i=+this.dataset.idx;var t=filtered[i].title;sel[t]=this.checked;renderFooter()}});
+document.querySelectorAll("#tbody input[type=checkbox]").forEach(function(cb){cb.onchange=function(){var i=+this.dataset.idx;var key=selectedKey(filtered[i]);sel[key]=this.checked;renderFooter()}});
 document.querySelectorAll("#tbody [data-del]").forEach(function(a){a.onclick=function(){delOne(filtered[+this.dataset.del])}});
 renderFooter();
 }
 function renderFooter(){
-var sn=0,sgb=0;seeds.forEach(function(s){if(sel[s.title]){sn++;sgb+=+s.size||0}});
+var sn=0,sgb=0;seeds.forEach(function(s){if(sel[selectedKey(s)]){sn++;sgb+=+s.size||0}});
 document.getElementById("seln").textContent=sn;document.getElementById("selgb").textContent=sgb.toFixed(1);
 document.getElementById("totaln").textContent=seeds.length;document.getElementById("totalgb").textContent=seeds.reduce(function(a,b){return a+(+b.size||0)},0).toFixed(1);
+var incompleteGroups=seeds.filter(function(s){return s.source==="downloader"});
+document.getElementById("siteCount").textContent=seeds.length-incompleteGroups.length;
+document.getElementById("downloadCount").textContent=incompleteGroups.length;
+document.getElementById("cnt_incomplete").textContent=incompleteGroups.length;
 var linked=seeds.filter(function(s){return !!s.matched}).length;
 var needsReview=seeds.filter(function(s){return s.match_status==="ambiguous"||s.match_status==="similar"||s.match_status==="unverified"||s.match_status==="downloading"}).length;
 var translated=seeds.filter(function(s){return s.match_status==="translated"}).length;
@@ -1620,7 +1712,7 @@ document.getElementById("crossSeedGroups").textContent=seeds.filter(function(s){
 document.getElementById("auxiliaryTaskCount").textContent=seeds.reduce(function(sum,s){return sum+(s.auxiliary_count||0)},0);
 document.getElementById("unlinkedCount").textContent=seeds.length-linked;
 document.getElementById("verifyCount").textContent=needsReview;
-var c0=0,c1=0,c2=0;seeds.forEach(function(s){var t=tierOf(s.seeders);if(t===0)c0++;else if(t===1)c1++;else c2++});
+var c0=0,c1=0,c2=0;seeds.forEach(function(s){var t=tierOf(s.seeders);if(t===0)c0++;else if(t===1)c1++;else if(t===2)c2++});
 document.getElementById("cnt_all").textContent=seeds.length;
 document.getElementById("cnt_t0").textContent=c0;document.getElementById("cnt_t1").textContent=c1;document.getElementById("cnt_t2").textContent=c2;
 }
@@ -1715,7 +1807,7 @@ clients[t.downloader]=(clients[t.downloader]||0)+1;
 var names=Object.keys(clients).sort().map(function(k){return k+": "+clients[k]+" 个任务"}).join("；");
 document.getElementById("hhConfirmTitle").textContent="确认删除全部辅种及文件";
 document.getElementById("hhConfirmDesc").textContent=
-"保种记录："+items.length+" 条\n关联辅种任务："+total+" 个\n"+
+"选中记录："+items.length+" 组\n关联下载器任务："+total+" 个\n"+
 "下载器："+names+"\n"+
 (items.length===1?"发布名："+items[0].title+"\n":"")+
 "模式：全部移除任务，并删除各任务关联的数据文件。";
@@ -1789,7 +1881,7 @@ if(targets.some(function(t){return !t.downloader||!t.hash}))return null;
 return {title:seed.title,seed_id:seed.seed_id,targets:targets,delete_file:true};
 }
 function forgetVerifiedItem(item){
-delete sel[item.title];
+delete sel[selectedKey(item)];
 var row=seeds.find(function(s){
 return (item.seed_id!=null&&s.seed_id===item.seed_id)||s.title===item.title;
 });
@@ -1838,8 +1930,8 @@ await doDel([group]);
 }
 async function delSel(){
 if(deletionBusy)return;
-var chosen=seeds.filter(function(seed){return !!sel[seed.title]});
-if(!chosen.length){showToast("请先勾选需要删除的保种记录。","warn");return;}
+var chosen=seeds.filter(function(seed){return !!sel[selectedKey(seed)]});
+if(!chosen.length){showToast("请先勾选需要删除的站点或下载器任务。","warn");return;}
 var groups=chosen.map(groupFromSeed);
 if(groups.some(function(group){return !group})){
 showToast("所选记录中存在无法核对全部辅种的任务；请取消这些记录再试。","warn",11000);
@@ -2085,7 +2177,7 @@ buildHead();load(false);resumePendingDelete();
             seed_id = int(request.seed_id)
         except (TypeError, ValueError):
             return {"success": False, "message": "无效站点种子 ID"}
-        if (not request.confirm or not request.delete_file or not title or seed_id <= 0
+        if (not request.confirm or not request.delete_file or not title or seed_id == 0
                 or not re.fullmatch(r"[A-Za-z0-9_-]{12,80}", request_id)):
             return {"success": False, "message": "删除前必须确认站点、任务和文件"}
         if not self._enabled or self._stopped:
@@ -2206,9 +2298,13 @@ buildHead();load(false);resumePendingDelete();
                 return {"state": "failed", "removed_count": 0,
                         "message": "站点记录发生变化，删除已取消"}
             row = eligible[0]
+            is_downloader_only = seed_id < 0
+            if is_downloader_only != (row.get("source") == "downloader"):
+                return {"state": "failed", "removed_count": 0,
+                        "message": "下载器未完成任务与站点记录来源不一致，拒绝操作"}
             if not row.get("can_delete_group"):
                 return {"state": "failed", "removed_count": 0,
-                        "message": "存在名称近似、大小不一致或未完成任务，不允许整组删除"}
+                        "message": "存在名称近似、大小不一致或缺少 Hash，无法核验整组删除"}
             current_manifest = tuple(sorted(
                 (str(c.get("downloader") or ""),
                  str(c.get("hash") or "").lower())
@@ -2264,14 +2360,9 @@ buildHead();load(false);resumePendingDelete();
                     if not translated_size_matches(row, {"size_gb": size_gb}):
                         return {"state": "failed", "removed_count": 0,
                                 "message": f"{name} 种子体积变化，拒绝删除"}
-                    progress = self._get_progress_ratio(torrent, "")
-                    status = str(g("state", "status") or "").lower()
-                    if not (progress is not None and progress >= 0.999) and status not in (
-                        "seeding", "seed_pending", "stalledup", "pausedup",
-                        "queuedup", "forcedup", "uploading",
-                    ):
-                        return {"state": "failed", "removed_count": 0,
-                                "message": f"{name} 种子未确认完成，拒绝删除"}
+                    # Incomplete qB/Transmission downloads are legitimate
+                    # manual cleanup targets: progress is intentionally not
+                    # a prerequisite. The exact hash/name/size are required.
                     found.add(value)
                 if found != wanted:
                     return {"state": "failed", "removed_count": 0,
