@@ -26,11 +26,11 @@ def test_new_install_auto_and_old_config_unchanged(plugin):
     assert plugin._cron == "5 0 * * *" and plugin._schedule_mode == "cron"
 
 
-def test_auto_trigger_checks_locally_once_per_minute(plugin, monkeypatch):
+def test_auto_trigger_defaults_to_ten_minute_local_check(plugin, monkeypatch):
     monkeypatch.setattr(time, "time", lambda: 1000)
     plugin._enabled, plugin._schedule_mode = True, "auto"
     service = plugin.get_service()[0]
-    plugin._test_interval.assert_called_once_with(minutes=1)
+    plugin._test_interval.assert_called_once_with(minutes=10)
     assert service["kwargs"] == {"scheduled": True}
     plugin._stats.update(beach_due_at=4600, brick_due_at=4600)
     assert service["func"](**service["kwargs"])["status"] == "waiting"
@@ -281,3 +281,29 @@ def test_bad_reset_in_failed_sync_cannot_overflow_final_scheduler(plugin, monkey
     monkeypatch.setattr(requests, "get", Mock(return_value=response(text=html())))
     assert plugin.run_clean_task(scheduled=True)["status"] == "partial"
     assert plugin._stats["brick_due_at"] == 1300 and not plugin._lock.locked()
+
+
+@pytest.mark.parametrize("value,expected", [(None, 10), ("25", 25), (0, 1), (-3, 1), ("bad", 10), (float("inf"), 10)])
+def test_check_interval_defaults_custom_value_and_validation(plugin, value, expected):
+    plugin.init_plugin({"enabled": True, "schedule_mode": "auto", "check_interval_minutes": value})
+    plugin.get_service()
+    plugin._test_interval.assert_called_once_with(minutes=expected)
+
+
+def test_custom_check_interval_survives_all_save_paths_and_display(plugin):
+    plugin._queue_manual_run = Mock(return_value=True)
+    plugin.init_plugin({"enabled": True, "schedule_mode": "auto", "check_interval_minutes": 25, "run_once": True})
+    assert plugin.update_config.call_args.args[0]["check_interval_minutes"] == 25
+    plugin._update_stats()
+    saved = plugin.update_config.call_args.args[0]
+    assert saved["check_interval_minutes"] == 25
+    plugin.init_plugin(saved)
+    form, defaults = plugin.get_form()
+    assert defaults["check_interval_minutes"] == 25
+    assert '"model": "check_interval_minutes"' in json.dumps(form)
+    assert "每25分钟本地检查" in json.dumps(plugin.get_page(), ensure_ascii=False)
+
+
+def test_existing_auto_config_without_new_field_uses_ten_minutes(plugin):
+    plugin.init_plugin({"enabled": True, "schedule_mode": "auto", "interval_minutes": 121})
+    assert plugin._check_interval_minutes == 10 and plugin._interval_minutes == 121

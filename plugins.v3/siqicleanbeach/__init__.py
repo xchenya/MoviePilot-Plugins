@@ -39,7 +39,7 @@ class SiQiCleanBeach(_PluginBase):
     plugin_name = "思齐自动收垃圾"
     plugin_desc = "自动清理沙滩和可选搬砖，支持站点冷却或固定时间；新调度未经真实联调。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Moviepilot_A.png"
-    plugin_version = "2.2.0"
+    plugin_version = "2.2.1"
     plugin_author = "bfjy（V3 适配：xchenya）"
     author_url = "https://bfjy2024.github.io/bfjy"
     plugin_config_prefix = "siqicleanbeach_"
@@ -106,6 +106,7 @@ class SiQiCleanBeach(_PluginBase):
         self._schedule_mode = "interval"
         self._cron = "1 */2 * * *"
         self._interval_minutes = 121
+        self._check_interval_minutes = 10
         self._auto_brick = False
         self._brick_cooldown_minutes = 1440
         self._notify = True
@@ -145,6 +146,7 @@ class SiQiCleanBeach(_PluginBase):
             self._schedule_mode = "interval"
         self._cron = (config.get("cron") or "1 */2 * * *").strip()
         self._interval_minutes = self.__safe_int(config.get("interval_minutes"), 121, min_value=1)
+        self._check_interval_minutes = self.__safe_int(config.get("check_interval_minutes"), 10, min_value=1)
         self._auto_brick = bool(config.get("auto_brick", False))
         self._brick_cooldown_minutes = self.__safe_int(config.get("brick_cooldown_minutes"), 1440, min_value=1)
         self._notify = bool(config.get("notify", True))
@@ -173,6 +175,7 @@ class SiQiCleanBeach(_PluginBase):
                 "schedule_mode": self._schedule_mode,
                 "cron": self._cron,
                 "interval_minutes": self._interval_minutes,
+                "check_interval_minutes": self._check_interval_minutes,
                 "notify": self._notify,
                 "run_once": False,
                 "stats": self._stats,
@@ -227,7 +230,7 @@ class SiQiCleanBeach(_PluginBase):
 
         if self._schedule_mode == "auto":
             return [{"id": "SiQiCleanBeach", "name": "思齐站点冷却调度",
-                     "trigger": IntervalTrigger(minutes=1), "func": self.run_clean_task,
+                     "trigger": IntervalTrigger(minutes=self._check_interval_minutes), "func": self.run_clean_task,
                      "kwargs": {"scheduled": True}}]
 
         if self._schedule_mode == "interval":
@@ -324,7 +327,7 @@ class SiQiCleanBeach(_PluginBase):
                                                 {"title": "固定时间（Cron）", "value": "cron"},
                                                 {"title": "旧版固定间隔（兼容）", "value": "interval"},
                                             ],
-                                            "hint": "站点冷却与固定时间二选一；旧间隔仅作兼容。自动模式每分钟在本地检查，到期才请求站点。"
+                                            "hint": "站点冷却与固定时间二选一；自动模式按冷却检查间隔在本地判断，到期才请求站点。"
                                         }
                                     }
                                 ]
@@ -352,7 +355,7 @@ class SiQiCleanBeach(_PluginBase):
                                         "component": "VTextField",
                                         "props": {
                                             "model": "interval_minutes",
-                                            "label": "间隔分钟数",
+                                            "label": "旧版执行间隔（分钟）",
                                             "type": "number",
                                             "min": 1,
                                             "hint": "间隔模式下生效，例如 121",
@@ -371,6 +374,9 @@ class SiQiCleanBeach(_PluginBase):
                             ]},
                             {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
                                 {"component": "VTextField", "props": {"model": "brick_cooldown_minutes", "label": "旧版搬砖冷却（分钟）", "type": "number", "min": 1, "hint": "仅旧版固定间隔模式使用。站点冷却/固定时间模式以服务端每日50块及重置时间为准。"}}
+                            ]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                                {"component": "VTextField", "props": {"model": "check_interval_minutes", "label": "冷却检查间隔（分钟）", "type": "number", "min": 1, "hint": "仅按站点冷却模式生效，默认10分钟；冷却到期后在下一次检查执行。"}}
                             ]}
                         ]
                     },
@@ -405,6 +411,7 @@ class SiQiCleanBeach(_PluginBase):
             "schedule_mode": self._schedule_mode,
             "cron": self._cron,
             "interval_minutes": self._interval_minutes,
+            "check_interval_minutes": self._check_interval_minutes,
             "notify": self._notify,
             "run_once": False,
             "stats": self._stats,
@@ -438,7 +445,7 @@ class SiQiCleanBeach(_PluginBase):
         history = stats.get("history", [])[-5:]
 
         if self._schedule_mode == "auto":
-            schedule_info = "按站点冷却（每分钟本地检查）"
+            schedule_info = f"按站点冷却（每{self._check_interval_minutes}分钟本地检查）"
         elif self._schedule_mode == "interval":
             schedule_info = f"每{self._interval_minutes}分钟"
         else:
@@ -1205,6 +1212,7 @@ class SiQiCleanBeach(_PluginBase):
                 "schedule_mode": self._schedule_mode,
                 "cron": self._cron,
                 "interval_minutes": self._interval_minutes,
+                "check_interval_minutes": self._check_interval_minutes,
                 "notify": self._notify,
                 "run_once": False,
                 "stats": self._stats,

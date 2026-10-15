@@ -81,7 +81,7 @@ def test_v3_metadata_and_source_license():
     }
     market = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))
     entry = market["SiQiCleanBeach"]
-    assert attrs["plugin_version"] == entry["version"] == "2.2.0"
+    assert attrs["plugin_version"] == entry["version"] == "2.2.1"
     assert entry["system_version"] == ">=3.0.0"
     assert entry["release"] is False
     assert attrs["plugin_author"].startswith("bfjy")
