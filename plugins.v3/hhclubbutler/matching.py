@@ -395,8 +395,9 @@ def associate_rescue_seeds(
             # for even a task-only removal.
             strong_name = kind in {"exact", "translated"}
             can_remove = (
-                not unsafe_group and strong_name and completed
+                not unsafe_group and strong_name
                 and bool(task_hash and client)
+                and (progress is not None or state in completed_states)
             )
             # In a cross-seed group deleting shared data can destroy files
             # used by the remaining swarms, so prohibit payload deletion.
@@ -423,9 +424,10 @@ def associate_rescue_seeds(
         ))
         item["candidates"] = records
         item["can_manage"] = any(c["can_remove"] for c in records)
-        # Tracker is advisory only. Strong release-title evidence, actual
-        # downloader hash, completed status and tight size agreement authorize
-        # a user-confirmed group operation. Never infer from mere fuzzy title.
+        # Tracker and progress are only display information for a user-
+        # initiated deletion. A downloader task may be incomplete and still
+        # have a full infohash and verified expected total size; the same
+        # strong release identity and stable manifest are required. Never infer from mere fuzzy title.
         item["can_delete_group"] = bool(
             not unsafe_group and len(records) > 0 and len(records) <= 200
             and all(c["can_remove"] and c["size_verified"] for c in records)
@@ -450,7 +452,7 @@ def associate_rescue_seeds(
         item["trusted_tracker"] = selected["trusted_tracker"]
         if not selected["completed"]:
             item["match_status"] = "downloading" if selected["progress"] is not None else "unverified"
-            item["match_reason"] = "下载进度未核实或尚未完成"
+            item["match_reason"] = "下载尚未完成，可核验 Hash 后主动清理未完成文件"
         elif match_type == "translated":
             item["match_reason"] = "忽略中文译名后完整英文发布名与体积一致"
         elif match_type == "similar":

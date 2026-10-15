@@ -71,12 +71,12 @@ def test_fuzzy_size_contradiction_must_not_link():
 def test_unknown_tracker_or_incomplete_torrent_is_not_deletable():
     title = "Example Drama S01 2025 1080p WEB-DL DDP5.1"
     rows, _ = _match()([_site(title)], [_torrent(title, site_tracker=False)])
-    assert rows[0]["match_status"] == "unverified"
+    assert rows[0]["match_status"] == "exact"
     assert not rows[0]["can_delete"]
     assert rows[0]["downloader"] == "qBittorrent"
     rows, _ = _match()([_site(title)], [_torrent(title, progress=0.4)])
     assert rows[0]["match_status"] == "downloading"
-    assert not rows[0]["can_delete"]
+    assert rows[0]["can_delete_group"]  # incomplete tasks now have an explicit manual delete
 
 
 def test_duplicate_exact_torrents_display_both_downloaders_but_block_deletion():
@@ -145,7 +145,8 @@ def test_unknown_progress_without_seeding_state_is_read_only():
     rows, _ = _match()([_site(title)], [torrent])
     assert rows[0]["downloader"] == "qBittorrent"
     assert rows[0]["match_status"] == "unverified"
-    assert not rows[0]["can_delete"]
+    assert not rows[0]["can_delete"]  # no trusted tracker
+    assert not rows[0]["can_delete_group"]  # missing progress AND state is unsafe
     torrent["state"] = "seeding"
     rows, _ = _match()([_site(title)], [torrent])
-    assert rows[0]["can_delete"]
+    assert rows[0]["can_delete_group"]

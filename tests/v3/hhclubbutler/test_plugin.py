@@ -1,4 +1,4 @@
-"""HHClubButler V3.0.9 contracts and deletion safety without a real downloader."""
+"""HHClubButler V3.0.10 contracts and deletion safety without a real downloader."""
 from __future__ import annotations
 
 import ast
@@ -39,7 +39,7 @@ def test_v3_metadata_and_v2_fallback_disabled():
     }
     market_v3 = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))
     market_v2 = json.loads((ROOT / "package.v2.json").read_text(encoding="utf-8"))
-    assert attrs["plugin_version"] == "3.0.9"
+    assert attrs["plugin_version"] == "3.0.10"
     assert market_v3["HHClubButler"]["version"] == attrs["plugin_version"]
     assert market_v3["HHClubButler"]["system_version"] == ">=3.0.0"
     assert market_v3["HHClubButler"]["release"] is False
