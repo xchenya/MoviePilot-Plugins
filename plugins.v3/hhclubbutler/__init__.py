@@ -206,7 +206,7 @@ class HHClubButler(_PluginBase):
     plugin_name = "憨憨保种区管家"
     plugin_desc = "自动优选添加及换种工具\n保种管理器/Hosts加速"
     plugin_icon = "https://raw.githubusercontent.com/xchenya/MoviePilot-Plugins/main/plugins.v3/hhclubbutler/icon.png"
-    plugin_version = "3.0.11"
+    plugin_version = "3.0.12"
     plugin_author = "六个橙子"
     author_url = "https://github.com/SixOrg"
     plugin_config_prefix = "hhclubbutler_"
@@ -259,6 +259,9 @@ class HHClubButler(_PluginBase):
         self._list_lock = threading.Lock()
         self._list_state = "idle"
         self._list_cache = None
+        self._list_snapshot = None
+        self._list_requested_clients = set()
+        self._list_requested_full = False
         self._list_updated_at = 0.0
         self._list_started_at = 0.0
         self._list_finished_at = 0.0
@@ -875,6 +878,9 @@ class HHClubButler(_PluginBase):
             self._list_generation += 1
             self._list_state = "idle"
             self._list_cache = None
+            self._list_snapshot = None
+            self._list_requested_clients = set()
+            self._list_requested_full = False
             self._list_updated_at = 0.0
             self._list_error = ""
             self._list_warning = ""
@@ -1015,7 +1021,9 @@ class HHClubButler(_PluginBase):
             logger.warning(f"预取下载器种子失败：{HHClubButler._safe_error(e)}")
             return None
 
-    def _collect_rescue_seeds(self, strict_downloaders: bool = False) -> list[dict]:
+    def _collect_rescue_seeds(self, strict_downloaders: bool = False, *,
+                              snapshot: dict | None = None,
+                              refresh_downloaders: tuple = ()) -> list[dict]:
         """Complete site rescue inventory, with optional downloader annotations.
 
         This view must NEVER call _get_current_seeding: that intersection is
@@ -1023,7 +1031,12 @@ class HHClubButler(_PluginBase):
         """
         started = time.monotonic()
         logs = []
-        completed = self._fetch_completed(logs)
+        partial = bool(refresh_downloaders and snapshot is not None and "completed" in snapshot)
+        if strict_downloaders and snapshot is not None:
+            raise ValueError("删除核验不能使用列表快照")
+        if refresh_downloaders and not partial:
+            raise ValueError("没有可用的站点快照，请手动刷新完整列表")
+        completed = snapshot["completed"] if partial else self._fetch_completed(logs)
         if not completed and any("失败" in line or "未获取到" in line for line in logs):
             raise RuntimeError("站点完成页抓取失败，拒绝使用不完整列表")
         logger.info(f"憨憨保种管理器：站点全部可保种记录 {len(completed)} 条，"
@@ -1031,22 +1044,34 @@ class HHClubButler(_PluginBase):
         downloader_rows = []
         read_clients, read_hashes = set(), []
         warnings = []
+        downloaded = {}
         services = self._get_manage_services()
-        requested = set(self._downloaders or [])
+        requested = set(refresh_downloaders if partial else self._downloaders or [])
         missing = requested - set(services)
         if missing:
             warnings.append("以下已选下载器不可用：" + "、".join(sorted(missing)))
-            if strict_downloaders:
+            if strict_downloaders or partial:
                 raise RuntimeError("管理下载器不可用，不能核实删除目标")
         if not services:
-            if strict_downloaders:
+            if strict_downloaders or partial:
                 raise RuntimeError("未配置有效的管理下载器，不能核实删除目标")
             warnings.append("未选择可用下载器，站点清单仍会完整显示")
+        if partial:
+            for name in set(self._downloaders or []) - requested:
+                cached = snapshot.get("downloaders", {}).get(name)
+                if cached is None:
+                    raise ValueError("下载器快照不完整，请手动刷新完整列表")
+                downloader_rows.extend(cached["rows"])
+                warnings.extend(cached["warnings"])
+                downloaded[name] = cached
         for name, service in services.items():
+            if partial and name not in requested:
+                continue
+            row_start, warning_start = len(downloader_rows), len(warnings)
             try:
                 torrents, error = service.instance.get_torrents()
                 if error or torrents is None:
-                    if strict_downloaders:
+                    if strict_downloaders or partial:
                         raise RuntimeError(f"下载器 {name} 读取失败，拒绝删除")
                     warnings.append(f"{name} 种子读取失败")
                     continue
@@ -1070,7 +1095,7 @@ class HHClubButler(_PluginBase):
                     infohash = str(g("hash", "hashString") or "").lower()
                     if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", infohash, re.I):
                         complete_hashes = False
-                        if strict_downloaders:
+                        if strict_downloaders or partial:
                             raise ValueError("下载器任务清单缺少 Hash")
                     else:
                         read_hashes.append({"downloader": name, "hash": infohash})
@@ -1127,14 +1152,19 @@ class HHClubButler(_PluginBase):
                             f"本站主机可识别 {trusted_tracker_count} 条（仅作诊断，不影响人工删除）")
             except Exception as e:
                 logger.warning(f"憨憨保种管理器：下载器 {name} 数据解析失败：{HHClubButler._safe_error(e)}")
-                if strict_downloaders:
+                if strict_downloaders or partial:
                     raise RuntimeError(f"下载器 {name} 数据不完整，拒绝删除") from e
                 warnings.append(f"{name} 数据解析失败")
+            finally:
+                downloaded[name] = {"rows": downloader_rows[row_start:], "warnings": warnings[warning_start:]}
         self._reconcile_delete_guard(read_hashes, read_clients)
         rows, stats = associate_rescue_seeds(completed, downloader_rows)
         rows = self._append_downloader_incomplete(rows, downloader_rows)
+        if snapshot is not None:
+            snapshot.update(completed=completed, downloaders=downloaded, warning="；".join(warnings))
         extra = sum(1 for row in rows if row.get("source") == "downloader")
-        self._list_warning = "；".join(warnings)
+        if snapshot is None:
+            self._list_warning = "；".join(warnings)
         if extra:
             logger.info(f"憨憨保种管理器：另有 {extra} 组未进入站点完成页的下载器未完成任务")
         logger.info(f"憨憨保种管理器：站点 {stats['eligible']} 条 / "
@@ -1226,56 +1256,89 @@ class HHClubButler(_PluginBase):
                                            str(row.get("title"))))
         return site_rows + supplemental
 
-    def _list_rescue_worker(self, generation: int):
+    def _list_rescue_worker(self, generation: int, downloaders: tuple = ()):
         """Update the in-memory snapshot atomically, keeping errors visible."""
         started = time.monotonic()
         try:
-            seeds = self._collect_rescue_seeds()
+            with self._list_lock:
+                previous = getattr(self, "_list_snapshot", None)
+                snapshot = dict(previous) if downloaders and previous is not None else {}
+            covered, full_read = set(), False
+            while True:
+                seeds = self._collect_rescue_seeds(snapshot=snapshot, refresh_downloaders=downloaders)
+                covered.update(downloaders)
+                full_read = full_read or not downloaders
+                with self._list_lock:
+                    if generation != self._list_generation or self._stopped:
+                        return
+                    pending = getattr(self, "_list_requested_clients", set()) - covered
+                    if getattr(self, "_list_requested_full", False) and not full_read:
+                        downloaders = ()
+                    elif pending and not full_read:
+                        downloaders = tuple(sorted(pending))
+                    else:
+                        self._list_cache = seeds
+                        self._list_snapshot = snapshot
+                        self._list_warning = snapshot.get("warning", "")
+                        self._list_updated_at = time.time()
+                        self._list_finished_at = self._list_updated_at
+                        self._list_state = "ready"
+                        self._list_error = ""
+                        return
         except Exception as e:
             logger.error(f"憨憨保种管理器后台读取失败，耗时 {time.monotonic() - started:.1f}s：{HHClubButler._safe_error(e)}")
             with self._list_lock:
                 if generation != self._list_generation or self._stopped:
                     return
                 self._list_state = "error"
-                self._list_error = "读取保种数据失败，请检查站点 Cookie、下载器及插件日志"
+                self._list_error = ("更新下载器失败，请检查下载器连接后重试" if downloaders else
+                                    "读取保种数据失败，请检查站点 Cookie、下载器及插件日志")
                 self._list_finished_at = time.time()
-        else:
-            with self._list_lock:
-                if generation != self._list_generation or self._stopped:
-                    return
-                self._list_cache = seeds
-                self._list_updated_at = time.time()
-                self._list_finished_at = self._list_updated_at
-                self._list_state = "ready"
-                self._list_error = ""
 
-    def api_list_rescue_seeds(self, refresh: bool = False):
+    def api_list_rescue_seeds(self, refresh: bool = False, downloaders: str = ""):
         """Immediate status response; expensive I/O is coalesced in one worker."""
         now = time.time()
+        clients = ()
+        if downloaders:
+            try:
+                names = json.loads(downloaders)
+                if (not isinstance(names, list) or not names or len(names) > 50
+                        or any(not isinstance(name, str) or name not in self._downloaders for name in names)):
+                    raise ValueError("下载器范围无效")
+                clients = tuple(sorted(set(names)))
+            except (ValueError, TypeError):
+                return {"success": False, "message": "下载器刷新范围无效"}
         with self._list_lock:
             if self._stopped or not self._enabled:
                 return {"success": False, "message": "插件未启用"}
             if self._list_state == "loading":
+                if refresh:
+                    self._list_requested_clients.update(clients)
+                    self._list_requested_full = self._list_requested_full or not clients
                 return {
                     "success": True, "loading": True,
                     "elapsed_seconds": max(0, int(now - self._list_started_at)),
                     "message": "保种数据正在后台读取"}
-            if (not refresh and self._list_cache is not None
+            if clients and getattr(self, "_list_snapshot", None) is None:
+                return {"success": False, "message": "站点快照尚未就绪，请手动刷新完整列表"}
+            if (not refresh and self._list_state == "error"
+                    and now - self._list_finished_at < 30):
+                return {"success": False, "message": self._list_error}
+            if (not refresh and self._list_state == "ready" and self._list_cache is not None
                     and now - self._list_updated_at < self._list_cache_ttl):
                 return {"success": True, "loading": False,
                         "data": self._list_cache, "warning": self._list_warning,
                         "updated_at": datetime.fromtimestamp(
                             self._list_updated_at).strftime("%Y-%m-%d %H:%M:%S")}
-            if (not refresh and self._list_state == "error"
-                    and now - self._list_finished_at < 30):
-                return {"success": False, "message": self._list_error}
             self._list_generation += 1
             generation = self._list_generation
             self._list_state = "loading"
+            self._list_requested_clients = set(clients)
+            self._list_requested_full = not clients
             self._list_started_at = now
             self._list_error = ""
             thread = threading.Thread(
-                target=self._list_rescue_worker, args=(generation,),
+                target=self._list_rescue_worker, args=(generation, clients),
                 daemon=True, name="HHClubButler-RescueSnapshot")
             self._list_thread = thread
             try:
@@ -1520,12 +1583,13 @@ tr.sel td{background:var(--tr-sel);color:#fff}
 <span>已选体积 <b id="selgb">0</b> GB</span>
 <span>总体积 <b id="totalgb">0</b> GB</span>
 <span>站点保种资格 <b id="siteCount">0</b> 条 / 下载器未完成 <b id="downloadCount">0</b> 组</span>
-<span>下载器已关联 <b id="linkedCount">0</b> 个</span>
+<span>下载器已关联 <b id="linkedCount">0</b> 组</span>
+<span title="按当前下载器筛选，使用下载器名称与 Hash 去重；同组辅种分别计数。">当前显示 <b id="visibleCount">0</b> 条 / 已确认关联任务 <b id="linkedTaskCount">0</b> 个</span>
 <span>译名关联 <b id="translatedCount">0</b> 个</span>
 <span>辅种组 <b id="crossSeedGroups">0</b> 个 / 额外任务 <b id="auxiliaryTaskCount">0</b> 个</span>
 <span>未关联 <b id="unlinkedCount">0</b> 个</span>
 <span>待核对 <b id="verifyCount">0</b> 个</span>
-<span title="正数种子ID来自站点完成页；标注未完成的项目直接来自已选下载器，且不计入站点保种资格。">列表：站点资格 + 下载器未完成</span>
+<span title="无站点 ID 的未完成项目来自下载器，不计入站点资格。删除后只更新相关下载器；站点资格通过“刷新列表”更新。">列表：站点资格 + 下载器未完成</span>
 </div>
 <div class="hh-overlay" id="hhConfirmOverlay" hidden>
   <div class="hh-dialog" role="dialog" aria-modal="true" aria-labelledby="hhConfirmTitle" aria-describedby="hhConfirmDesc">
@@ -1590,7 +1654,7 @@ return(va-vb)*sortDir;
 });
 }
 function cellVal(c,s,t){
-if(c.k==="c_sid")return s.source==="downloader"?"下载器":s.seed_id||"-";
+if(c.k==="c_sid")return s.source==="downloader"?'<span title="未关联站点种子 ID；此记录来自下载器当前任务，不代表种子已删除">—</span>':s.seed_id||"-";
 if(c.k==="c_name")return '<span title="'+esc(s.title)+'">'+esc(s.title)+"</span>";
 if(c.k==="c_size")return fmtSize(s.size);
 if(c.k==="c_init")return s.source==="downloader"?"-":s.seeders;
@@ -1639,6 +1703,13 @@ document.querySelectorAll("#tbody [data-del]").forEach(function(a){a.onclick=fun
 renderFooter();
 }
 function renderFooter(){
+var tasks={};
+filtered.forEach(function(s){if(s.match_status==="ambiguous")return;(s.candidates||[]).forEach(function(c){
+if(c.hash&&c.downloader&&(!Object.keys(dlSel).length||dlSel[c.downloader])&&
+ (c.match_type==="exact"||c.match_type==="translated"))tasks[JSON.stringify([c.downloader,c.hash.toLowerCase()])]=1;
+})});
+document.getElementById("visibleCount").textContent=filtered.length;
+document.getElementById("linkedTaskCount").textContent=Object.keys(tasks).length;
 var sn=0,sgb=0;seeds.forEach(function(s){if(sel[selectedKey(s)]){sn++;sgb+=+s.size||0}});
 document.getElementById("seln").textContent=sn;document.getElementById("selgb").textContent=sgb.toFixed(1);
 document.getElementById("totaln").textContent=seeds.length;document.getElementById("totalgb").textContent=seeds.reduce(function(a,b){return a+(+b.size||0)},0).toFixed(1);
@@ -1672,18 +1743,19 @@ document.querySelectorAll("#dlList input[type=checkbox]").forEach(function(cb){c
 updateDlBtn();
 }
 var activeLoadId=0;
-async function load(force){
+async function load(force,downloaders){
 var token=++activeLoadId;
 var st=document.getElementById("status"),started=Date.now();
 st.style.display="flex";
-st.innerHTML='<span>正在获取保种数据… <b id="el">0</b> 秒</span><div class="bar"><i></i></div>';
+st.innerHTML='<span>'+(downloaders&&downloaders.length?'正在更新下载器 '+esc(downloaders.join(' / ')):'正在获取保种数据')+'… <b id="el">0</b> 秒</span><div class="bar"><i></i></div>';
 function elapsed(){return Math.floor((Date.now()-started)/1000)}
 var ticker=setInterval(function(){
 if(token!==activeLoadId)return;
 var el=document.getElementById("el");if(el)el.textContent=elapsed();
 },250);
 function showErr(msg){
-st.innerHTML='<span class="errmsg">'+esc(msg)+'</span><button class="retrybtn" onclick="load(true)">重试</button>';
+st.innerHTML='<span class="errmsg">'+esc(msg)+'</span><button class="retrybtn" id="retryLoad">重试</button>';
+document.getElementById("retryLoad").onclick=function(){return load(true,downloaders)};
 }
 try{
 while(token===activeLoadId){
@@ -1691,6 +1763,7 @@ var ctl=(typeof AbortController!=="undefined")?new AbortController():null;
 var timeout=ctl?setTimeout(function(){ctl.abort()},15000):null;
 try{
 var url="/api/v1/plugin/HHClubButler/list_rescue_seeds"+(force?"?refresh=1":"");
+if(downloaders&&downloaders.length)url+=(force?"&":"?")+"downloaders="+encodeURIComponent(JSON.stringify(downloaders));
 force=false;
 var r=await fetch(url,ctl?{signal:ctl.signal,credentials:"same-origin",cache:"no-store"}:{credentials:"same-origin",cache:"no-store"});
 if(!r.ok)throw Error("HTTP "+r.status);
@@ -1825,30 +1898,39 @@ return {title:seed.title,seed_id:seed.seed_id,targets:targets,delete_file:true};
 }
 function forgetVerifiedItem(item){
 delete sel[selectedKey(item)];
-var row=seeds.find(function(s){
-return (item.seed_id!=null&&s.seed_id===item.seed_id)||s.title===item.title;
-});
+var row=seeds.find(function(s){return selectedKey(s)===selectedKey(item)});
 if(row){
+if(row.source==="downloader"){
+seeds=seeds.filter(function(s){return s!==row});
+}else{
 row.candidates=[];row.cross_seed_count=0;row.auxiliary_count=0;
 row.can_manage=false;row.can_delete=false;row.can_delete_group=false;
 row.hash="";row.matched=false;row.match_status="unmatched";
-row.match_reason="关联任务删除指令已完成，正在重新读取站点和下载器";
+row.match_reason="已确认移除关联任务；站点资格记录仍保留";
 row.downloader="";row.downloaders=[];
 }
+}
 doSort();buildDlList();render();
+}
+function refreshDownloaders(items){
+var clients=[];
+items.forEach(function(item){(item.targets||[]).forEach(function(t){
+if(t.downloader&&clients.indexOf(t.downloader)<0)clients.push(t.downloader);
+})});
+return clients.length?load(true,clients):Promise.resolve();
 }
 async function followDeletion(record,reload){
 var result=await pollDeleteStatus(record.id);
 if(result.status==="resolved"){
 clearPending();showToast(result.message||"旧指令已核对，请刷新剩余任务，磁盘状态需另行确认","warn",12000);
-load(true);return "resolved";
+if(reload)await refreshDownloaders([record.item]);return "resolved";
 }
 if(result.status==="verified"){
 forgetVerifiedItem(record.item);clearPending();
 showToast("下载器已确认移除全部 "+(result.removed_count||0)+
 " 个关联任务，并已收到删除文件指令。\n"+
 "注意：实际磁盘文件是否彻底删除须到下载器/存储端确认。","good",10000);
-if(reload)load(true);
+if(reload)await refreshDownloaders([record.item]);
 return "verified";
 }
 if(result.status==="failed"){
@@ -1862,7 +1944,7 @@ showToast("部分完成或状态未知："+(result.message||"需人工核对")+
 "\n已确认任务数："+(result.removed_count||0)+
 "/"+(result.total_count||record.item.targets.length)+
 "\n请核对下载器和磁盘文件！不会自动重发删除命令。","warn",0);
-load(true);
+if(reload)await refreshDownloaders([record.item]);
 return "uncertain";
 }
 async function delOne(seed){
@@ -1894,7 +1976,7 @@ showToast("上一条删除请求状态尚未核对，请等待或重新打开页
 return;
 }
 toggleDeletionBusy(true);
-var finished=0,stopped=false;
+var finished=0,stopped=false,attempted=[];
 try{
 for(var i=0;i<groups.length;i++){
 var item=groups[i],record={id:createRequestId(),item:item,started:Date.now()};
@@ -1918,15 +2000,16 @@ clearPending();
 showToast("服务端拒绝删除："+(submitted.message||"未知原因"),"bad",10000);
 stopped=true;break;
 }
+attempted.push(item);
 var state=await followDeletion(record,false);
 if(state==="verified")finished++;
 else{stopped=true;break;}
 }
 if(finished){
 showToast("已确认处理 "+finished+" 组辅种。"+
-(stopped?"其他组已停止，需人工核对。":"正在刷新列表。"),"good",9000);
-load(true);
+(stopped?"其他组已停止，需人工核对。":"正在更新相关下载器。"),"good",9000);
 }
+if(attempted.length)await refreshDownloaders(attempted);
 }finally{toggleDeletionBusy(false);}
 }
 async function resumePendingDelete(){
@@ -2219,6 +2302,11 @@ buildHead();load(false);resumePendingDelete();
                            "message": "删除状态不确定，不会自动重试，请查看下载器"}
             finally:
                 self._run_lock.release()
+        if (generation == self._delete_generation
+                and (outcome.get("removed_count", 0) or outcome.get("state") in ("uncertain", "verified"))):
+            self._invalidate_rescue_cache()
+            self._last_overview = None
+            self._last_overview_ts = 0.0
         with self._delete_lock:
             item = self._delete_jobs.get(request_id)
             if item:
@@ -2228,10 +2316,6 @@ buildHead();load(false);resumePendingDelete();
                 item["finished_at"] = time.time()
             if self._delete_active_id == request_id:
                 self._delete_active_id = None
-        if outcome.get("removed_count", 0) or outcome.get("state") in ("uncertain", "verified"):
-            self._invalidate_rescue_cache()
-            self._last_overview = None
-            self._last_overview_ts = 0.0
 
     @staticmethod
     def _torrent_field(t, *keys):

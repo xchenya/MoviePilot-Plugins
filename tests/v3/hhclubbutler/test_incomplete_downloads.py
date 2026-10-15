@@ -146,7 +146,7 @@ def test_ui_has_separate_download_incomplete_filter_and_selection_keys():
     assert 'function selectedKey(seed)' in src
     assert 'seed.source==="downloader"' in src or 's.source==="downloader"' in src
     assert 'if(curTier==="incomplete"' in src
-    assert 'return s.source==="downloader"?"下载器"' in src
+    assert "未关联站点种子 ID" in src
 
 
 def test_group_delete_has_download_only_source_separation():

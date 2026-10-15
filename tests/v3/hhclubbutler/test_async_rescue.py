@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import json
 import re
 import runpy
 import threading
@@ -35,7 +36,7 @@ def _method(name: str):
                                                  type_ignores=[]))
     helpers = runpy.run_path(str(ROOT / "plugins.v3/hhclubbutler/matching.py"))
     associate = helpers["associate_rescue_seeds"]
-    namespace = {"HHClubButler": SUPPORT["Subject"], "time": time, "threading": threading, "datetime": datetime,
+    namespace = {"HHClubButler": SUPPORT["Subject"], "time": time, "threading": threading, "datetime": datetime, "json": json,
                  "re": re, "associate_rescue_seeds": associate,
                  "is_trusted_hh_tracker": helpers["is_trusted_hh_tracker"],
                  "logger": SimpleNamespace(info=Mock(), warning=Mock(), error=Mock())}
@@ -52,7 +53,7 @@ def _fixture():
         _list_finished_at=0.0, _list_error="", _list_generation=0,
         _list_thread=None, _list_cache_ttl=180.0, _list_warning="",
     )
-    fake._list_rescue_worker = lambda generation: _method("_list_rescue_worker")(fake, generation)
+    fake._list_rescue_worker = lambda generation, downloaders=(): _method("_list_rescue_worker")(fake, generation, downloaders)
     return SUPPORT["enrich"](fake)
 
 
@@ -63,7 +64,7 @@ def test_first_read_returns_loading_without_blocking_and_coalesces_requests():
     finish = threading.Event()
     counter = []
 
-    def collect():
+    def collect(**kwargs):
         counter.append("started")
         fetched.set()
         assert finish.wait(5), "fixture worker should have been released"
@@ -91,7 +92,7 @@ def test_fetch_error_is_explicit_and_retry_is_controlled():
     api = _method("api_list_rescue_seeds")
     fake = _fixture()
     calls = []
-    def broken():
+    def broken(**kwargs):
         calls.append(1)
         raise RuntimeError("pretend remote is unavailable")
 
@@ -104,7 +105,7 @@ def test_fetch_error_is_explicit_and_retry_is_controlled():
     assert len(calls) == 1
     assert api(fake)["success"] is False
     assert len(calls) == 1, "retries should be rate-limited"
-    fake._collect_rescue_seeds = lambda: [{"title": "Recovered", "size": 2.0}]
+    fake._collect_rescue_seeds = lambda **kwargs: [{"title": "Recovered", "size": 2.0}]
     assert api(fake, refresh=True)["loading"] is True
     fake._list_thread.join(timeout=5)
     assert api(fake)["data"][0]["title"] == "Recovered"
@@ -115,7 +116,7 @@ def test_worker_from_old_generation_cannot_publish_after_stop():
     fake = _fixture()
     started, finish = threading.Event(), threading.Event()
 
-    def slow():
+    def slow(**kwargs):
         started.set()
         assert finish.wait(5)
         return [{"title": "Stale", "size": 99}]
@@ -140,7 +141,7 @@ def test_refetch_explicitly_refreshes_cached_data():
     fake._list_state = "ready"
     fake._list_updated_at = time.time()
     assert api(fake)["data"][0]["title"] == "A"
-    fake._collect_rescue_seeds = lambda: [{"title": "B", "size": 1}]
+    fake._collect_rescue_seeds = lambda **kwargs: [{"title": "B", "size": 1}]
     assert api(fake, refresh=True)["loading"] is True
     fake._list_thread.join(timeout=5)
     assert api(fake)["data"][0]["title"] == "B"
@@ -148,7 +149,7 @@ def test_refetch_explicitly_refreshes_cached_data():
 
 def test_ui_uses_short_polling_and_detail_page_has_no_blocking_fetch():
     code = _source()
-    assert "async function load(force)" in code
+    assert "async function load(force,downloaders)" in code
     assert "if(j.loading)" in code
     assert "list_rescue_seeds" in code
     assert "setTimeout(function(){ctl.abort()},15000)" in code
@@ -249,8 +250,8 @@ def test_market_metadata_marks_patch_release_unpublished():
     import json
     manifest = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))
     entry = manifest["HHClubButler"]
-    assert entry["version"] == "3.0.11"
+    assert entry["version"] == "3.0.12"
     assert entry["release"] is False
-    assert "3.0.11" in entry["history"]
+    assert "3.0.12" in entry["history"]
 
 
