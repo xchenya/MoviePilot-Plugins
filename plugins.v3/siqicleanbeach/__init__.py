@@ -39,7 +39,7 @@ class SiQiCleanBeach(_PluginBase):
     plugin_name = "思齐自动收垃圾"
     plugin_desc = "自动清理沙滩和可选搬砖，支持站点冷却或固定时间；新调度未经真实联调。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Moviepilot_A.png"
-    plugin_version = "2.2.1"
+    plugin_version = "2.2.2"
     plugin_author = "bfjy（V3 适配：xchenya）"
     author_url = "https://bfjy2024.github.io/bfjy"
     plugin_config_prefix = "siqicleanbeach_"
@@ -445,11 +445,15 @@ class SiQiCleanBeach(_PluginBase):
         history = stats.get("history", [])[-5:]
 
         if self._schedule_mode == "auto":
-            schedule_info = f"按站点冷却（每{self._check_interval_minutes}分钟本地检查）"
+            schedule_info = "按站点冷却"
         elif self._schedule_mode == "interval":
             schedule_info = f"每{self._interval_minutes}分钟"
         else:
             schedule_info = f"Cron: {self._cron}"
+
+        last_result = stats.get("last_result", "-")
+        if "clean_result" in stats and "brick_result" in stats:
+            last_result = f"清理：{stats['clean_result']}；搬砖：{stats['brick_result']}"
 
         return [
             {
@@ -482,10 +486,10 @@ class SiQiCleanBeach(_PluginBase):
                                 "component": "VRow",
                                 "content": [
                                     self.__info_col("⏰ 定时模式", schedule_info),
-                                    self.__info_col("🏖️ 沙滩下次可执行", self.__due_text("beach_due_at")),
-                                    self.__info_col("🧱 搬砖下次可执行", self.__due_text("brick_due_at") if self._auto_brick else "未开启"),
+                                    self.__info_col("🏖️ 沙滩下次执行时间", self.__due_text("beach_due_at", compact=True)),
+                                    self.__info_col("🧱 搬砖下次执行时间", self.__due_text("brick_due_at", compact=True) if self._auto_brick else "未开启"),
                                     self.__info_col("⏳ 沙滩时间来源", stats.get("beach_due_source", "等待首次同步")),
-                                    self.__info_col("📝 最后结果", stats.get("last_result", "-")),
+                                    self.__info_col("📝 最后结果", last_result),
                                     self.__info_col("🗑️ 清理结果", stats.get("clean_result", "-")),
                                     self.__info_col("🧱 搬砖结果", stats.get("brick_result", "-")),
                                     self.__info_col("🧱 本次 / 今日 / 库存", f"{stats.get('bricks_moved', 0)} / {stats.get('daily_bricks') if stats.get('daily_bricks') is not None else '未知'} / {inventory.get('砖块', {}).get('count', '未知')}"),
@@ -799,12 +803,14 @@ class SiQiCleanBeach(_PluginBase):
         return (not isinstance(value, bool) and isinstance(value, (int, float))
                 and 0 < value < 253402300800 and math.isfinite(value))
 
-    def __due_text(self, key: str) -> str:
+    def __due_text(self, key: str, compact: bool = False) -> str:
         due = self._stats.get(key)
         if not self.__valid_due(due):
             return "等待首次同步" if due is None else "时间异常，等待重新同步"
-        remaining = max(0, int(due - time.time()))
         try:
+            if compact:
+                return f"{datetime.fromtimestamp(due):%Y-%m-%d %H:%M}"
+            remaining = max(0, int(due - time.time()))
             return f"{datetime.fromtimestamp(due):%Y-%m-%d %H:%M:%S}（约{remaining // 3600}:{remaining // 60 % 60:02d}:{remaining % 60:02d}）"
         except (ValueError, OverflowError, OSError):
             return "时间异常，等待重新同步"
