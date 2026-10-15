@@ -15,6 +15,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+SUPPORT = __import__("runpy").run_path(str(Path(__file__).with_name("support.py")))
+
 ROOT = Path(__file__).resolve().parents[3]
 SOURCE = ROOT / "plugins.v3/hhclubbutler/__init__.py"
 
@@ -32,7 +34,7 @@ def _subject():
     assert len(members) == len(chosen)
     cls = ast.ClassDef(name="DeleteSubject", bases=[], keywords=[],
                        body=members, decorator_list=[])
-    namespace = {"threading": threading, "time": time, "re": re,
+    namespace = {"HHClubButler": SUPPORT["Subject"], "threading": threading, "time": time, "re": re,
                  "logger": SimpleNamespace(info=Mock(), error=Mock())}
     helpers=runpy.run_path(str(ROOT/"plugins.v3/hhclubbutler/matching.py"))
     namespace.update({name: helpers[name] for name in
@@ -56,17 +58,20 @@ def _fixture():
     instance._list_generation = 0
     instance._list_state = "ready"
     instance._list_cache = [{"title": "Old.Movie", "downloader": "QB",
-                             "hash": "HASH123"}]
+                             "hash": "1111111111111111111111111111111111111111"}]
     instance._list_updated_at = time.time()
     instance._list_error = ""
     instance._collect_rescue_seeds = lambda strict_downloaders=False: [
         {"title": "Old.Movie", "size": 8.0, "downloader": "QB",
-         "hash": "HASH123", "can_delete": True, "match_status": "exact",
-         "candidates": [{"downloader": "QB", "hash": "HASH123",
+         "hash": "1111111111111111111111111111111111111111", "can_delete": True, "match_status": "exact",
+         "candidates": [{"downloader": "QB", "hash": "1111111111111111111111111111111111111111",
                          "can_remove": True, "can_delete_files": True,
                          "match_type": "exact"}]}]
     instance._last_overview = {"count": 1}
     instance._last_overview_ts = time.time()
+    SUPPORT["enrich"](instance)
+    # These tests isolate legacy identity; full-subject tests cover file references.
+    instance._validate_delete_files = Mock()
     return instance
 
 REQ_ID = "a7ab618f-1300-4551-bb7c-aba7e323d077"
@@ -74,7 +79,7 @@ OTHER_ID = "cb982a2e-778a-41e0-9c71-31f2ec19a738"
 
 def _submit(host, request_id=REQ_ID, **kwargs):
     args = dict(title="Old.Movie", downloader="QB",
-                torrent_hash="HASH123", confirm=True, request_id=request_id)
+                torrent_hash="1111111111111111111111111111111111111111", confirm=True, request_id=request_id)
     args.update(kwargs)
     return host.api_delete_rescue_seed(**args)
 
@@ -158,13 +163,13 @@ def test_exact_delete_waits_for_hash_to_disappear_from_downloader():
     host._extract_tracker_text = lambda t: t.get("tracker", "")
     host._get_current_seeding = lambda logs: {"seeds":[{"title":"Old.Movie"}]}
     delete = Mock(return_value=True)
-    torrent = {"name":"Old.Movie","hash":"HASH123","tracker":"https://tracker.hhanclub.net/announce"}
+    torrent = {"name":"Old.Movie","hash":"1111111111111111111111111111111111111111","size":8*1073741824,"tracker":"https://tracker.hhanclub.net/announce"}
     host._get_manage_services = lambda: {"QB": SimpleNamespace(instance=SimpleNamespace(
         get_torrents=lambda: (([] if delete.called else [torrent]), None),
         delete_torrents=delete))}
-    result = host._delete_rescue_exact("Old.Movie","QB","HASH123",True,host._delete_generation)
+    result = host._delete_rescue_exact("Old.Movie","QB","1111111111111111111111111111111111111111",True,host._delete_generation)
     assert result["success"] and result["state"] == "verified"
-    delete.assert_called_once_with(delete_file=True,ids=["HASH123"])
+    delete.assert_called_once_with(delete_file=True,ids=["1111111111111111111111111111111111111111"])
 
 def test_delete_not_reissued_when_downloader_returns_false():
     host = _fixture()
@@ -172,10 +177,10 @@ def test_delete_not_reissued_when_downloader_returns_false():
     host._extract_tracker_text = lambda t: t.get("tracker", "")
     host._get_current_seeding = lambda logs: {"seeds":[{"title":"Old.Movie"}]}
     delete = Mock(return_value=False)
-    torrent = {"name":"Old.Movie","hash":"HASH123","tracker":"https://tracker.hhanclub.net/announce"}
+    torrent = {"name":"Old.Movie","hash":"1111111111111111111111111111111111111111","size":8*1073741824,"tracker":"https://tracker.hhanclub.net/announce"}
     host._get_manage_services = lambda: {"QB": SimpleNamespace(instance=SimpleNamespace(
         get_torrents=lambda: ([torrent],None),delete_torrents=delete))}
-    result = host._delete_rescue_exact("Old.Movie","QB","HASH123",True,host._delete_generation)
+    result = host._delete_rescue_exact("Old.Movie","QB","1111111111111111111111111111111111111111",True,host._delete_generation)
     assert result["state"] == "uncertain"
     delete.assert_called_once()
 
@@ -185,11 +190,11 @@ def test_reconfiguration_aborts_before_side_effect():
     host._extract_tracker_text = lambda t: t.get("tracker", "")
     host._get_current_seeding = lambda logs: {"seeds":[{"title":"Old.Movie"}]}
     delete = Mock(return_value=True)
-    torrent = {"name":"Old.Movie","hash":"HASH123","tracker":"https://tracker.hhanclub.net/announce"}
+    torrent = {"name":"Old.Movie","hash":"1111111111111111111111111111111111111111","size":8*1073741824,"tracker":"https://tracker.hhanclub.net/announce"}
     host._get_manage_services = lambda: {"QB": SimpleNamespace(instance=SimpleNamespace(
         get_torrents=lambda: ([torrent],None),delete_torrents=delete))}
     host._delete_generation = 2
-    result = host._delete_rescue_exact("Old.Movie","QB","HASH123",True,generation=1)
+    result = host._delete_rescue_exact("Old.Movie","QB","1111111111111111111111111111111111111111",True,generation=1)
     assert result["success"] is False
     delete.assert_not_called()
 
@@ -210,7 +215,7 @@ def test_custom_dialog_and_refresh_controls_without_native_alerts():
     assert "alert(" not in page and "confirm(" not in page
     assert "window.confirm" not in page
     assert "delete_rescue_status?request_id=" in page
-    assert 'request_id:id' in page
+    assert 'request_id:record.id' in page
     assert 'getElementById("hhConfirmDesc")' in page
     assert ".textContent=" in page
 
@@ -233,7 +238,7 @@ def test_readback_without_hash_is_uncertain_not_verified():
     host._extract_tracker_text = lambda t: t.get("tracker", "")
     host._get_current_seeding = lambda logs: {"seeds": [{"title": "Old.Movie"}]}
     deletion = Mock(return_value=True)
-    record = {"name": "Old.Movie", "hash": "HASH123",
+    record = {"name": "Old.Movie", "hash": "1111111111111111111111111111111111111111", "size": 8*1073741824,
               "tracker": "https://tracker.hhanclub.net/announce"}
     client = SimpleNamespace(
         get_torrents=lambda: (([{"name": "Other.Movie"}] if deletion.called
@@ -241,7 +246,7 @@ def test_readback_without_hash_is_uncertain_not_verified():
         delete_torrents=deletion,
     )
     host._get_manage_services = lambda: {"QB": SimpleNamespace(instance=client)}
-    result = host._delete_rescue_exact("Old.Movie", "QB", "HASH123", True)
+    result = host._delete_rescue_exact("Old.Movie", "QB", "1111111111111111111111111111111111111111", True)
     assert result["state"] == "uncertain"
     assert not result["success"]
     deletion.assert_called_once()

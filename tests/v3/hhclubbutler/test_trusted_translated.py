@@ -40,7 +40,7 @@ def test_strong_tracker_translated_name_and_size_allow_explicit_delete():
     assert rows[0]["hash"]=="a"*40
     assert rows[0]["match_status"]=="translated"
     assert rows[0]["trusted_tracker"]
-    assert "Tracker" in rows[0]["match_reason"]
+    assert "体积一致" in rows[0]["match_reason"]
     assert stats["deletable"]==1
 
 def test_translation_size_tolerance_is_not_one_point_five_percent():
@@ -79,7 +79,7 @@ def test_tracker_host_only_accepts_exact_hostname_not_domain_suffix():
 def test_untrusted_full_exact_match_is_not_changed_by_translated_policy():
     f=_functions()["associate_rescue_seeds"]
     rows,_=f([site()],[torrent(name=SITE,verified=False)])
-    assert rows[0]["match_status"]=="unverified"
+    assert rows[0]["match_status"]=="exact"
     assert not rows[0]["can_delete"]
 
 def test_ambiguity_keeps_translated_downloads_non_deletable():

@@ -78,6 +78,14 @@ def translated_release_key(value: Any) -> str | None:
     return normalized
 
 
+
+def release_name(value: Any) -> str:
+    """Strip only the already-validated independent Chinese title prefix."""
+    text = unicodedata.normalize("NFKC", str(value or "")).strip()
+    match = _TRANSLATED_NAME_RE.fullmatch(text)
+    return match.group("release").strip() if match and translated_release_key(text) else text
+
+
 def translated_size_matches(site: dict, torrent: dict) -> bool:
     """Both sizes must agree within one hundredth of a GiB.
 
@@ -177,7 +185,7 @@ def associate_rescue_seeds(
         label = str(raw.get("downloader") or "").strip()
         name_key = normalize_name(raw.get("name"))
         info_hash = str(raw.get("hash") or "").strip().lower()
-        key = (label.casefold(), info_hash, name_key)
+        key = (label, info_hash, name_key)
         if label and info_hash and name_key and key in seen_tasks:
             duplicates_ignored += 1
             continue
@@ -384,8 +392,8 @@ def associate_rescue_seeds(
             torrent = torrents[index]
             progress = torrent.get("progress")
             state = str(torrent.get("state") or "").strip().lower()
-            completed = (progress >= 0.999 if progress is not None
-                         else state in completed_states)
+            completed = bool(torrent.get("completed")) if "completed" in torrent else (
+                progress >= 1.0 if progress is not None else state in completed_states)
             confirmed_hh = bool(torrent.get("trusted_tracker"))
             task_hash = str(torrent.get("hash") or "").strip()
             task_name = str(torrent.get("name") or "")
@@ -396,14 +404,14 @@ def associate_rescue_seeds(
             strong_name = kind in {"exact", "translated"}
             can_remove = (
                 not unsafe_group and strong_name
-                and bool(task_hash and client)
+                and bool(client and re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", task_hash, re.I))
                 and (progress is not None or state in completed_states)
             )
             # In a cross-seed group deleting shared data can destroy files
             # used by the remaining swarms, so prohibit payload deletion.
             can_delete_files = (
                 can_remove and not is_cross_seed and len(group) == 1
-                and confirmed_hh
+                and confirmed_hh and translated_size_matches(site, torrent)
             )
             record = {
                 "downloader": client, "hash": task_hash,
@@ -412,6 +420,7 @@ def associate_rescue_seeds(
                 "match_type": kind, "trusted_tracker": confirmed_hh,
                 "completed": completed, "progress": progress,
                 "size_gb": torrent.get("size_gb"),
+                "added_timestamp": torrent.get("added_timestamp", 0),
                 "size_verified": translated_size_matches(site, torrent),
                 "can_remove": bool(can_remove),
                 "can_delete_files": bool(can_delete_files),

@@ -50,6 +50,6 @@ def test_invalid_tracker_is_optional_not_reported_as_hh():
     assert extract()(obj)==""
     src=(ROOT/"plugins.v3/hhclubbutler/__init__.py").read_text()
     assert "can_delete_group" in src
-    # No group delete path requires a trusted tracker field.
+    # Tracker restrictions apply only to automatic operations.
     block=src.split("    def _delete_rescue_group(")[1].split("    def _delete_rescue_exact(")[0]
-    assert "is_trusted_hh_tracker(" not in block
+    assert "if auto_mode:" in block

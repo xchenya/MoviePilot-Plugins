@@ -21,7 +21,7 @@ def _fetch_function():
     fake_time=SimpleNamespace(sleep=lambda seconds: None)
     globs={
         "time":fake_time,
-        "HHClubButler":SimpleNamespace(_norm_title=lambda name: name.casefold().replace(".","")),
+        "HHClubButler":SimpleNamespace(_norm_title=lambda name: name.casefold().replace(".",""), _safe_error=str),
         "logger":SimpleNamespace(info=Mock(),error=Mock(),warning=Mock()),
     }
     exec(compile(module,"<no-network-pagination>","exec"),globs)

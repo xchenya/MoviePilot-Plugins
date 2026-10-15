@@ -7,6 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+SUPPORT = __import__("runpy").run_path(str(Path(__file__).with_name("support.py")))
+
 ROOT=Path(__file__).resolve().parents[3]
 NAME="A Lifetime Love S01 2017 1080p WEB-DL H264 AAC-HHWEB"
 A="a"*40
@@ -22,6 +24,7 @@ def _method(name):
     import datetime,time,re
     scope={"associate_rescue_seeds":match["associate_rescue_seeds"],
            "normalize_name":match["normalize_name"],
+           "release_name":match["release_name"],
            "is_trusted_hh_tracker":match["is_trusted_hh_tracker"],
            "datetime":datetime.datetime,"time":time,"re":re,
            "hashlib":hashlib,
@@ -128,7 +131,7 @@ def test_actual_collector_includes_downloader_only_incomplete_even_with_empty_si
         _append_downloader_incomplete=append,
         _list_warning="",
     )
-    result=collect(fake)
+    result=collect(SUPPORT["enrich"](fake))
     assert len(result)==1
     assert result[0]["source"]=="downloader"
     assert result[0]["can_delete_group"]

@@ -15,6 +15,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+SUPPORT = __import__("runpy").run_path(str(Path(__file__).with_name("support.py")))
+
 ROOT = Path(__file__).resolve().parents[3]
 SOURCE = ROOT / "plugins.v3" / "hhclubbutler" / "__init__.py"
 
@@ -33,7 +35,7 @@ def _method(name: str):
                                                  type_ignores=[]))
     helpers = runpy.run_path(str(ROOT / "plugins.v3/hhclubbutler/matching.py"))
     associate = helpers["associate_rescue_seeds"]
-    namespace = {"time": time, "threading": threading, "datetime": datetime,
+    namespace = {"HHClubButler": SUPPORT["Subject"], "time": time, "threading": threading, "datetime": datetime,
                  "re": re, "associate_rescue_seeds": associate,
                  "is_trusted_hh_tracker": helpers["is_trusted_hh_tracker"],
                  "logger": SimpleNamespace(info=Mock(), warning=Mock(), error=Mock())}
@@ -51,7 +53,7 @@ def _fixture():
         _list_thread=None, _list_cache_ttl=180.0, _list_warning="",
     )
     fake._list_rescue_worker = lambda generation: _method("_list_rescue_worker")(fake, generation)
-    return fake
+    return SUPPORT["enrich"](fake)
 
 
 def test_first_read_returns_loading_without_blocking_and_coalesces_requests():
@@ -184,16 +186,16 @@ def _site_fixture():
         _get_progress_ratio=lambda torrent, dltype: 1.0,
         _extract_tracker_text=lambda torrent, dltype: "https://hhanclub.net/announce",
     )
-    return fake
+    return SUPPORT["enrich"](fake)
 
 
 def test_site_rows_survive_missing_or_ambiguous_downloader_associations():
     collect = _method("_collect_rescue_seeds")
     fake = _site_fixture()
     fake._get_manage_services = lambda: _fake_services({
-        "A": ([{"name": "Same.Title", "hash": "1", "size": 8*1073741824},
-               {"name": "Unique.Title", "hash": "3", "size": 9*1073741824}], False),
-        "B": ([{"name": "Same.Title", "hash": "2", "size": 8*1073741824}], False),
+        "A": ([{"name": "Same.Title", "hash": "1111111111111111111111111111111111111111", "size": 8*1073741824},
+               {"name": "Unique.Title", "hash": "3333333333333333333333333333333333333333", "size": 9*1073741824}], False),
+        "B": ([{"name": "Same.Title", "hash": "2222222222222222222222222222222222222222", "size": 8*1073741824}], False),
     })
     result = collect(fake)
     assert len(result) == 3
@@ -247,8 +249,8 @@ def test_market_metadata_marks_patch_release_unpublished():
     import json
     manifest = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))
     entry = manifest["HHClubButler"]
-    assert entry["version"] == "3.0.10"
+    assert entry["version"] == "3.0.11"
     assert entry["release"] is False
-    assert "3.0.10" in entry["history"]
+    assert "3.0.11" in entry["history"]
 
 

@@ -19,7 +19,7 @@ def _site(title, size=8.0, sid=1):
             "completed_at": "2026-10-13", "qualified": "未达标"}
 
 
-def _torrent(name, downloader="qBittorrent", size=8.0, hash_value="abc123",
+def _torrent(name, downloader="qBittorrent", size=8.0, hash_value="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
              site_tracker=True, progress=1.0):
     return {"name": name, "downloader": downloader, "size_gb": size,
             "hash": hash_value, "site_tracker": site_tracker,
@@ -45,7 +45,7 @@ def test_exact_punctuation_and_unicode_width_association_is_deletable():
     rows, stats = _match()([_site(title)], [_torrent(candidate)])
     assert stats["linked"] == 1 and stats["exact"] == 1
     assert rows[0]["downloader"] == "qBittorrent"
-    assert rows[0]["hash"] == "abc123"
+    assert rows[0]["hash"] == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     assert rows[0]["can_delete"] is True
     assert rows[0]["match_status"] == "exact"
 
@@ -82,8 +82,8 @@ def test_unknown_tracker_or_incomplete_torrent_is_not_deletable():
 def test_duplicate_exact_torrents_display_both_downloaders_but_block_deletion():
     title = "Example Drama S01 2025 1080p WEB-DL DDP5.1"
     rows, stats = _match()([_site(title)], [
-        _torrent(title, downloader="qBittorrent", hash_value="aaa"),
-        _torrent(title, downloader="Transmission", hash_value="bbb"),
+        _torrent(title, downloader="qBittorrent", hash_value="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        _torrent(title, downloader="Transmission", hash_value="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
     ])
     assert rows[0]["downloaders"] == ["Transmission", "qBittorrent"]
     assert "Transmission" in rows[0]["downloader"] and "qBittorrent" in rows[0]["downloader"]
@@ -117,7 +117,7 @@ def test_large_unmatched_site_list_remains_complete():
     originals = [_site("Rescue Movie %04d S01 2026 1080p WEB-DL" % i, sid=i)
                  for i in range(700)]
     others = [_torrent("Other Release %04d S01 2026 1080p WEB-DL" % i,
-                       hash_value=str(i)) for i in range(900)]
+                       hash_value=f"{i+1:040x}") for i in range(900)]
     started = time.monotonic()
     rows, stats = _match()(originals, others)
     assert len(rows) == len(originals)

@@ -15,6 +15,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+SUPPORT = __import__("runpy").run_path(str(Path(__file__).with_name("support.py")))
+
 ROOT=Path(__file__).resolve().parents[3]
 BASE=ROOT/"plugins.v3/hhclubbutler/__init__.py"
 HASH_A="a"*40
@@ -35,7 +37,7 @@ def subject():
     assert len(nodes)==len(names)
     klass=ast.ClassDef(name="Subject",bases=[],keywords=[],body=nodes,decorator_list=[])
     match=runpy.run_path(str(ROOT/"plugins.v3/hhclubbutler/matching.py"))
-    namespace={"re":re,"time":time,"threading":threading,
+    namespace={"HHClubButler": SUPPORT["Subject"], "re":re,"time":time,"threading":threading,
                "RescueGroupDeleteRequest":SimpleNamespace,
                "logger":SimpleNamespace(info=Mock(),warning=Mock(),error=Mock()),
                "normalize_name":match["normalize_name"],
@@ -53,6 +55,8 @@ class Client:
         self.instance=self
     def get_torrents(self):
         return list(self.torrents),False
+    def get_files(self, tid):
+        return [{"name": "release/payload.mkv"}]
     def delete_torrents(self,delete_file,ids):
         self.calls.append({"delete_file":delete_file,"ids":list(ids)})
         if self.accept:
@@ -62,7 +66,7 @@ class Client:
 
 def torrent(name,hash_value):
     return {"name":name,"hash":hash_value,
-            "size":round(41.34*1073741824),"progress":1.0}
+            "save_path":"/fixtures", "size":round(41.34*1073741824),"progress":1.0}
 
 def fixture(client_failure=None,fresh_targets=None):
     o=subject()()
@@ -88,7 +92,7 @@ def fixture(client_failure=None,fresh_targets=None):
          "can_delete_group":True,
          "candidates":[{"downloader":d,"hash":h} for d,h in targets]}
     ]
-    return o,services,expected
+    return SUPPORT["enrich"](o),services,expected
 
 def request(targets,request_id=REQUEST,confirm=True,seed_id=51999):
     return SimpleNamespace(

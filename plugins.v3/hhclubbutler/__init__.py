@@ -32,11 +32,15 @@ from app.sdk.events import eventmanager, Event
 from app.schemas.types import NotificationType
 from fastapi import Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
-from app.adapters.web.security.access import verify_resource_token
+from app.adapters.web.security.access import verify_resource_token, verify_token
 from .matching import (associate_rescue_seeds, normalize_name, translated_release_key,
-                       translated_size_matches, is_trusted_hh_tracker)
+                       translated_size_matches, is_trusted_hh_tracker, release_name)
 
 import requests
+
+def _require_bear_admin(identity=Depends(verify_token)) -> None:
+    if not getattr(identity, "super_user", False):
+        raise HTTPException(status_code=403, detail="管理员权限不足")
 
 def _require_resource_admin(request: Request, identity=Depends(verify_resource_token)) -> None:
     """V3 resource Cookie used by independently opened HTML pages.
@@ -120,6 +124,9 @@ class SettlementRecord(BaseModel):
 
 
 class SettlementData(BaseModel):
+    loading: bool = False
+    elapsed_seconds: int = 0
+    retry_after_seconds: int = 3
     labels: list[str] = Field(default_factory=list)
     bean: list[float | None] = Field(default_factory=list)
     pt: list[float | None] = Field(default_factory=list)
@@ -199,7 +206,7 @@ class HHClubButler(_PluginBase):
     plugin_name = "憨憨保种区管家"
     plugin_desc = "自动优选添加及换种工具\n保种管理器/Hosts加速"
     plugin_icon = "https://raw.githubusercontent.com/xchenya/MoviePilot-Plugins/main/plugins.v3/hhclubbutler/icon.png"
-    plugin_version = "3.0.10"
+    plugin_version = "3.0.11"
     plugin_author = "六个橙子"
     author_url = "https://github.com/SixOrg"
     plugin_config_prefix = "hhclubbutler_"
@@ -266,6 +273,12 @@ class HHClubButler(_PluginBase):
         self._delete_jobs = {}
         self._delete_active_id = None
         self._delete_generation = 0
+        self._delete_guard = {}
+        self._delete_resolved = []
+        self._delete_guard_loaded = False
+        self._stats_lock = threading.Lock()
+        self._stats_job_lock = threading.Lock()
+        self._stats_job = {"state": "idle"}
         self._overview_refresh_lock = threading.Lock()
         self._overview_launch_lock = threading.Lock()
         self._overview_manual_thread = None
@@ -274,6 +287,8 @@ class HHClubButler(_PluginBase):
     def init_plugin(self, config: dict = None):
         self.stop_service()
         self._stopped = False
+        self._last_overview = None
+        self._last_overview_ts = 0
         config = config or {}
         self._enabled = bool(config.get("enabled"))
         self._onlyonce = bool(config.get("onlyonce"))
@@ -375,6 +390,7 @@ class HHClubButler(_PluginBase):
         page_deps = [Depends(_require_resource_admin)]
         return [
             {"path": "/run", "endpoint": self.api_run, "methods": ["POST"],
+             "dependencies": [Depends(_require_bear_admin)],
              "auth": "bear", "summary": "立即运行优选", "response_model": ActionResult},
             {"path": "/result", "endpoint": self.api_result, "methods": ["GET"],
              "auth": "bear", "summary": "最近运行结果", "response_model": ResultData},
@@ -428,7 +444,7 @@ class HHClubButler(_PluginBase):
             for config in DownloaderHelper().get_configs().values():
                 downloaders.append({"title": config.name, "value": config.name})
         except Exception as e:
-            logger.warning(f"获取下载器列表失败：{e}")
+            logger.warning(f"获取下载器列表失败：{HHClubButler._safe_error(e)}")
         form = [
             {
                 'component': 'VForm',
@@ -576,7 +592,7 @@ class HHClubButler(_PluginBase):
                 f.write(content)
             return True
         except Exception as e:
-            logger.warning(f"Hosts 文件写入失败（权限不足或只读）：{e}")
+            logger.warning(f"Hosts 文件写入失败（权限不足或只读）：{HHClubButler._safe_error(e)}")
             return False
 
     @staticmethod
@@ -626,8 +642,8 @@ class HHClubButler(_PluginBase):
             else:
                 self._hosts_errors = "Hosts 写入失败（权限不足），请以管理员/root 权限运行或手动配置"
         except Exception as e:
-            logger.error(f"Hosts 加速应用异常：{e}")
-            self._hosts_errors = f"Hosts 加速应用异常：{e}"
+            logger.error(f"Hosts 加速应用异常：{HHClubButler._safe_error(e)}")
+            self._hosts_errors = f"Hosts 加速应用异常：{HHClubButler._safe_error(e)}"
 
     def _overview_form_cards(self) -> dict:
         if not self._last_overview or not self._last_overview.get("ok"):
@@ -776,109 +792,13 @@ class HHClubButler(_PluginBase):
             return f"上次更新 {ago}"
         return f"每 {hours:g} 小时自动刷新一次"
 
-    def _build_management_page(self) -> dict:
-        """仿QB风格保种管理页"""
-        try:
-            cur = self._get_current_seeding([])
-        except Exception as e:
-            cur = {"error": str(e), "seeds": []}
-        seeds = cur.get("seeds", []) or []
-        seeds = sorted(seeds, key=lambda s: (tier_of(s.get("seeders", 1)), -s.get("size", 0)))
-
-        rows = []
-        for i, s in enumerate(seeds, 1):
-            title = (s.get("title") or "").strip()
-            size = s.get("size", 0.0) or 0.0
-            seeders = s.get("seeders", 0) or 0
-            t = tier_of(seeders)
-            badge = TIER_BADGE.get(t, '<span style="display:inline-block;padding:1px 8px;border-radius:10px;background:#999;color:#fff;font-size:11px;">&gt;5人</span>')
-            safe_title = title.replace("\\", "\\\\").replace("'", "\\'")
-            rows.append({
-                "component": "VRow",
-                "props": {"class": "py-1", "style": "border-bottom:1px solid rgba(var(--v-theme-on-surface),.06);"},
-                "content": [
-                    {"component": "VCol", "props": {"cols": 1},
-                     "content": [{"component": "div",
-                                   "props": {"class": "text-caption",
-                                             "style": "text-align:center;color:rgba(var(--v-theme-on-surface),.5);"},
-                                   "text": str(i)}]},
-                    {"component": "VCol", "props": {"cols": 6},
-                     "content": [{"component": "div",
-                                   "props": {"style": "font-size:12px;word-break:break-all;line-height:1.4;",
-                                             "title": title},
-                                   "text": title}]},
-                    {"component": "VCol", "props": {"cols": 2},
-                     "content": [{"component": "div",
-                                   "props": {"class": "text-caption", "style": "text-align:right;"},
-                                   "text": f"{size:.2f} GB"}]},
-                    {"component": "VCol", "props": {"cols": 2},
-                     "content": [{"component": "div", "props": {"style": "text-align:center;"},
-                                   "html": badge}]},
-                    {"component": "VCol", "props": {"cols": 1},
-                     "content": [{"component": "VBtn",
-                                   "props": {"size": "x-small", "color": "error", "variant": "tonal",
-                                             "icon": "mdi-delete-outline"},
-                                   "events": {"click": {
-                                       "api": "plugin/HHClubButler/delete_rescue_seed",
-                                       "method": "post",
-                                       "params": {"title": title}
-                                   }}}]},
-                ]
-            })
-
-        header = {
-            "component": "VRow",
-            "props": {"class": "py-1",
-                      "style": "border-bottom:1px solid rgba(var(--v-theme-on-surface),.12);font-weight:600;font-size:11px;color:rgba(var(--v-theme-on-surface),.6);"},
-            "content": [
-                {"component": "VCol", "props": {"cols": 1}, "content": [{"component": "div", "text": "#"}]},
-                {"component": "VCol", "props": {"cols": 6}, "content": [{"component": "div", "text": "种子名称"}]},
-                {"component": "VCol", "props": {"cols": 2},
-                 "content": [{"component": "div", "props": {"style": "text-align:right;"}, "text": "大小"}]},
-                {"component": "VCol", "props": {"cols": 2},
-                 "content": [{"component": "div", "props": {"style": "text-align:center;"}, "text": "档位"}]},
-                {"component": "VCol", "props": {"cols": 1},
-                 "content": [{"component": "div", "props": {"style": "text-align:center;"}, "text": "删除"}]},
-            ]
-        }
-
-        total_gb = sum(s.get("size", 0.0) for s in seeds)
-        summary_html = (
-            f'<div style="padding:6px 4px;font-size:12px;color:rgba(var(--v-theme-on-surface),.6);">'
-            f'共 <b style="color:rgb(var(--v-theme-on-surface));">{len(seeds)}</b> 个种子 · '
-            f'总体积 <b style="color:rgb(var(--v-theme-on-surface));">{total_gb:.1f} GB</b> · '
-            f'点击删除按钮将同时删除下载器任务和文件</div>'
-        )
-
-        return {
-            "component": "VCard",
-            "props": {"flat": True},
-            "content": [
-                {"component": "VCardTitle", "props": {"class": "text-subtitle-1"},
-                 "content": [{"component": "div", "text": "📋 保种管理（仿QB面板）"}]},
-                {"component": "VCardText", "content": [
-                    {"component": "div", "html": summary_html},
-                    header,
-                    *rows,
-                    {"component": "div", "props": {"style": "margin-top:8px;"},
-                     "content": [{"component": "VBtn",
-                                   "props": {"size": "small", "color": "primary", "variant": "tonal",
-                                             "prepend-icon": "mdi-refresh"},
-                                   "events": {"click": {
-                                       "api": "plugin/HHClubButler/refresh_overview",
-                                       "method": "post"
-                                   }},
-                                   "content": [{"component": "div", "text": "刷新列表"}]}]}
-                ]}
-            ]
-        }
 
     def get_page(self) -> List[dict]:
         overview = None
         try:
             overview = self._get_overview_cached_or_refresh()
         except Exception as e:
-            logger.error(f"获取憨憨保种区管家概况失败：{e}")
+            logger.error(f"获取憨憨保种区管家概况失败：{HHClubButler._safe_error(e)}")
         panel_link = (
             '<div style="padding:10px 0;display:flex;align-items:center;gap:10px;">'
             '<a href="/api/v1/plugin/HHClubButler/monthly_stats" target="_blank" rel="noopener noreferrer" '
@@ -925,7 +845,7 @@ class HHClubButler(_PluginBase):
         try:
             overview = self._get_overview_cached_or_refresh()
         except Exception as e:
-            logger.error(f"仪表盘概况获取失败：{e}")
+            logger.error(f"仪表盘概况获取失败：{HHClubButler._safe_error(e)}")
             overview = {"count": 0, "total_gb": 0.0,
                         "dist": {"0-1人": {"count": 0, "gb": 0.0},
                                  "2-3人": {"count": 0, "gb": 0.0},
@@ -947,6 +867,8 @@ class HHClubButler(_PluginBase):
             # Reconfiguration invalidates an in-flight job's permission to send
             # a deletion after a potentially long site lookup.
             self._delete_generation += 1
+        with self._stats_job_lock:
+            self._stats_job = {"state": "idle"}
         with self._list_lock:
             # A prior worker may still be waiting on a remote site: invalidate
             # its generation so it cannot overwrite cache after reconfiguration.
@@ -964,14 +886,14 @@ class HHClubButler(_PluginBase):
                     self._scheduler.shutdown()
                 self._scheduler = None
         except Exception as e:
-            logger.error(f"停止插件服务失败：{e}")
+            logger.error(f"停止插件服务失败：{HHClubButler._safe_error(e)}")
         try:
             if self._overview_stop:
                 self._overview_stop.set()
             if self._overview_thread and self._overview_thread.is_alive():
                 self._overview_thread.join(timeout=3)
         except Exception as e:
-            logger.error(f"停止概况刷新线程失败：{e}")
+            logger.error(f"停止概况刷新线程失败：{HHClubButler._safe_error(e)}")
         finally:
             self._overview_stop = None
             self._overview_thread = None
@@ -985,7 +907,7 @@ class HHClubButler(_PluginBase):
                 daemon=True, name="HHClubButler-OverviewRefresh")
             self._overview_thread.start()
         except Exception as e:
-            logger.error(f"启动概况刷新线程失败：{e}")
+            logger.error(f"启动概况刷新线程失败：{HHClubButler._safe_error(e)}")
 
     def _overview_loop(self, stop_event: threading.Event):
         # Use the captured event, not the mutable self._overview_stop.
@@ -995,7 +917,7 @@ class HHClubButler(_PluginBase):
                 try:
                     self._ensure_monthly_stats()
                 except Exception as e:
-                    logger.error(f"结算日志重试检查失败：{e}")
+                    logger.error(f"结算日志重试检查失败：{HHClubButler._safe_error(e)}")
                 if stop_event.is_set():
                     return
                 hours = self._overview_hours
@@ -1009,7 +931,7 @@ class HHClubButler(_PluginBase):
                 else:
                     stop_event.wait(300)
             except Exception as e:
-                logger.error(f"概况刷新线程异常：{e}")
+                logger.error(f"概况刷新线程异常：{HHClubButler._safe_error(e)}")
                 stop_event.wait(300)
 
     def _refresh_overview(self, manual: bool = False):
@@ -1021,13 +943,14 @@ class HHClubButler(_PluginBase):
             self._overview_refresh_lock.release()
 
     def _refresh_overview_impl(self, manual: bool = False):
+        generation = self._delete_generation
         try:
             # 顺带刷新结算统计表数据：当日已成功则直接命中本地缓存，未拉取过则翻页拉取一次并落盘；
             # 与完成页刷新互相隔离，失败不影响概况
             try:
                 self._ensure_monthly_stats()
             except Exception as e:
-                logger.error(f"结算统计表数据顺带刷新失败：{e}")
+                logger.error(f"结算统计表数据顺带刷新失败：{HHClubButler._safe_error(e)}")
             cur = self._get_current_seeding([])
             if cur.get("error"):
                 logger.warning(f"憨憨保种区管家概况刷新失败（{cur['error']}），保留上次数据")
@@ -1035,7 +958,10 @@ class HHClubButler(_PluginBase):
             if cur.get("degraded"):
                 logger.warning(f"憨憨保种区管家概况刷新失败（{cur['degraded']}），保留上次数据")
                 return False
-            self._last_overview = self._build_overview_from_current(cur)
+            overview = self._build_overview_from_current(cur)
+            if self._stopped or generation != self._delete_generation:
+                return False
+            self._last_overview = overview
             self._last_overview_ts = time.time()
             logger.info(f"憨憨保种区管家概况已{'手动' if manual else '自动'}刷新："
                         f"{cur.get('count', 0)} 个 / {cur.get('total_gb', 0.0):.1f} GB"
@@ -1043,7 +969,7 @@ class HHClubButler(_PluginBase):
                         f" / 上次积分 {self._last_overview.get('last_pt', '—')}")
             return True
         except Exception as e:
-            logger.error(f"概况{'手动' if manual else '自动'}刷新失败：{e}")
+            logger.error(f"概况{'手动' if manual else '自动'}刷新失败：{HHClubButler._safe_error(e)}")
             return False
 
     def _get_overview_cached_or_refresh(self) -> dict:
@@ -1086,7 +1012,7 @@ class HHClubButler(_PluginBase):
             torrents = self._fetch_all_downloader_torrents()
             return torrents or None
         except Exception as e:
-            logger.warning(f"预取下载器种子失败：{e}")
+            logger.warning(f"预取下载器种子失败：{HHClubButler._safe_error(e)}")
             return None
 
     def _collect_rescue_seeds(self, strict_downloaders: bool = False) -> list[dict]:
@@ -1103,6 +1029,7 @@ class HHClubButler(_PluginBase):
         logger.info(f"憨憨保种管理器：站点全部可保种记录 {len(completed)} 条，"
                     f"用时 {time.monotonic()-started:.1f}s")
         downloader_rows = []
+        read_clients, read_hashes = set(), []
         warnings = []
         services = self._get_manage_services()
         requested = set(self._downloaders or [])
@@ -1128,6 +1055,7 @@ class HHClubButler(_PluginBase):
                 except Exception:
                     dl_type = ""
                 tracker_fields_seen, trusted_tracker_count = 0, 0
+                complete_hashes = True
                 for torrent in torrents:
                     def g(*keys):
                         for key in keys:
@@ -1139,6 +1067,13 @@ class HHClubButler(_PluginBase):
                             except Exception:
                                 pass
                         return None
+                    infohash = str(g("hash", "hashString") or "").lower()
+                    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", infohash, re.I):
+                        complete_hashes = False
+                        if strict_downloaders:
+                            raise ValueError("下载器任务清单缺少 Hash")
+                    else:
+                        read_hashes.append({"downloader": name, "hash": infohash})
                     label = str(g("name") or "")
                     if not label:
                         continue
@@ -1158,15 +1093,20 @@ class HHClubButler(_PluginBase):
                     )
                     parsed_domain = re.search(r"https?://([A-Za-z0-9.:-]+)", tracker)
                     try:
-                        added = g("added_on", "date_added", "dateAdded")
+                        added = g("added_on", "added_date", "date_added", "dateAdded")
+                        if hasattr(added, "timestamp"):
+                            added = added.timestamp()
+                        added_stamp = float(added or 0)
                         added_at = (datetime.fromtimestamp(int(added)).strftime("%Y-%m-%d")
                                     if added and int(added) > 1000000000 else "")
                     except (TypeError, ValueError, OverflowError, OSError):
-                        added_at = ""
+                        added_at, added_stamp = "", 0
                     downloader_rows.append({
                         "name": label, "downloader": name,
                         "hash": str(g("hash", "hashString") or ""),
                         "progress": progress, "size_gb": size_gb,
+                        "completed": self._is_completed(torrent, dl_type),
+                        "added_timestamp": added_stamp,
                         "state": str(g("state", "status") or ""),
                         "site_tracker": site_tracker,
                         "trusted_tracker": trusted_tracker,
@@ -1180,14 +1120,17 @@ class HHClubButler(_PluginBase):
                         "tracker": parsed_domain.group(1) if parsed_domain else "",
                         "added": added_at,
                     })
+                if complete_hashes:
+                    read_clients.add(name)
                 logger.info(f"憨憨保种管理器：下载器 {name} 种子 {len(torrents)} 条，"
                             f"Tracker 字段可读 {tracker_fields_seen} 条 / "
                             f"本站主机可识别 {trusted_tracker_count} 条（仅作诊断，不影响人工删除）")
             except Exception as e:
-                logger.warning(f"憨憨保种管理器：下载器 {name} 数据解析失败：{e}")
+                logger.warning(f"憨憨保种管理器：下载器 {name} 数据解析失败：{HHClubButler._safe_error(e)}")
                 if strict_downloaders:
                     raise RuntimeError(f"下载器 {name} 数据不完整，拒绝删除") from e
                 warnings.append(f"{name} 数据解析失败")
+        self._reconcile_delete_guard(read_hashes, read_clients)
         rows, stats = associate_rescue_seeds(completed, downloader_rows)
         rows = self._append_downloader_incomplete(rows, downloader_rows)
         extra = sum(1 for row in rows if row.get("source") == "downloader")
@@ -1240,7 +1183,7 @@ class HHClubButler(_PluginBase):
                 continue
             if size <= 0 or not 0 <= progress <= 1:
                 continue
-            signature = (normalize_name(name), round(size, 2))
+            signature = (normalize_name(release_name(name)), round(size, 2))
             if not signature[0]:
                 continue
             group = groups.setdefault(signature, [])
@@ -1253,7 +1196,7 @@ class HHClubButler(_PluginBase):
             # Group all exact same-release hashes when at least one has not
             # finished. Other completed siblings are included in the manifest
             # so the user's "remove all cross-seeds" choice remains complete.
-            if not any(float(task["progress"]) < 0.999 for task in candidates):
+            if not any(float(task["progress"]) < 1.0 for task in candidates):
                 continue
             # Stable negative JS-safe integer; page fetches can be repeated
             # without reassigning IDs during the same download.
@@ -1261,7 +1204,7 @@ class HHClubButler(_PluginBase):
             synthetic = -int.from_bytes(
                 hashlib.sha256(fingerprint).digest()[:6], "big") - 1
             source = {
-                "title": str(candidates[0]["name"]),
+                "title": release_name(candidates[0]["name"]),
                 "size": size,
                 "seed_id": synthetic,
                 "seeders": -1,
@@ -1289,7 +1232,7 @@ class HHClubButler(_PluginBase):
         try:
             seeds = self._collect_rescue_seeds()
         except Exception as e:
-            logger.error(f"憨憨保种管理器后台读取失败，耗时 {time.monotonic() - started:.1f}s：{e}")
+            logger.error(f"憨憨保种管理器后台读取失败，耗时 {time.monotonic() - started:.1f}s：{HHClubButler._safe_error(e)}")
             with self._list_lock:
                 if generation != self._list_generation or self._stopped:
                     return
@@ -1338,7 +1281,7 @@ class HHClubButler(_PluginBase):
             try:
                 thread.start()
             except Exception as e:
-                logger.error(f"启动保种列表后台任务失败：{e}")
+                logger.error(f"启动保种列表后台任务失败：{HHClubButler._safe_error(e)}")
                 self._list_state = "error"
                 self._list_error = "后台任务启动失败，请检查插件日志"
                 self._list_finished_at = time.time()
@@ -1859,7 +1802,7 @@ if(++missing<3){await new Promise(function(r){setTimeout(r,2000)});continue;}
 return {status:"unknown",message:payload.message||"未找到删除任务"};
 }
 var job=payload.data||{},state=job.status||"unknown";
-if(state==="verified"||state==="failed"||state==="uncertain")return job;
+if(state==="verified"||state==="failed"||state==="uncertain"||state==="resolved")return job;
 if(state!=="running"&&state!=="queued")return {status:"unknown",message:"未知任务状态"};
 errors=0;missing=0;
 showToast("辅种删除执行中（"+Math.floor(job.elapsed_seconds||0)+" 秒）"+
@@ -1896,6 +1839,10 @@ doSort();buildDlList();render();
 }
 async function followDeletion(record,reload){
 var result=await pollDeleteStatus(record.id);
+if(result.status==="resolved"){
+clearPending();showToast(result.message||"旧指令已核对，请刷新剩余任务，磁盘状态需另行确认","warn",12000);
+load(true);return "resolved";
+}
 if(result.status==="verified"){
 forgetVerifiedItem(record.item);clearPending();
 showToast("下载器已确认移除全部 "+(result.removed_count||0)+
@@ -1910,7 +1857,7 @@ showToast("删除前核验失败："+(result.message||"请检查插件日志")+
 "\n未自动重新提交。","bad",12000);
 return "failed";
 }
-clearPending();
+savePending(record);
 showToast("部分完成或状态未知："+(result.message||"需人工核对")+
 "\n已确认任务数："+(result.removed_count||0)+
 "/"+(result.total_count||record.item.targets.length)+
@@ -2031,9 +1978,9 @@ loadColCfg();
 var THEME_KEY="hhclubbutler_theme_v1";
 function applyTheme(t){document.body.setAttribute("data-theme",t);try{localStorage.setItem(THEME_KEY,t)}catch(e){}}
 try{var lt=localStorage.getItem(THEME_KEY);if(lt)applyTheme(lt);else applyTheme("dark");}catch(e){applyTheme("dark");}
-var sel=document.getElementById("themeSel");
-sel.value=document.body.getAttribute("data-theme")||"dark";
-sel.onchange=function(){applyTheme(this.value)};
+var themeSelect=document.getElementById("themeSel");
+themeSelect.value=document.body.getAttribute("data-theme")||"dark";
+themeSelect.onchange=function(){applyTheme(this.value)};
 document.getElementById("btnExit").onclick=function(){try{window.close()}catch(e){}setTimeout(function(){if(!window.closed)showToast("浏览器未能自动关闭窗口，请手动关闭本标签页。","info")},150)};
 buildHead();load(false);resumePendingDelete();
 </script></body></html>"""
@@ -2066,6 +2013,8 @@ buildHead();load(false);resumePendingDelete();
         """Quick idempotent admission. Network requests happen in one worker."""
         if not confirm or not all((title, downloader, torrent_hash)):
             return {"success": False, "message": "缺少删除确认或种子标识"}
+        if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", torrent_hash, re.I):
+            return {"success": False, "message": "种子 Hash 格式无效"}
         if not re.fullmatch(r"[A-Za-z0-9_-]{12,80}", request_id or ""):
             return {"success": False, "message": "删除请求标识不合法"}
         if not self._enabled or self._stopped:
@@ -2110,7 +2059,7 @@ buildHead();load(false);resumePendingDelete();
             try:
                 worker.start()
             except Exception as error:
-                logger.error(f"后台删除任务启动失败：{error}")
+                logger.error(f"后台删除任务启动失败：{HHClubButler._safe_error(error)}")
                 self._delete_jobs.pop(request_id, None)
                 self._delete_active_id = None
                 return {"success": False, "message": "无法启动后台删除任务，请检查插件日志"}
@@ -2131,9 +2080,9 @@ buildHead();load(false);resumePendingDelete();
             try:
                 result = self._delete_rescue_exact(
                     *target, confirm=True, generation=generation,
-                    delete_file=job["delete_file"])
+                    delete_file=job["delete_file"], request_id=request_id)
             except Exception as error:
-                logger.error(f"删除后台任务出现未知异常：{error}")
+                logger.error(f"删除后台任务出现未知异常：{HHClubButler._safe_error(error)}")
                 # Do not claim a safe retry when an exception may happen
                 # after a downloader has already accepted deletion.
                 result = {"success": False, "state": "uncertain",
@@ -2149,6 +2098,7 @@ buildHead();load(false);resumePendingDelete();
             job = self._delete_jobs.get(request_id)
             if job:
                 job["status"] = status
+                job["removed_count"] = 1 if status == "verified" else 0
                 job["message"] = str(result.get("message") or "")
                 job["finished_at"] = time.time()
             if self._delete_active_id == request_id:
@@ -2160,6 +2110,18 @@ buildHead();load(false);resumePendingDelete();
             return {"success": False, "message": "删除任务标识不合法"}
         with self._delete_lock:
             job = self._delete_jobs.get(request_id)
+            if job is None or job.get("status") == "uncertain":
+                try:
+                    self._load_delete_guard()
+                    if request_id in self._delete_resolved:
+                        return {"success": True, "message": "旧指令状态已核对，请刷新核对剩余任务",
+                                "data": {"request_id": request_id, "status": "resolved", "title": "",
+                                         "message": "已发送指令的 Hash 已消失；未自动执行剩余目标，磁盘状态需另行核对"}}
+                    if job is None and request_id in self._delete_guard.values():
+                        return {"success": True, "data": {"request_id": request_id, "status": "uncertain",
+                                "title": "", "message": "重启前的删除尚待核对，保护已保留，不会重发"}}
+                except Exception:
+                    return {"success": False, "message": "无法读取持久化删除保护，拒绝恢复写操作"}
             if job is None:
                 return {"success": False, "message": "未找到删除任务；状态未知，请刷新列表核对，勿重复提交"}
             return {"success": True, "message": job.get("message", ""),
@@ -2230,7 +2192,7 @@ buildHead();load(false);resumePendingDelete();
                     daemon=True, name="HHClubButler-GroupRemove",
                 ).start()
             except Exception as e:
-                logger.error(f"辅种后台任务启动失败：{e}")
+                logger.error(f"辅种后台任务启动失败：{HHClubButler._safe_error(e)}")
                 self._delete_jobs.pop(request_id, None)
                 self._delete_active_id = None
                 return {"success": False, "message": "无法启动后台删除，请检查插件日志"}
@@ -2252,7 +2214,7 @@ buildHead();load(false);resumePendingDelete();
                     seed_id=seed_id, title=title,
                     targets=manifest, generation=generation, request_id=request_id)
             except Exception as e:
-                logger.error(f"辅种删除后台执行异常：{e}")
+                logger.error(f"辅种删除后台执行异常：{HHClubButler._safe_error(e)}")
                 outcome = {"state": "uncertain",
                            "message": "删除状态不确定，不会自动重试，请查看下载器"}
             finally:
@@ -2271,168 +2233,275 @@ buildHead();load(false);resumePendingDelete();
             self._last_overview = None
             self._last_overview_ts = 0.0
 
-    def _delete_rescue_group(self, seed_id: int, title: str, targets: tuple,
-                             generation: int, request_id: str = "") -> dict:
-        """Delete the *confirmed entire* hash manifest including payloads.
+    @staticmethod
+    def _torrent_field(t, *keys):
+        for key in keys:
+            try:
+                value = t.get(key) if isinstance(t, dict) else getattr(t, key, None)
+                if value is not None:
+                    return value
+            except Exception:
+                continue
+        return None
 
-        This is not atomic across clients. Never repeat a command once sent;
-        report partial/uncertain outcomes instead. Tracker details are only
-        for diagnostics, not a blocking prerequisite.
-        """
-        if not self._enabled or self._stopped or generation != self._delete_generation:
-            return {"state": "failed", "removed_count": 0,
-                    "message": "插件配置已变化，未开始删除"}
-        if not 1 <= len(targets) <= 200:
-            return {"state": "failed", "removed_count": 0,
-                    "message": "辅种任务数量不符合安全上限"}
-        removed_count = 0
+    def _data_paths(self, service, torrent, *, files=True):
+        import posixpath
+        import ntpath
+        get = lambda *keys: self._torrent_field(torrent, *keys)
+        base = str(get("save_path", "download_dir", "downloadDir") or "")
+        pathmod = ntpath if "\\" in base or re.match(r"^[A-Za-z]:", base) else posixpath
+        def canonical(value):
+            return pathmod.normcase(pathmod.normpath(value)).replace("\\", "/")
+        content = str(get("content_path") or "")
+        if not files and content and pathmod.isabs(content):
+            return {canonical(content)}
+        if not base or not pathmod.isabs(base):
+            raise ValueError("无法确认下载数据的绝对路径，拒绝删除文件")
+        getter = getattr(service.instance, "get_files", None)
+        infohash = str(get("hash", "hashString") or "")
+        entries = getter(infohash) if callable(getter) else None
+        if not entries:
+            raise ValueError("无法读取下载器文件清单，拒绝删除文件")
+        paths = set()
+        for entry in entries:
+            name = self._torrent_field(entry, "name")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("下载器文件清单缺少完整名称")
+            paths.add(canonical(pathmod.join(base, name)))
+        return paths
+
+    @staticmethod
+    def _paths_overlap(first, second):
+        return any(a == b or a.startswith(b.rstrip("/") + "/") or b.startswith(a.rstrip("/") + "/")
+                   for a in first for b in second)
+
+    def _validate_delete_files(self, services, snapshots, targets):
+        wanted = set(targets)
+        selected = set()
+        for client, remote in snapshots.items():
+            for torrent in remote:
+                infohash = str(self._torrent_field(torrent, "hash", "hashString") or "").lower()
+                if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", infohash, re.I):
+                    raise ValueError("下载器任务缺少 Hash，无法检查共享数据")
+                if (client, infohash) in wanted:
+                    selected.update(self._data_paths(services[client], torrent))
+        if not selected:
+            raise ValueError("没有可核实的目标文件清单")
+        for client, remote in snapshots.items():
+            for torrent in remote:
+                infohash = str(self._torrent_field(torrent, "hash", "hashString") or "").lower()
+                if (client, infohash) in wanted:
+                    continue
+                content = self._torrent_field(torrent, "content_path")
+                base = str(self._torrent_field(torrent, "save_path", "download_dir", "downloadDir") or "")
+                # qB content_path is authoritative; TR needs files when its directory overlaps.
+                import ntpath
+                import posixpath
+                pathmod = ntpath if "\\" in base or re.match(r"^[A-Za-z]:", base) else posixpath
+                if not content:
+                    if not base or not pathmod.isabs(base):
+                        raise ValueError("非目标任务缺少绝对路径，无法排除共享数据")
+                    normalized_base = pathmod.normcase(pathmod.normpath(base)).replace("\\", "/")
+                    if not self._paths_overlap(selected, {normalized_base}):
+                        continue
+                paths = self._data_paths(services[client], torrent, files=False)
+                if self._paths_overlap(selected, paths):
+                    raise ValueError(f"下载器 {client} 存在非目标任务共享数据，拒绝删除文件")
+
+    def _load_delete_guard(self):
+        if self._delete_guard_loaded:
+            return
+        path = self.get_data_path() / "pending_deletions.json"
+        if path.exists():
+            value = json.loads(path.read_text(encoding="utf-8"))
+            pending = value.get("pending") if isinstance(value, dict) else None
+            resolved = value.get("resolved") if isinstance(value, dict) else None
+            if (not isinstance(pending, dict) or not isinstance(resolved, list)
+                    or any(not isinstance(k, str) or not isinstance(v, str) for k, v in pending.items())
+                    or any(not isinstance(v, str) for v in resolved)):
+                raise ValueError("删除保护记录损坏，拒绝新的删除")
+            self._delete_guard = pending
+            self._delete_resolved = resolved[-100:]
+        self._delete_guard_loaded = True
+
+    def _save_delete_guard(self):
+        path = self.get_data_path() / "pending_deletions.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump({"pending": self._delete_guard, "resolved": self._delete_resolved}, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+
+    def _guard_deletion(self, targets, request_id):
+        with self._delete_lock:
+            self._load_delete_guard()
+            keys = [client + "\0" + infohash.lower() for client, infohash in targets]
+            if any(key in self._delete_guard for key in keys):
+                raise ValueError("同一 Hash 的上次删除结果仍不确定，仅允许刷新核对，禁止重发")
+            before = dict(self._delete_guard)
+            old_resolved = list(self._delete_resolved)
+            self._delete_resolved = [value for value in self._delete_resolved if value != request_id]
+            self._delete_guard.update({key: request_id for key in keys})
+            try:
+                self._save_delete_guard()
+            except Exception:
+                self._delete_guard = before
+                self._delete_resolved = old_resolved
+                raise
+
+    def _cancel_delete_reservation(self, targets, request_id):
+        with self._delete_lock:
+            for client, infohash in targets:
+                key = client + "\0" + infohash.lower()
+                if self._delete_guard.get(key) == request_id:
+                    self._delete_guard.pop(key)
+            self._save_delete_guard()
+
+    def _reconcile_delete_guard(self, rows, read_clients):
+        with self._delete_lock:
+            self._load_delete_guard()
+            visible = {str(r.get("downloader")) + "\0" + str(r.get("hash") or "").lower() for r in rows}
+            expired = [key for key in self._delete_guard if key.split("\0", 1)[0] in read_clients and key not in visible]
+            if expired:
+                before = dict(self._delete_guard)
+                old_resolved = list(self._delete_resolved)
+                requests = {self._delete_guard[key] for key in expired}
+                for key in expired:
+                    self._delete_guard.pop(key, None)
+                for request_id in requests - set(self._delete_guard.values()):
+                    if request_id not in self._delete_resolved:
+                        self._delete_resolved.append(request_id)
+                self._delete_resolved = self._delete_resolved[-100:]
+                try:
+                    self._save_delete_guard()
+                except Exception:
+                    self._delete_guard = before
+                    self._delete_resolved = old_resolved
+                    raise
+
+    def _delete_rescue_group(self, seed_id: int, title: str, targets: tuple,
+                             generation: int, request_id: str = "", auto_mode: str = "") -> dict:
+        if not self._operation_allowed(generation) or not 1 <= len(targets) <= 200:
+            return {"state": "failed", "removed_count": 0, "message": "插件配置已变化或任务清单无效，未执行删除"}
+        if (len(set(targets)) != len(targets) or any(client not in self._downloaders
+                or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value, re.I) for client, value in targets)):
+            return {"state": "failed", "removed_count": 0, "message": "下载器或 Hash 清单无效，未执行删除"}
+        removed_count, dispatched = 0, False
+        def outcome(state, message):
+            return {"state": state, "removed_count": removed_count, "message": message}
         try:
-            # Stage 1: fresh site eligibility + every managed downloader.
             rows = self._collect_rescue_seeds(strict_downloaders=True)
-            eligible = [
-                row for row in rows
-                if str(row.get("seed_id")) == str(seed_id)
-                and normalize_name(row.get("title")) == normalize_name(title)
-            ]
+            eligible = [row for row in rows if str(row.get("seed_id")) == str(seed_id)
+                        and normalize_name(row.get("title")) == normalize_name(title)]
             if len(eligible) != 1:
-                return {"state": "failed", "removed_count": 0,
-                        "message": "站点记录发生变化，删除已取消"}
+                return outcome("failed", "站点记录发生变化，删除已取消")
             row = eligible[0]
-            is_downloader_only = seed_id < 0
-            if is_downloader_only != (row.get("source") == "downloader"):
-                return {"state": "failed", "removed_count": 0,
-                        "message": "下载器未完成任务与站点记录来源不一致，拒绝操作"}
-            if not row.get("can_delete_group"):
-                return {"state": "failed", "removed_count": 0,
-                        "message": "存在名称近似、大小不一致或缺少 Hash，无法核验整组删除"}
-            current_manifest = tuple(sorted(
-                (str(c.get("downloader") or ""),
-                 str(c.get("hash") or "").lower())
-                for c in row.get("candidates", [])
-            ))
-            if current_manifest != tuple(targets):
-                return {"state": "failed", "removed_count": 0,
-                        "message": "辅种 Hash 清单已变化，请刷新页面重新确认"}
+            if (seed_id < 0) != (row.get("source") == "downloader") or not row.get("can_delete_group"):
+                return outcome("failed", "记录来源或名称/预计大小/Hash 无法完整核实，拒绝删除")
+            manifest = tuple(sorted((str(c.get("downloader") or ""), str(c.get("hash") or "").lower())
+                                    for c in row.get("candidates", [])))
+            if manifest != tuple(targets):
+                return outcome("failed", "辅种 Hash 清单已变化，请刷新重新确认")
             services = self._get_manage_services()
             grouped = {}
-            for downloader, infohash in targets:
-                grouped.setdefault(downloader, []).append(infohash)
-            if any(name not in services for name in grouped):
-                return {"state": "failed", "removed_count": 0,
-                        "message": "管理下载器不可用，未执行删除"}
-
-            # Stage 2: read the current torrent object again and verify that
-            # each selected exact hash still denotes the same complete release.
-            # Tracker host is optional; normalized release identity + size,
-            # which the user can independently inspect, are mandatory.
-            for name, hashes in grouped.items():
-                remote, err = services[name].instance.get_torrents()
-                if err or remote is None:
-                    return {"state": "failed", "removed_count": 0,
-                            "message": f"下载器 {name} 无法读取最新数据，取消删除"}
-                wanted = set(hashes)
-                found = set()
+            for client, infohash in targets:
+                grouped.setdefault(client, []).append(infohash)
+            if any(client not in services for client in grouped):
+                return outcome("failed", "管理下载器不可用，未执行删除")
+            snapshots = {}
+            for client, service in services.items():
+                remote, error = service.instance.get_torrents()
+                if error or remote is None:
+                    return outcome("failed", f"下载器 {client} 无法读取最新清单")
+                snapshots[client] = list(remote)
+                wanted, found = set(grouped.get(client, [])), set()
                 for torrent in remote:
-                    def g(*keys):
-                        for key in keys:
-                            try:
-                                value = (torrent.get(key) if isinstance(torrent, dict)
-                                         else getattr(torrent, key, None))
-                                if value is not None:
-                                    return value
-                            except Exception:
-                                continue
-                        return None
-                    value = str(g("hash", "hashString") or "").lower()
-                    if value not in wanted:
+                    get = lambda *keys: self._torrent_field(torrent, *keys)
+                    infohash = str(get("hash", "hashString") or "").lower()
+                    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", infohash, re.I):
+                        return outcome("failed", "下载器清单缺少 Hash，拒绝删除")
+                    if infohash not in wanted:
                         continue
-                    remote_name = str(g("name") or "")
-                    canonical = normalize_name(remote_name)
-                    if (canonical != normalize_name(title)
-                            and translated_release_key(remote_name) != normalize_name(title)):
-                        return {"state": "failed", "removed_count": 0,
-                                "message": f"{name} 种子名称变化，拒绝删除"}
-                    size_raw = g("total_size", "totalSize", "size")
+                    remote_name = str(get("name") or "")
+                    if (translated_release_key(remote_name) or normalize_name(remote_name)) != (translated_release_key(title) or normalize_name(title)):
+                        return outcome("failed", f"{client} 完整发布名变化，拒绝删除")
                     try:
-                        size_gb = float(size_raw) / 1073741824 if size_raw else 0.0
+                        size = float(get("total_size", "totalSize", "size") or 0) / 1073741824
                     except (TypeError, ValueError):
-                        size_gb = 0.0
-                    if not translated_size_matches(row, {"size_gb": size_gb}):
-                        return {"state": "failed", "removed_count": 0,
-                                "message": f"{name} 种子体积变化，拒绝删除"}
-                    # Incomplete qB/Transmission downloads are legitimate
-                    # manual cleanup targets: progress is intentionally not
-                    # a prerequisite. The exact hash/name/size are required.
-                    found.add(value)
+                        size = 0
+                    if not translated_size_matches(row, {"size_gb": size}):
+                        return outcome("failed", f"{client} 预计总体积变化，拒绝删除")
+                    if auto_mode:
+                        dl_type = str(getattr(service, "type", ""))
+                        completed = self._is_completed(torrent, dl_type)
+                        if not is_trusted_hh_tracker(self._extract_tracker_text(torrent, dl_type)):
+                            return outcome("failed", "自动删除无法确认站点 Tracker，已取消")
+                        if auto_mode == "wash" and not completed:
+                            return outcome("failed", "自动换种目标尚未完成，已取消")
+                        if auto_mode == "stale":
+                            added = get("added_on", "added_date", "date_added", "dateAdded")
+                            added = added.timestamp() if hasattr(added, "timestamp") else float(added or 0)
+                            if (completed or self._get_progress_ratio(torrent, dl_type) is None
+                                    or not added > 0 or self._auto_clean_days <= 0
+                                    or time.time() - added < self._auto_clean_days * 86400):
+                                return outcome("failed", "自动清理条件已变化，已取消")
+                    found.add(infohash)
                 if found != wanted:
-                    return {"state": "failed", "removed_count": 0,
-                            "message": f"{name} 的种子 Hash 列表已变化，拒绝删除"}
-
-            # Stage 3: deletion. All client calls are one-shot; no retry.
-            for name, hashes in sorted(grouped.items()):
-                if self._stopped or generation != self._delete_generation:
-                    return {"state": "uncertain" if removed_count else "failed",
-                            "removed_count": removed_count,
-                            "message": f"配置更新已停止后续删除，已确认移除 {removed_count} 个"}
-                service = services[name]
-                logger.warning(
-                    f"憨憨保种管家：用户确认删除 {name} 上 {len(hashes)} 个辅种任务及其文件"
-                )
-                try:
-                    accepted = service.instance.delete_torrents(
-                        delete_file=True, ids=list(hashes))
-                except Exception as exc:
-                    logger.error(f"整组辅种删除命令执行状态未知：{name}，{exc}")
-                    return {"state": "uncertain", "removed_count": removed_count,
-                            "message": f"{name} 删除返回异常，无法判断是否执行；不自动重试"}
+                    return outcome("failed", f"{client} 的目标 Hash 已变化，拒绝删除")
+            self._validate_delete_files(services, snapshots, targets)
+            for client, hashes in sorted(grouped.items()):
+                if not self._operation_allowed(generation):
+                    return outcome("uncertain" if dispatched else "failed", "配置变化已停止后续删除")
+                self._guard_deletion([(client, value) for value in hashes], request_id)
+                # Persist the target guard before the first one-shot destructive RPC.
+                if not self._operation_allowed(generation):
+                    self._cancel_delete_reservation([(client, value) for value in hashes], request_id)
+                    return outcome("uncertain" if dispatched else "failed", "配置变化，未发送当前下载器的删除指令")
+                dispatched = True
+                accepted = services[client].instance.delete_torrents(delete_file=True, ids=list(hashes))
                 if accepted is False:
-                    return {"state": "uncertain", "removed_count": removed_count,
-                            "message": f"{name} 未确认删除是否执行；不自动重试"}
-                # Confirm exact hashes disappeared. This checks tasks, not
-                # independent filesystem erasure, which downloader APIs do
-                # not reliably prove.
-                confirmed = False
+                    return outcome("uncertain", f"{client} 未确认指令结果，不会自动重发")
+                missing = set()
+                client_before = removed_count
                 for attempt in range(3):
-                    actual, err = service.instance.get_torrents()
-                    if err or actual is None:
-                        return {"state": "uncertain", "removed_count": removed_count,
-                                "message": f"{name} 无法回读，任务及文件状态待人工核对"}
+                    actual, error = services[client].instance.get_torrents()
+                    if error or actual is None:
+                        return outcome("uncertain", f"{client} 无法回读，文件及任务状态待核对")
                     remaining = set()
-                    for t in actual:
-                        hash_value = (t.get("hash") or t.get("hashString")
-                                      if isinstance(t, dict)
-                                      else getattr(t, "hash", None)
-                                      or getattr(t, "hashString", None))
-                        if hash_value:
-                            remaining.add(str(hash_value).lower())
-                    if not remaining.intersection(hashes):
-                        confirmed = True
+                    for torrent in actual:
+                        value = self._torrent_field(torrent, "hash", "hashString")
+                        if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", str(value or ""), re.I):
+                            return outcome("uncertain", f"{client} 回读缺少 Hash，无法确认移除")
+                        remaining.add(str(value).lower())
+                    missing = set(hashes) - remaining
+                    removed_count = client_before + len(missing)
+                    if len(missing) == len(hashes):
                         break
                     if attempt < 2:
                         time.sleep(0.5)
-                if not confirmed:
-                    return {"state": "uncertain", "removed_count": removed_count,
-                            "message": f"{name} 仍能读到部分 Hash，操作状态不确定"}
-                removed_count += len(hashes)
+                fresh = [{"downloader": client, "hash": value} for value in remaining]
+                self._reconcile_delete_guard(fresh, {client})
+                if len(missing) != len(hashes):
+                    return outcome("uncertain", f"{client} 部分 Hash 仍存在，已确认移除 {removed_count} 个；不会重发")
                 if request_id:
                     with self._delete_lock:
                         job = self._delete_jobs.get(request_id)
                         if job:
                             job["removed_count"] = removed_count
-                            job["message"] = f"已确认移除 {removed_count}/{len(targets)} 个任务，正在处理其它下载器"
-            return {"state": "verified", "removed_count": removed_count,
-                    "message": f"已确认移除全部 {removed_count} 个辅种任务；删除数据文件指令已发送"}
-        except Exception as exc:
-            logger.error(f"整组辅种删除异常：{exc}")
-            return {"state": "uncertain" if removed_count else "failed",
-                    "removed_count": removed_count,
-                    "message": ("删除过程部分完成，勿重复执行，请核对下载器"
-                                if removed_count else "删除前核验失败，未开始操作")}
+                            job["message"] = f"已确认移除 {removed_count}/{len(targets)} 个任务"
+            return outcome("verified", f"已确认移除全部 {removed_count} 个任务；删文件指令已发送，磁盘状态需另行核对")
+        except Exception as error:
+            logger.error(f"辅种删除核验/回读异常：{self._safe_error(error)}")
+            return outcome("uncertain" if dispatched else "failed",
+                           "命令已发送，结果不确定；禁止重发，请刷新核对" if dispatched else f"删除前核验失败：{self._safe_error(error)}")
 
     def _delete_rescue_exact(self, title: str = "", downloader: str = "",
                             torrent_hash: str = "", confirm: bool = False,
                             generation: int | None = None,
-                            delete_file: bool = True):
+                            delete_file: bool = True, request_id: str = ""):
+
         """Remove ONE selected downloader hash after fresh identity checking.
 
         Multiple same-name infohashes are legitimate cross-seeding.
@@ -2445,6 +2514,8 @@ buildHead();load(false);resumePendingDelete();
             return {"success": False, "state": "failed", "message": "插件配置已更新，已取消旧删除操作"}
         if not (confirm and title and downloader and torrent_hash):
             return {"success": False, "state": "failed", "message": "必须提供完整标识和删除确认"}
+        if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", torrent_hash, re.I):
+            return {"success": False, "state": "failed", "message": "种子 Hash 格式无效"}
         canon = normalize_name(title)
         if not canon or downloader not in self._downloaders:
             return {"success": False, "state": "failed", "message": "下载器或种子名称无效"}
@@ -2484,6 +2555,15 @@ buildHead();load(false);resumePendingDelete();
             torrents, error = service.instance.get_torrents()
             if error or torrents is None:
                 return {"success": False, "state": "failed", "message": "下载器任务读取失败，拒绝删除"}
+            if delete_file:
+                services = self._get_manage_services()
+                snapshots = {}
+                for client, current_service in services.items():
+                    remote, failed = current_service.instance.get_torrents()
+                    if failed or remote is None:
+                        return {"success": False, "state": "failed", "message": "共享数据核验无法读取全部下载器"}
+                    snapshots[client] = list(remote)
+                self._validate_delete_files(services, snapshots, [(downloader, torrent_hash.lower())])
             matched_hashes = set()
             for torrent in torrents:
                 def g(*keys):
@@ -2520,6 +2600,12 @@ buildHead();load(false);resumePendingDelete();
                     if delete_file and not is_trusted_hh_tracker(tracker_text):
                         return {"success": False, "state": "failed",
                                 "message": "未确认 tracker.hhanclub.net，不允许删除文件"}
+                try:
+                    size_gb = float(g("total_size", "totalSize", "size") or 0) / 1073741824
+                except (TypeError, ValueError):
+                    size_gb = 0
+                if not translated_size_matches(row, {"size_gb": size_gb}):
+                    return {"success": False, "state": "failed", "message": "预计总体积无法核实，拒绝删除"}
                 matched_hashes.add(remote_hash)
             if len(matched_hashes) != 1:
                 return {"success": False, "state": "failed",
@@ -2529,6 +2615,11 @@ buildHead();load(false);resumePendingDelete();
             # waiting for the site or downloader.
             if self._stopped or (generation is not None and generation != self._delete_generation):
                 return {"success": False, "state": "failed", "message": "插件配置已变化，删除已取消"}
+            guard_id = request_id or f"single-{time.time_ns()}"
+            self._guard_deletion([(downloader, torrent_hash.lower())], guard_id)
+            if self._stopped or (generation is not None and generation != self._delete_generation):
+                self._cancel_delete_reservation([(downloader, torrent_hash.lower())], guard_id)
+                return {"success": False, "state": "failed", "message": "配置变化，未发送删除指令"}
             dispatched = True
             accepted = service.instance.delete_torrents(
                 delete_file=bool(delete_file), ids=matched)
@@ -2549,15 +2640,17 @@ buildHead();load(false);resumePendingDelete();
                 for item in after:
                     value = ((item.get("hash") or item.get("hashString")) if isinstance(item, dict)
                              else getattr(item, "hash", None) or getattr(item, "hashString", None))
-                    if not value:
+                    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", str(value or ""), re.I):
                         return {"success": False, "state": "uncertain",
                                 "message": "下载器回读结果缺少种子哈希，无法确认删除"}
                     hashes.append(str(value).lower())
                 if torrent_hash.lower() not in hashes:
+                    self._reconcile_delete_guard(
+                        [{"downloader": downloader, "hash": value} for value in hashes], {downloader})
                     logger.info(f"憨憨保种区管家已确认移除：下载器={downloader}，"
                                 f"hash={torrent_hash[:8]}…，保留文件={not delete_file}")
                     message = ("已移除所选任务并保留数据文件" if not delete_file
-                               else "已移除任务和数据文件")
+                               else "已移除任务，删除文件指令已发送；磁盘清除需另行核对")
                     return {"success": True, "state": "verified", "message": f"{message}：{title}"}
                 if attempt < 2:
                     time.sleep(0.5)
@@ -2565,7 +2658,7 @@ buildHead();load(false);resumePendingDelete();
                     "message": "删除请求已发送，但下载器仍返回该种子；请刷新核对"}
 
         except Exception as e:
-            logger.error(f"手动删除种子异常：{e}")
+            logger.error(f"手动删除种子异常：{self._safe_error(e)}")
             return {"success": False, "state": "uncertain" if dispatched else "failed",
                     "message": "删除指令执行状态不确定，请刷新核对，勿重复删除"
                     if dispatched else "删除前核验失败，未执行删除，请检查插件日志"}
@@ -2576,7 +2669,10 @@ buildHead();load(false);resumePendingDelete();
             logger.info("憨憨保种区管家已有任务在运行，跳过重复触发")
             return
         self._running = True
+        self._run_generation = self._delete_generation
         try:
+            if not self._operation_allowed():
+                return
             cookie = self._get_site_cookie()
             if not cookie:
                 self._last_result = "未获取到站点Cookie"
@@ -2585,12 +2681,12 @@ buildHead();load(false);resumePendingDelete();
             try:
                 self._do_run()
             except Exception as e:
-                logger.error(f"憨憨保种区管家运行异常：{e}")
-                self._last_result = f"运行异常：{e}"
+                logger.error(f"憨憨保种区管家运行异常：{HHClubButler._safe_error(e)}")
+                self._last_result = f"运行异常：{HHClubButler._safe_error(e)}"
                 if self._notify:
                     try:
                         self.post_message(mtype=NotificationType.Plugin,
-                                          title="【憨憨保种区管家】运行异常", text=str(e))
+                                          title="【憨憨保种区管家】运行异常", text=self._safe_error(e))
                     except Exception:
                         pass
         finally:
@@ -2608,8 +2704,11 @@ buildHead();load(false);resumePendingDelete();
             logger.warning(self._last_result)
             self._save_log(logs)
             return
+        if not self._operation_allowed():
+            self._last_result = "配置已变化，停止旧自动任务"
+            return
         seeds_full = list(seeds)
-        all_site_titles = {HHClubButler._norm_title(s.get("title") or "") for s in seeds}
+        all_site_titles = {normalize_name(release_name(s.get("title"))) for s in seeds}
 
         if self._exclude_zero:
             before = len(seeds)
@@ -2636,31 +2735,43 @@ buildHead();load(false);resumePendingDelete();
         in_flight_gb = 0.0
         if dl_all is None:
             dl_norm_all = set()
-            logs.append("⚠️ 下载器种子列表获取失败，本次暂停推送以防重复")
+            logs.append("下载器种子列表获取失败，本次停止以防重复")
+            self._last_result = logs[-1]
+            self._save_log(logs)
+            return
         else:
-            dl_done = self._get_downloader_seeds(logs, only_completed=True, any_tracker=True) or set()
-            dl_norm_all = {HHClubButler._norm_title(n) for n in dl_all}
-            dl_done_norm = {HHClubButler._norm_title(n) for n in dl_done}
+            dl_done = self._get_downloader_seeds(logs, only_completed=True, any_tracker=True)
+            if dl_done is None:
+                self._last_result = "下载器完成状态读取失败，停止本轮"
+                self._save_log(logs)
+                return
+            dl_norm_all = {normalize_name(release_name(n)) for n in dl_all}
+            dl_done_norm = {normalize_name(release_name(n)) for n in dl_done}
             in_flight_norms = dl_norm_all - dl_done_norm
             if in_flight_norms:
                 gb_map = {}
                 for s in seeds_full:
-                    gb_map[HHClubButler._norm_title(s.get("title") or "")] = s.get("size", 0.0)
+                    gb_map[normalize_name(release_name(s.get("title")))] = s.get("size", 0.0)
                 in_flight_gb = sum(gb_map.get(nm, 0.0) for nm in in_flight_norms)
             logs.append(f"在途（下载中未完成）{len(in_flight_norms)} 个，体积 {in_flight_gb:.1f} GB")
             before = len(seeds)
-            seeds = [s for s in seeds if HHClubButler._norm_title(s.get("title") or "") not in dl_norm_all]
+            seeds = [s for s in seeds if normalize_name(release_name(s.get("title"))) not in dl_norm_all]
             removed = before - len(seeds)
             if removed:
                 logs.append(f"已剔除 {removed} 个已在下载器中的候选（含下载中），剩 {len(seeds)} 个")
 
-        if not current.get("degraded"):
+        if self._operation_allowed() and not current.get("degraded"):
             try:
-                self._last_overview = self._build_overview_from_current(current)
-                self._last_overview_ts = time.time()
+                overview = self._build_overview_from_current(current)
+                if self._operation_allowed():
+                    self._last_overview = overview
+                    self._last_overview_ts = time.time()
             except Exception as e:
-                logger.error(f"构建概况缓存失败：{e}")
+                logger.error(f"构建概况缓存失败：{HHClubButler._safe_error(e)}")
 
+        if not self._operation_allowed():
+            self._last_result = "配置已变化，停止旧自动任务"
+            return
         target = self._target_volume
         committed_gb = current_gb + in_flight_gb
         if target and target > 0:
@@ -2694,7 +2805,15 @@ buildHead();load(false);resumePendingDelete();
 
         picked = result.get("picked", [])
         if result.get("del_seeds"):
-            self._delete_seeds(result["del_seeds"], logs)
+            deletion = self._delete_seeds(result["del_seeds"], logs)
+            result["del_seeds"] = deletion["verified"]
+            if not deletion["success"]:
+                self._last_result = f"换种停止：已核实移除 {deletion['removed_count']} 个任务，未推送依赖释放容量的新种子"
+                self._save_log(logs)
+                if self._operation_allowed():
+                    self._last_overview = None
+                    self._last_overview_ts = 0
+                return
             for s in result["del_seeds"]:
                 logger.info(f"优选删除种子: {s.get('title','')} | {s.get('size',0.0):.1f} GB | "
                             f"初始做种 {s.get('seeders','?')} 人")
@@ -2702,7 +2821,7 @@ buildHead();load(false);resumePendingDelete();
         filtered = 0
         if picked and dl_all is not None:
             before = len(picked)
-            picked = [s for s in picked if HHClubButler._norm_title(s["title"]) not in dl_norm_all]
+            picked = [s for s in picked if normalize_name(release_name(s["title"])) not in dl_norm_all]
             filtered = before - len(picked)
             if filtered:
                 logs.append(f"已过滤 {filtered} 个已在下载器的种子，实际推送 {len(picked)} 个")
@@ -2711,6 +2830,8 @@ buildHead();load(false);resumePendingDelete();
         fail_list = []
         if picked:
             ok_count, fail_count, fail_list = self._push_seeds(picked, logs)
+            failed_names = {failure["title"] for failure in fail_list}
+            picked = [s for s in picked if s["title"] not in failed_names]
             for s in picked:
                 logger.info(f"优选新增种子: {s.get('title','')} | {s.get('size',0.0):.1f} GB | "
                             f"初始做种 {s.get('seeders','?')} 人")
@@ -2725,7 +2846,7 @@ buildHead();load(false);resumePendingDelete();
 
         total_gb = sum(s.get("size", 0.0) for s in picked)
         mode_name = "换种" if self._mode == "wash" else "增量"
-        summary = (f"{mode_name}优选 {len(picked)} 个 | 新增体积 {total_gb:.1f} GB")
+        summary = (f"{mode_name}已接收下载 {ok_count} 个 | 新增体积 {total_gb:.1f} GB | 失败/未发送 {fail_count} 个")
         if result.get("del_seeds"):
             summary += f" | 删除 {len(result['del_seeds'])} 个"
         logs.append("=== " + summary + " ===")
@@ -2741,20 +2862,22 @@ buildHead();load(false);resumePendingDelete();
                                   title=f"【憨憨保种区管家】{mode_name}优选完成",
                                   text="\n".join(notify))
             except Exception as e:
-                logger.error(f"憨憨保种区管家发送通知失败：{e}")
+                logger.error(f"憨憨保种区管家发送通知失败：{HHClubButler._safe_error(e)}")
 
         del_done = result.get("del_seeds") or []
-        if del_done and not current.get("degraded"):
+        if del_done and self._operation_allowed() and not current.get("degraded"):
             del_titles = {s.get("title") for s in del_done}
             remain = [s for s in current.get("seeds", []) if s.get("title") not in del_titles]
             current["seeds"] = remain
             current["count"] = len(remain)
             current["total_gb"] = sum(s.get("size", 0.0) for s in remain)
             try:
-                self._last_overview = self._build_overview_from_current(current)
-                self._last_overview_ts = time.time()
+                overview = self._build_overview_from_current(current)
+                if self._operation_allowed():
+                    self._last_overview = overview
+                    self._last_overview_ts = time.time()
             except Exception as e:
-                logger.error(f"删除后更新概况失败：{e}")
+                logger.error(f"删除后更新概况失败：{HHClubButler._safe_error(e)}")
 
     def _build_notify(self, mode_name, current, target, eff_target, picked, total_gb,
                       filtered, ok_count, fail_count, fail_list, result, cleaned=0) -> list:
@@ -2774,7 +2897,7 @@ buildHead();load(false);resumePendingDelete();
                 seen.add(s["title"])
         final_count = len(final_seeds)
         final_gb = sum(s.get("size", 0.0) for s in final_seeds)
-        lines.append(f"在保种子：{final_count} 个 / {final_gb:.1f} GB")
+        lines.append(f"保留保种及已接收下载：{final_count} 个 / {final_gb:.1f} GB（新下载待完成）")
         if target and target > 0:
             remain = max(0.0, target - final_gb)
             lines.append(f"目标体积：{target:.0f} GB（剩余可增 {remain:.1f} GB）")
@@ -2812,14 +2935,13 @@ buildHead();load(false);resumePendingDelete();
                 lines.append(f"  · {t}")
             if len(picked) > 5:
                 lines.append(f"  …等共 {len(picked)} 个")
-            if fail_count:
-                lines.append(f"⚠️ 推送失败：{fail_count} 个（成功 {ok_count}）")
-            else:
-                lines.append(f"推送成功：{ok_count}/{len(picked)}")
+            lines.append(f"推送成功：{ok_count}/{ok_count + fail_count}")
         else:
             lines.append("无需新增下载")
             if filtered > 0:
                 lines.append(f"已过滤 {filtered} 个已在下载器的种子")
+        if fail_count:
+            lines.append(f"推送失败/未发送：{fail_count} 个（已接收 {ok_count}）")
         if result.get("del_seeds"):
             lines.append(f"删除低档位种子：{len(result['del_seeds'])} 个")
             for s in result["del_seeds"][:5]:
@@ -2840,7 +2962,7 @@ buildHead();load(false);resumePendingDelete();
                         or "hhanclub" in domain.lower() or "hhclub" in domain.lower():
                     return site
         except Exception as e:
-            logger.error(f"读取MP站点配置失败：{e}")
+            logger.error(f"读取MP站点配置失败：{HHClubButler._safe_error(e)}")
         return None
 
     def _get_site_cookie(self) -> str:
@@ -2885,7 +3007,7 @@ buildHead();load(false);resumePendingDelete();
                 logger.info(f"已从站点主页自动获取UID：{uid}")
                 return uid
         except Exception as e:
-            logger.error(f"自动获取站点UID失败：{e}")
+            logger.error(f"自动获取站点UID失败：{HHClubButler._safe_error(e)}")
         logger.warning("未自动获取到站点UID，请检查站点Cookie/UA是否有效")
         return None
 
@@ -2951,7 +3073,7 @@ buildHead();load(false);resumePendingDelete();
                         url = f"{site_url}/rescuesettleinfo.php?id={uid}&page={page}"
                     r = self._get_with_retry(session, url, timeout=20, retries=2, backoff=(3, 5))
                 except Exception as e:
-                    logger.warning(f"上次结算第{page + 1}页获取失败：{e}")
+                    logger.warning(f"上次结算第{page + 1}页获取失败：{HHClubButler._safe_error(e)}")
                     break
                 soup = BeautifulSoup(r.text, "html.parser")
                 table = None
@@ -2992,7 +3114,7 @@ buildHead();load(false);resumePendingDelete();
             if best:
                 return best[0], best[1], best_date
         except Exception as e:
-            logger.warning(f"抓取上次结算失败：{e}")
+            logger.warning(f"抓取上次结算失败：{HHClubButler._safe_error(e)}")
         return None, None, ""
 
     # ---------- 结算统计表（保种结算日志翻页拉取 + 本地历史累计） ----------
@@ -3004,7 +3126,7 @@ buildHead();load(false);resumePendingDelete();
                 path.mkdir(parents=True, exist_ok=True)
             return path / "monthly_stats.json"
         except Exception as e:
-            logger.error(f"获取插件数据目录失败：{e}")
+            logger.error(f"获取插件数据目录失败：{HHClubButler._safe_error(e)}")
             return None
 
     def _load_monthly_stats(self) -> dict:
@@ -3022,7 +3144,7 @@ buildHead();load(false);resumePendingDelete();
                 return json.load(f)
         except Exception as e:
             self._load_error = str(e)
-            logger.warning(f"读取结算统计表本地数据失败：{e}")
+            logger.warning(f"读取结算统计表本地数据失败：{HHClubButler._safe_error(e)}")
             return {"last_fetch_date": "", "updated_at": "", "records": []}
 
     def _save_monthly_stats(self, data: dict):
@@ -3035,8 +3157,8 @@ buildHead();load(false);resumePendingDelete();
         try:
             s = json.dumps(data, ensure_ascii=False, indent=1)
         except Exception as e:
-            self._save_error = f"序列化失败：{e}"
-            logger.error(f"保存结算统计表本地数据失败（序列化）：{e}")
+            self._save_error = f"序列化失败：{HHClubButler._safe_error(e)}"
+            logger.error(f"保存结算统计表本地数据失败（序列化）：{HHClubButler._safe_error(e)}")
             return
         tmp = p.with_suffix(".tmp")
         try:
@@ -3049,8 +3171,8 @@ buildHead();load(false);resumePendingDelete();
                     pass
             os.replace(tmp, p)
         except Exception as e:
-            self._save_error = f"写入失败：{e}"
-            logger.error(f"保存结算统计表本地数据失败（写入）：{e}")
+            self._save_error = f"写入失败：{HHClubButler._safe_error(e)}"
+            logger.error(f"保存结算统计表本地数据失败（写入）：{HHClubButler._safe_error(e)}")
             try:
                 if tmp.exists():
                     tmp.unlink()
@@ -3074,8 +3196,8 @@ buildHead();load(false);resumePendingDelete();
                     url = f"{site_url}/rescuesettleinfo.php?id={uid}&page={page}"
                 html = self._get_with_retry(session, url, timeout=20, retries=2, backoff=(3, 5)).text
             except Exception as e:
-                logger.warning(f"结算日志第{page + 1}页获取失败：{e}")
-                break
+                logger.warning(f"结算日志第{page + 1}页获取失败：{self._safe_error(e)}")
+                return []
             soup = BeautifulSoup(html, "html.parser")
             table = None
             for tb in soup.find_all("table"):
@@ -3097,8 +3219,9 @@ buildHead();load(false);resumePendingDelete();
                     dmatch = re.search(r'\d{4}-\d{2}-\d{2}', dstr)
                     if not dmatch:
                         continue
-                    out[dmatch.group(0)] = (bean, pt)
-                    new_rows += 1
+                    day = dmatch.group(0)
+                    new_rows += int(day not in out)
+                    out[day] = (bean, pt)
                 except (ValueError, IndexError):
                     continue
             if new_rows == 0:
@@ -3108,7 +3231,7 @@ buildHead();load(false);resumePendingDelete();
             logger.info(f"结算日志翻页拉取完成：共 {len(out)} 条（最新 {max(out.keys())}）")
         return [(d, v[0], v[1]) for d, v in out.items()]
 
-    def _ensure_monthly_stats(self, force: bool = False) -> dict:
+    def _ensure_monthly_stats_impl(self, force: bool = False) -> dict:
         """返回本地历史；当日已成功获取（本地已含当日记录或当日拉取成功）则直接使用。
         拉取失败或未拉取到当日数据时，按 retry_at 时间戳（5 分钟间隔）自动重试，当日累计最多 3 次。
         结算日志按时间正序分页，最新一条在最后一页；本地按日期全量聚合，取最新=max(date)，与页序无关。"""
@@ -3122,7 +3245,7 @@ buildHead();load(false);resumePendingDelete();
             self._fetch_state = "ok_cached"
             return data
         attempt_date = str(data.get("last_attempt_date") or "")
-        attempts = int(data.get("attempt_count") or 0)
+        attempts = int(data.get("attempt_count") or 0) if attempt_date == today else 0
         retry_at = float(data.get("retry_at") or 0)
         if not force and attempt_date == today and attempts >= 3:
             self._fetch_state = "failed_limited"
@@ -3130,7 +3253,10 @@ buildHead();load(false);resumePendingDelete();
         if not force and attempt_date == today and attempts > 0 and now.timestamp() < retry_at:
             self._fetch_state = "pending_retry"
             return data
+        generation = self._delete_generation
         fetched = self._fetch_settlement_history()
+        if self._stopped or generation != self._delete_generation:
+            return data
         if fetched:
             merged: Dict[str, dict] = {}
             for r in records:
@@ -3225,7 +3351,47 @@ buildHead();load(false);resumePendingDelete();
             headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
                      "X-Content-Type-Options": "nosniff", "X-Frame-Options": "SAMEORIGIN"})
 
+    def _ensure_monthly_stats(self, force: bool = False) -> dict:
+        generation = self._delete_generation
+        with self._stats_lock:
+            if self._stopped or generation != self._delete_generation:
+                raise RuntimeError("结算刷新配置已变化")
+            self._save_error = ""
+            result = self._ensure_monthly_stats_impl(force=force)
+            if getattr(self, "_save_error", ""):
+                raise RuntimeError("结算数据保存失败，未确认本次刷新成功")
+            return result
+
+    def _monthly_stats_worker(self, generation, force):
+        try:
+            result = self._monthly_stats_result(refresh=int(force))
+        except Exception as error:
+            logger.error(f"结算后台任务失败：{self._safe_error(error)}")
+            result = {"error": "结算后台读取失败，请检查脱敏日志"}
+        with self._stats_job_lock:
+            if self._stopped or generation != self._delete_generation:
+                return
+            self._stats_job = {"state": "ready", "result": result, "finished_at": time.time()}
+
     def api_monthly_stats_data(self, refresh: int = 0):
+        with self._stats_job_lock:
+            if self._stopped or not self._enabled:
+                return {"error": "插件未启用"}
+            job = self._stats_job
+            if job.get("state") == "loading":
+                return {"loading": True, "elapsed_seconds": max(0, int(time.time() - job["started_at"]))}
+            if not refresh and job.get("state") == "ready" and time.time() - job["finished_at"] < 180:
+                return job["result"]
+            self._stats_job = {"state": "loading", "started_at": time.time()}
+            try:
+                threading.Thread(target=self._monthly_stats_worker, args=(self._delete_generation, bool(refresh)),
+                                 daemon=True, name="HHClubButler-Settlement").start()
+            except Exception:
+                self._stats_job = {"state": "idle"}
+                return {"error": "无法启动结算后台任务"}
+            return {"loading": True}
+
+    def _monthly_stats_result(self, refresh: int = 0):
         try:
             data = self._ensure_monthly_stats(force=bool(refresh))
             agg = self._monthly_agg(data)
@@ -3257,8 +3423,8 @@ buildHead();load(false);resumePendingDelete();
                 },
             }
         except Exception as e:
-            logger.error(f"获取结算统计表数据失败：{e}")
-            return {"error": str(e)}
+            logger.error(f"获取结算统计表数据失败：{HHClubButler._safe_error(e)}")
+            return {"error": "结算读取失败，请检查脱敏日志"}
 
     def _build_monthly_stats_html(self) -> str:
         html = r"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
@@ -3355,13 +3521,29 @@ function fmtBig(n){if(n===null||n===undefined)return "—";return Number(n).toLo
 function showErr(msg){var st=document.getElementById('status');st.innerHTML='<span class="err">'+esc(msg)+'</span><button class="retrybtn" onclick="location.reload()">重试</button>';}
 function showWarn(msg){var w=document.getElementById('warn');w.style.display='flex';w.innerHTML='<b>⚠ '+esc(msg)+'</b><button class="wbtn" onclick="loadData(true)">立即重试</button>';}
 function clearWarn(){var w=document.getElementById('warn');w.style.display='none';w.innerHTML='';}
-function loadData(refresh){
+var statsLoading=false;
+async function loadData(refresh){
+if(statsLoading)return;
+statsLoading=true;
 var t0=Date.now(),tmr=null;
 document.getElementById('status').innerHTML='<span>正在获取每月结算数据，请稍候… <b id="el">0</b> 秒</span><div class="bar"><i></i></div>';
 function tick(){var el=document.getElementById("el");if(el)el.textContent=Math.floor((Date.now()-t0)/1000);}
 tick();tmr=setInterval(tick,250);
 var url='/api/v1/plugin/HHClubButler/monthly_stats_data'+(refresh?'?refresh=1':'');
-fetch(url,{credentials:'same-origin'}).then(function(r){if(!r.ok)throw Error('HTTP '+r.status);return r.json();}).then(function(j){
+try {
+var j;
+while(true){
+var ctl=new AbortController(),timer=setTimeout(function(){ctl.abort()},15000);
+try{
+var r=await fetch(url,{credentials:'same-origin',cache:'no-store',signal:ctl.signal});
+if(!r.ok)throw Error('HTTP '+r.status);
+j=await r.json();
+}finally{clearTimeout(timer)}
+if(!j.loading)break;
+if(Date.now()-t0>480000)throw Error('后台结算读取超时，请检查日志后重试');
+url='/api/v1/plugin/HHClubButler/monthly_stats_data';
+await new Promise(function(resolve){setTimeout(resolve,3000)});
+}
 if(j&&j.error){if(tmr)clearInterval(tmr);showErr(j.error);return;}
 data=j;
 var st=document.getElementById('status');if(tmr)clearInterval(tmr);st.style.display='none';
@@ -3379,7 +3561,8 @@ var ft=document.getElementById('foot');
 ft.textContent='数据更新于 '+(data.updated_at||'—')+' · 灰显月份暂无历史记录 · 统计结算表数据来自憨憨站保种结算日志';
 if(typeof echarts==='undefined'){renderTable();return;}
 renderChart();renderTable();
-}).catch(function(e){if(tmr)clearInterval(tmr);showErr('获取数据失败：'+e.message);});
+}catch(e){showErr('获取数据失败：'+e.message);}
+finally{if(tmr)clearInterval(tmr);statsLoading=false;}
 }
 loadData(false);
 function renderChart(){
@@ -3457,10 +3640,10 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
                     seeds.extend(page_seeds)
                     logs.append(f"保种区第1页已通过备用域名访问：{alt}")
                 except Exception as e2:
-                    logs.append(f"保种区第1页获取失败（含备用域名）：{e2}")
+                    logs.append(f"保种区第1页获取失败（含备用域名）：{HHClubButler._safe_error(e2)}")
                     return []
             else:
-                logs.append(f"保种区第1页获取失败：{e}")
+                logs.append(f"保种区第1页获取失败：{HHClubButler._safe_error(e)}")
                 return []
         for page in range(1, max_page + 1):
             try:
@@ -3470,20 +3653,26 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
                 seeds.extend(page_seeds)
                 logs.append(f"保种区第{page + 1}页获取 {len(page_seeds)} 条数据")
             except Exception as e:
-                logs.append(f"保种区第{page + 1}页获取失败（已重试）：{e}")
+                logs.append(f"保种区第{page + 1}页获取失败（已重试）：{HHClubButler._safe_error(e)}")
                 logs.append("候选池数据不完整，本次优选中止以防误操作")
                 return []
             time.sleep(0.5)
-        return seeds
+        unique = {}
+        for seed in seeds:
+            key = seed.get("seed_id") or (normalize_name(release_name(seed.get("title"))), seed.get("href"))
+            unique.setdefault(key, seed)
+        return list(unique.values())
 
     def _parse_rescue_page(self, html: str) -> Tuple[List[dict], int]:
         seeds = []
-        max_page = 1
+        max_page = 0
         soup = BeautifulSoup(html, "html.parser")
         for a in soup.select('a[href*="page="]'):
             m = re.search(r'[?&]page=(\d+)', a.get("href", ""))
             if m:
                 max_page = max(max_page, int(m.group(1)))
+        if max_page > 500:
+            raise ValueError("保种候选分页超过安全上限")
         for row in soup.select("div.torrent-table-sub-info"):
             s = self._parse_seed_row(row)
             if s:
@@ -3542,40 +3731,25 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
 
     def _get_current_seeding(self, logs: list, torrents: Optional[list] = None) -> dict:
         result = {"count": 0, "total_gb": 0.0, "seeds": []}
-        completed = self._fetch_completed(logs)
-        if not completed:
-            logs.append("完成页未获取到数据，本次按空保种降级处理")
-            result["degraded"] = "完成页未获取到数据"
+        try:
+            rows = self._collect_rescue_seeds(strict_downloaders=True)
+        except Exception as error:
+            result["error"] = "站点或下载器无法完整读取"
+            logs.append(f"当前保种读取失败：{self._safe_error(error)}")
             return result
-        dl_seeds = self._get_downloader_seeds(logs, torrents=torrents)
-        if dl_seeds is None:
-            logs.append("下载器未获取到种子，按站点完成页全量显示")
-            result["count"] = len(completed)
-            result["total_gb"] = sum(x.get("size", 0.0) for x in completed)
-            result["seeds"] = completed
-            return result
-        dl_names = set(dl_seeds)
-        norm_map = {}
-        for x in completed:
-            norm_map.setdefault(HHClubButler._norm_title(x["title"]), x)
-        matched_map = {}
-        for dn in dl_names:
-            nd = HHClubButler._norm_title(dn)
-            hit = None
-            if nd in norm_map:
-                hit = norm_map[nd]
-            elif len(nd) >= 15:
-                for nd_key, x in norm_map.items():
-                    if len(nd_key) >= 15 and (nd in nd_key or nd_key in nd):
-                        hit = x
-                        break
-            if hit is not None:
-                matched_map.setdefault(hit["title"], hit)
-        matched = list(matched_map.values())
-        result["count"] = len(matched)
-        result["total_gb"] = sum(x["size"] for x in matched)
-        result["seeds"] = matched
-        logs.append(f"完成页 {len(completed)} 个 ∩ 下载器做种 {len(dl_names)} 个 = 当前保种 {len(matched)} 个")
+        current = []
+        for row in rows:
+            copies = row.get("candidates", [])
+            if row.get("source") == "downloader" or row.get("match_status") not in {"exact", "translated", "cross_seed"}:
+                continue
+            if not any(copy.get("completed") for copy in copies):
+                continue
+            item = dict(row)
+            item["auto_delete_ready"] = bool(item.get("can_delete_group") and copies
+                and all(copy.get("completed") and copy.get("trusted_tracker") for copy in copies))
+            current.append(item)
+        result.update(count=len(current), total_gb=sum(s.get("size", 0) for s in current), seeds=current)
+        logs.append(f"站点资格与下载器强匹配的已完成保种 {len(current)} 个")
         return result
 
     def _build_overview_from_current(self, cur: dict) -> dict:
@@ -3632,23 +3806,26 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
                     items, max_page = self._parse_completed_page(r.text)
                     logs.append(f"完成页已通过备用域名访问：{alt}")
                 except Exception as e2:
-                    logs.append(f"完成页第1页获取失败（含备用域名，已重试）：{e2}")
+                    logs.append(f"完成页第1页获取失败（含备用域名，已重试）：{HHClubButler._safe_error(e2)}")
                     return []
             else:
-                logs.append(f"完成页第1页获取失败（已重试）：{e}")
+                logs.append(f"完成页第1页获取失败（已重试）：{HHClubButler._safe_error(e)}")
                 return []
         logger.info(f"憨憨保种管理器：站点完成页 UID={uid}，预计 {max_page + 1} 页")
-        for page in range(1, max_page + 1):
+        page = 1
+        while page <= max_page:
             try:
                 r = self._get_with_retry(session, f"{url}&page={page}",
                                          timeout=30, retries=2, backoff=(3, 5))
-                page_items, _ = self._parse_completed_page(r.text)
+                page_items, discovered = self._parse_completed_page(r.text)
+                max_page = max(max_page, discovered)
                 items.extend(page_items)
             except Exception as e:
-                logs.append(f"完成页第{page + 1}页获取失败（已重试）：{e}")
+                logs.append(f"完成页第{page + 1}页获取失败（已重试）：{HHClubButler._safe_error(e)}")
                 logs.append("完成页数据不完整，本次刷新作废保留上次数据")
                 return []
             time.sleep(0.5)
+            page += 1
 
         # Dynamic pagination can overlap records when the user changes their
         # rescue status during a crawl. Preserve site identity and dedupe.
@@ -3880,99 +4057,126 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
 
     @staticmethod
     def _get_progress_ratio(t, dl_type: str = "") -> Optional[float]:
-        try:
-            if isinstance(t, dict):
-                progress = t.get("progress")
-                if progress is None:
-                    progress = t.get("percent_done")
-            else:
-                progress = getattr(t, "progress", None)
-                if progress is None:
-                    progress = getattr(t, "percent_done", None)
-            if progress is None:
-                return None
-            progress = float(progress)
-            dl = (dl_type or "").lower()
-            if ("transmission" in dl or "tr_" in dl) and progress > 1.0:
-                progress /= 100.0
-            return max(0.0, min(1.0, progress))
-        except Exception:
+        import math
+        def get(*keys):
+            for key in keys:
+                try:
+                    value = t.get(key) if isinstance(t, dict) else getattr(t, key, None)
+                    if value is not None:
+                        return value
+                except Exception:
+                    continue
             return None
+        try:
+            if "transmission" in str(dl_type).lower() or "tr_" in str(dl_type).lower():
+                progress = get("percent_done", "percentDone")
+                if progress is None:
+                    value = get("progress")
+                    progress = float(value) / 100 if value is not None else None
+            else:
+                progress = get("progress", "percent_done", "percentDone")
+            value = float(progress)
+            return value if math.isfinite(value) and 0 <= value <= 1 else None
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    @staticmethod
+    def _is_completed(t, dl_type: str = "") -> bool:
+        ratio = HHClubButler._get_progress_ratio(t, dl_type)
+        def get(key):
+            return t.get(key) if isinstance(t, dict) else getattr(t, key, None)
+        try:
+            state = str(get("state") or get("status") or "").lower()
+            left = get("amount_left")
+            if left is None:
+                left = get("left_until_done")
+            if left is None:
+                left = get("leftUntilDone")
+            if left is not None and float(left) > 0:
+                return False
+            if state in {"downloading", "download_pending", "checking", "checkingdl", "checkingup",
+                         "stalleddl", "metadl", "missingfiles", "error", "moving", "allocating"}:
+                return False
+            return ratio == 1 if ratio is not None else state in {
+                "seeding", "seed_pending", "stalledup", "uploading", "pausedup", "queuedup", "forcedup"}
+        except (TypeError, ValueError, AttributeError):
+            return False
+
+    def _operation_allowed(self, generation=None) -> bool:
+        expected = getattr(self, "_run_generation", self._delete_generation) if generation is None else generation
+        return bool(self._enabled and not self._stopped and expected == self._delete_generation)
+
+    @staticmethod
+    def _safe_error(error) -> str:
+        # Exceptions can contain full announce/download URLs, including credentials.
+        text = re.sub(r"(?:https?|udp)://[^\s<>]+", "[URL已隐藏]", str(error), flags=re.I)
+        text = re.sub(r"(?im)(header value\s*:)[^\r\n]*", r"\1[已隐藏]", text)
+        return re.sub(r'''(?im)\b(cookie|passkey|token|password|authorization)["']?\s*[:=]\s*[^\r\n]*''',
+                      r"\1=[已隐藏]", text)[:500]
+
+    def _download_response(self, session, url: str):
+        from urllib.parse import urljoin, urlsplit
+        site = urlsplit(self._get_site_url())
+        allowed = {site.hostname}
+        if site.hostname in {"hhanclub.net", "hhancclub.net"}:
+            allowed.update({"hhanclub.net", "hhancclub.net"})
+        for _ in range(6):
+            parsed = urlsplit(url)
+            if (parsed.scheme != "https" or parsed.hostname not in allowed or parsed.username
+                    or parsed.password or parsed.port not in (None, 443)):
+                raise ValueError("种子下载链接不属于受信站点 HTTPS 地址")
+            response = session.get(url, timeout=60, allow_redirects=False)
+            if response.status_code not in (301, 302, 303, 307, 308):
+                return response
+            location = response.headers.get("Location")
+            if not location:
+                raise ValueError("种子下载跳转缺少目标")
+            url = urljoin(url, location)
+        raise ValueError("种子下载跳转次数过多")
 
     def _get_downloader_seeds(self, logs: list, only_completed: bool = True,
-                                any_tracker: bool = False,
-                                torrents: Optional[list] = None) -> Optional[set]:
-        svcs = self._get_manage_services()
-        if not svcs:
-            logs.append("未配置有效的下载器")
+                             any_tracker: bool = False, torrents: Optional[list] = None) -> Optional[set]:
+        services = self._get_manage_services()
+        if not services or set(self._downloaders) - set(services):
+            logs.append("管理下载器不完整，停止自动任务")
             return None
-        sv_types = {}
-        for name, sv in svcs.items():
-            dl_type = ""
-            try:
-                dl_type = str(sv.type or sv.config.type or "")
-            except Exception:
-                pass
-            sv_types[name] = dl_type
+        names = set()
         try:
-            names = set()
-            site_total = 0
-            total = 0
-
-            def scan(dl_name, dl_type, t):
-                nonlocal site_total, total
-                total += 1
-                tracker = ""
-                try:
-                    tracker = HHClubButler._extract_tracker_text(t, dl_type)
-                except Exception:
-                    pass
-                if any_tracker or ("hhanclub" in tracker or "hhclub" in tracker
-                                   or "hanclub" in tracker):
-                    site_total += 1
-                if only_completed:
-                    progress = HHClubButler._get_progress_ratio(t, dl_type)
-                    if progress is not None and progress < 1.0:
-                        return
-                try:
-                    nm = t.get("name") if isinstance(t, dict) else getattr(t, "name", "")
-                except Exception:
-                    nm = ""
-                if nm:
-                    names.add(nm)
-
-            if torrents is None:
-                for name, sv in svcs.items():
-                    try:
-                        ts, error = sv.instance.get_torrents()
-                        if error:
-                            logs.append(f"下载器 {name} 获取种子列表出错")
-                            continue
-                    except Exception as e:
-                        logs.append(f"下载器 {name} 获取种子失败：{e}")
+            for client, service in services.items():
+                dl_type = str(getattr(service, "type", "") or getattr(service.config, "type", ""))
+                if torrents is None:
+                    remote, error = service.instance.get_torrents()
+                    if error or remote is None:
+                        return None
+                else:
+                    remote = [t for label, t in torrents if label == client]
+                for torrent in remote:
+                    if only_completed and not self._is_completed(torrent, dl_type):
                         continue
-                    for t in ts:
-                        scan(name, sv_types.get(name, ""), t)
-            else:
-                for dl_name, t in torrents:
-                    scan(dl_name, sv_types.get(dl_name, ""), t)
-            if only_completed:
-                logs.append(f"下载器共 {total} 个种子，本站tracker {site_total} 个，已完成做种 {len(names)} 个")
+                    if not any_tracker and not is_trusted_hh_tracker(self._extract_tracker_text(torrent, dl_type)):
+                        continue
+                    name = self._torrent_field(torrent, "name")
+                    if not name:
+                        return None
+                    names.add(str(name))
             return names
-        except Exception as e:
-            logs.append(f"获取下载器种子失败：{e}")
+        except Exception as error:
+            logs.append(f"下载器读取失败：{self._safe_error(error)}")
             return None
 
     def _push_seeds(self, seeds: list, logs: list):
         service = self._get_downloader_obj()
         if not service:
             logs.append("未配置有效的下载器，无法推送")
-            return 0, 0, []
+            return 0, len(seeds), [{"title": s.get("title", ""), "reason": "推送下载器不可用"} for s in seeds]
         session = self._session()
         push_cookie = self._get_site_cookie() or None
         ok_count = 0
         fail_list = []
-        for s in seeds:
+        for index, s in enumerate(seeds):
+            if not self._operation_allowed():
+                fail_list.extend({"title": pending.get("title", ""), "reason": "配置变化，未推送"} for pending in seeds[index:])
+                break
             href = s.get("href", "")
             title = s.get("title", "")
             if not href:
@@ -3980,7 +4184,10 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
                 continue
             url = href if href.startswith("http") else f"{self._get_site_url()}/{href.lstrip('/')}"
             try:
-                r = session.get(url, timeout=60)
+                r = self._download_response(session, url)
+                if not self._operation_allowed():
+                    fail_list.extend({"title": pending.get("title", ""), "reason": "配置变化，未添加下载"} for pending in seeds[index:])
+                    break
                 if r.status_code == 200 and r.content:
                     dl_type = ""
                     try:
@@ -4022,65 +4229,30 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
                 else:
                     fail_list.append({"title": title, "reason": f"种子文件下载失败(HTTP {r.status_code})"})
             except Exception as e:
-                fail_list.append({"title": title, "reason": f"推送异常：{e}"})
+                fail_list.append({"title": title, "reason": f"推送异常：{self._safe_error(e)}"})
             time.sleep(1)
         return ok_count, len(seeds) - ok_count, fail_list
 
-    def _do_delete_in_service(self, sv, seeds: list, logs: list) -> int:
-        try:
-            torrents, error = sv.instance.get_torrents()
-            if error:
-                return 0
-        except Exception:
-            return 0
-        del_norms = set()
-        for s in seeds:
-            n = HHClubButler._norm_title(s.get("title") or "")
-            if n:
-                del_norms.add(n)
-        if not del_norms:
-            return 0
-        del_ids = []
-        for t in torrents:
-            try:
-                tname = t.get("name") if isinstance(t, dict) else getattr(t, "name", "")
-                thash = (t.get("hash") if isinstance(t, dict)
-                         else getattr(t, "hash", None) or getattr(t, "hashString", ""))
-            except Exception:
-                continue
-            if HHClubButler._norm_title(tname) in del_norms and thash:
-                tracker = HHClubButler._extract_tracker_text(t).lower()
-                if any(k in tracker for k in ("hhanclub", "hhclub", "hanclub")):
-                    del_ids.append(thash)
-        if del_ids:
-            try:
-                sv.instance.delete_torrents(delete_file=True, ids=del_ids)
-                logs.append(f"已删除 {len(del_ids)} 个种子（任务+文件）")
-                return len(del_ids)
-            except Exception as e:
-                logs.append(f"删除种子失败：{e}")
-        return 0
 
-    def _delete_seeds(self, seeds: list, logs: list):
-        svcs = self._get_manage_services()
-        if not svcs:
-            logs.append("未配置有效的下载器，无法删除")
-            return
-        by_dl = {}
-        for s in seeds:
-            by_dl.setdefault(str(s.get("downloader") or ""), []).append(s)
-        total = 0
-        for dl_name, sub in by_dl.items():
-            if dl_name:
-                sv = svcs.get(dl_name)
-                if not sv:
-                    logs.append(f"下载器 {dl_name} 不可用，跳过其种子删除")
-                    continue
-                total += self._do_delete_in_service(sv, sub, logs)
-            else:
-                logs.append("种子缺少来源下载器，拒绝跨下载器猜测删除")
-        if total:
-            logs.append(f"删除低档位种子：共 {total} 个")
+    def _delete_seeds(self, seeds: list, logs: list, auto_mode: str = "wash"):
+        verified, removed = [], 0
+        generation = getattr(self, "_run_generation", self._delete_generation)
+        for seed in seeds:
+            targets = tuple(sorted((str(c.get("downloader") or ""), str(c.get("hash") or "").lower())
+                                   for c in seed.get("candidates", [])))
+            if not targets or any(not client or not value for client, value in targets):
+                logs.append("缺少下载器及 Hash 身份，拒绝跨下载器猜测删除")
+                return {"verified": verified, "removed_count": removed, "success": False}
+            if not self._operation_allowed(generation):
+                return {"verified": verified, "removed_count": removed, "success": False}
+            result = self._delete_rescue_group(seed_id=seed["seed_id"], title=seed["title"],
+                targets=targets, generation=generation, request_id=f"auto-{time.time_ns()}", auto_mode=auto_mode)
+            removed += result.get("removed_count", 0)
+            logs.append(result.get("message", "删除状态待核对"))
+            if result.get("state") != "verified":
+                return {"verified": verified, "removed_count": removed, "success": False}
+            verified.append(seed)
+        return {"verified": verified, "removed_count": removed, "success": True}
 
     @staticmethod
     def _norm_match(name: str, targets: set) -> bool:
@@ -4096,87 +4268,27 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
         return False
 
     def _clean_stale_downloads(self, logs: list, seeds: list, extra_titles: set = None):
-        svcs = self._get_manage_services()
-        if not svcs:
+        if not self._operation_allowed():
             return 0
         try:
-            site_titles = {HHClubButler._norm_title(s.get("title") or "") for s in seeds}
-            if extra_titles:
-                site_titles |= set(extra_titles)
-        except Exception:
-            site_titles = set(extra_titles or [])
-        now = time.time()
-        threshold = self._auto_clean_days * 86400
-        total_deleted = 0
-        per_dl = {}
-        for name, service in svcs.items():
-            dl_type = ""
-            try:
-                dl_type = str(service.type or service.config.type or "")
-            except Exception:
-                pass
-            try:
-                torrents, error = service.instance.get_torrents()
-                if error:
-                    continue
-            except Exception:
-                continue
-            stale = []
-            for t in torrents:
-                try:
-                    tracker = HHClubButler._extract_tracker_text(t)
-                    if isinstance(t, dict):
-                        tname = str(t.get("name") or "")
-                        progress = t.get("progress")
-                        added = (t.get("added_on") or t.get("added_time") or t.get("added_date") or 0)
-                        tid = t.get("hash") or t.get("id")
-                    else:
-                        tname = str(getattr(t, "name", "") or "")
-                        progress = HHClubButler._get_progress_ratio(t, dl_type)
-                        added = (getattr(t, "added_on", 0) or getattr(t, "added_time", 0)
-                                 or getattr(t, "added_date", 0) or 0)
-                        tid = getattr(t, "hash", None) or getattr(t, "hashString", None) or getattr(t, "id", None)
-                except Exception:
-                    continue
-                is_site = ("hhanclub" in tracker or "hhclub" in tracker or "hanclub" in tracker)
-                # File deletion must never be inferred from a similar filename.
-                if not is_site:
-                    continue
-                try:
-                    progress = float(progress) if progress is not None else 1.0
-                except (TypeError, ValueError):
-                    progress = 1.0
-                if progress > 1.0:
-                    progress /= 100.0
-                if progress >= 1.0:
-                    continue
-                try:
-                    if hasattr(added, "timestamp"):
-                        added = added.timestamp()
-                    added = float(added)
-                except (TypeError, ValueError, OSError, OverflowError):
-                    added = 0.0
-                if added <= 0:
-                    continue
-                if now - added >= threshold:
-                    stale.append((tid, tname))
-            if not stale:
-                continue
-            ids = [tid for tid, _ in stale if tid]
-            if not ids:
-                continue
-            try:
-                service.instance.delete_torrents(delete_file=True, ids=ids)
-                total_deleted += len(ids)
-                per_dl[name] = len(ids)
-            except Exception as e:
-                logs.append(f"未完成清理（下载器 {name}）失败：{e}")
-        if not per_dl:
-            logs.append(f"未完成清理：无超过 {self._auto_clean_days:g} 天未完成的任务")
+            rows = self._collect_rescue_seeds(strict_downloaders=True)
+        except Exception as error:
+            logs.append(f"自动清理无法完整核验：{self._safe_error(error)}")
             return 0
-        detail = "，".join(f"{k} {v} 个" for k, v in per_dl.items())
-        logs.append(f"未完成清理：已删除 {total_deleted} 个超时任务（含未完成文件，{detail}）")
-        return total_deleted
+        threshold, stale = self._auto_clean_days * 86400, []
+        for row in rows:
+            copies = row.get("candidates", [])
+            if (not row.get("can_delete_group") or not copies
+                    or not all(copy.get("trusted_tracker") and copy.get("progress") is not None
+                               and not copy.get("completed") and copy.get("added_timestamp", 0) > 0
+                               and time.time() - copy["added_timestamp"] >= threshold for copy in copies)):
+                continue
+            stale.append(row)
+        result = self._delete_seeds(stale, logs, auto_mode="stale")
+        if not result["success"]:
+            raise RuntimeError(f"自动清理部分完成或结果不确定，已核实移除 {result['removed_count']} 个；停止后续优选，禁止重发")
+        logs.append(f"已核实移除超时未完成任务 {result['removed_count']} 个；磁盘状态需另行核对")
+        return result["removed_count"]
 
     @staticmethod
     def _parse_seeder_range(raw) -> Optional[tuple]:
@@ -4203,7 +4315,7 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
 
     def _optimize_incremental(self, seeds: list, eff_target: float,
                               current_gb: float, logs: list) -> dict:
-        cap = eff_target
+        cap = float("inf") if self._target_volume <= 0 else eff_target
         if cap <= 0:
             logs.append("当前保种体积已达目标，无需新增")
             return {"picked": [], "total_gb": 0.0, "del_seeds": []}
@@ -4228,6 +4340,7 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
         if not cap or cap <= 0:
             logs.append("目标体积为0（不限），换种模式不删除任何种子")
             return {"picked": [], "del_seeds": [], "total_gb": 0.0, "keep_count": len(current)}
+        cap = min(cap, sum(s.get("size", 0) for s in current) + max(0, eff_target))
         cur_titles = {s["title"] for s in current}
         # 从当前在保种子开始，默认全部保留
         final = list(current)
@@ -4248,7 +4361,7 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
             # 放不下：只踢比候选档位更低的种子（低档优先、小体积优先）
             cand_tier = tier_of(cand.get("seeders", 1))
             victims = [s for s in final
-                       if tier_of(s.get("seeders", 1)) > cand_tier
+                       if s.get("auto_delete_ready") and tier_of(s.get("seeders", 1)) > cand_tier
                        and s["title"] not in del_map]
             victims.sort(key=lambda s: (-tier_of(s.get("seeders", 1)), s.get("size", 0.0)))
             evicted_this_round = []
@@ -4296,4 +4409,4 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
             with open(path / "run_log.txt", "w", encoding="utf-8") as f:
                 f.write("\n".join(logs))
         except Exception as e:
-            logger.error(f"保存日志失败：{e}")
+            logger.error(f"保存日志失败：{HHClubButler._safe_error(e)}")
