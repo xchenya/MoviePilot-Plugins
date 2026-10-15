@@ -53,6 +53,8 @@ def plugin():
     p.post_message = Mock()
     p._test_logger = ns["logger"]
     p._test_site_oper = ns["SiteOper"]
+    p._test_interval = ns["IntervalTrigger"]
+    p._test_cron = ns["CronTrigger"]
     return p
 
 

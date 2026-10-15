@@ -81,7 +81,7 @@ def test_v3_metadata_and_source_license():
     }
     market = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))
     entry = market["SiQiCleanBeach"]
-    assert attrs["plugin_version"] == entry["version"] == "2.1.2"
+    assert attrs["plugin_version"] == entry["version"] == "2.2.0"
     assert entry["system_version"] == ">=3.0.0"
     assert entry["release"] is False
     assert attrs["plugin_author"].startswith("bfjy")
@@ -121,7 +121,7 @@ def test_separate_runtime_lock_and_mutable_state():
 
 
 def test_nested_html_inventory_parsing(monkeypatch):
-    cls = _isolated_class("__cookie_to_dict", "__fetch_inventory")
+    cls = _isolated_class("__cookie_to_dict", "__fetch_inventory", "__read_beach_cooldown")
     plugin = cls()
     plugin.MOWAN_URL = "https://si-qi.xyz/mowan.php"
     plugin.ITEM_ICONS = {}
@@ -154,7 +154,7 @@ def test_nested_html_inventory_parsing(monkeypatch):
 
 
 def test_unknown_inventory_markup_keeps_cache(monkeypatch):
-    cls = _isolated_class("__cookie_to_dict", "__fetch_inventory")
+    cls = _isolated_class("__cookie_to_dict", "__fetch_inventory", "__read_beach_cooldown")
     p = cls()
     p.MOWAN_URL = "https://si-qi.xyz/mowan.php"
     p.ITEM_ICONS = {}

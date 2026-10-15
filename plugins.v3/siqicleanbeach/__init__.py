@@ -1,7 +1,7 @@
 """思齐自动收垃圾（MoviePilot V3 移植版）。
 
 原作者 bfjy，源码来自 bfjy2024/MoviePilot-Plugins，按原仓库 GPL-3.0
-许可改造。V3 适配由 xchenya 维护；未经过真实思齐站点联调。
+许可改造。V3 适配由 xchenya 维护；搬砖已获用户宿主日志验证，新调度未经真实联调。
 """
 import json
 import re
@@ -36,9 +36,9 @@ class StatsResponse(BaseModel):
 
 class SiQiCleanBeach(_PluginBase):
     plugin_name = "思齐自动收垃圾"
-    plugin_desc = "自动清理沙滩，可选自动搬砖，支持Cron和间隔定时；未经真实联调。"
+    plugin_desc = "自动清理沙滩和可选搬砖，支持站点冷却或固定时间；新调度未经真实联调。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Moviepilot_A.png"
-    plugin_version = "2.1.2"
+    plugin_version = "2.2.0"
     plugin_author = "bfjy（V3 适配：xchenya）"
     author_url = "https://bfjy2024.github.io/bfjy"
     plugin_config_prefix = "siqicleanbeach_"
@@ -132,7 +132,9 @@ class SiQiCleanBeach(_PluginBase):
 
         self._enabled = bool(config.get("enabled", False))
         self._cookie = (config.get("cookie") or site_cookie or "").strip()
-        self._schedule_mode = config.get("schedule_mode", "interval")
+        self._schedule_mode = config.get("schedule_mode", "interval" if config else "auto")
+        if self._schedule_mode not in {"auto", "cron", "interval"}:
+            self._schedule_mode = "interval"
         self._cron = (config.get("cron") or "1 */2 * * *").strip()
         self._interval_minutes = self.__safe_int(config.get("interval_minutes"), 121, min_value=1)
         self._auto_brick = bool(config.get("auto_brick", False))
@@ -214,6 +216,11 @@ class SiQiCleanBeach(_PluginBase):
     def get_service(self) -> List[Dict[str, Any]]:
         if not self._enabled:
             return []
+
+        if self._schedule_mode == "auto":
+            return [{"id": "SiQiCleanBeach", "name": "思齐站点冷却调度",
+                     "trigger": IntervalTrigger(minutes=1), "func": self.run_clean_task,
+                     "kwargs": {"scheduled": True}}]
 
         if self._schedule_mode == "interval":
             try:
@@ -305,10 +312,11 @@ class SiQiCleanBeach(_PluginBase):
                                             "model": "schedule_mode",
                                             "label": "定时模式",
                                             "items": [
-                                                {"title": "Cron表达式", "value": "cron"},
-                                                {"title": "固定间隔(分钟)", "value": "interval"},
+                                                {"title": "按站点冷却（推荐）", "value": "auto"},
+                                                {"title": "固定时间（Cron）", "value": "cron"},
+                                                {"title": "旧版固定间隔（兼容）", "value": "interval"},
                                             ],
-                                            "hint": "选择定时执行方式"
+                                            "hint": "站点冷却与固定时间二选一；旧间隔仅作兼容。自动模式每分钟在本地检查，到期才请求站点。"
                                         }
                                     }
                                 ]
@@ -323,7 +331,7 @@ class SiQiCleanBeach(_PluginBase):
                                             "model": "cron",
                                             "label": "Cron表达式",
                                             "placeholder": "5位 Cron 表达式",
-                                            "hint": "Cron模式下生效"
+                                            "hint": "固定时间模式生效，例如 5 0,2,4,6,8,10,12,14,16,18,20,22 * * *；使用宿主时区"
                                         }
                                     }
                                 ]
@@ -354,7 +362,7 @@ class SiQiCleanBeach(_PluginBase):
                                 {"component": "VSwitch", "props": {"model": "auto_brick", "label": "自动搬砖（默认关闭）"}}
                             ]},
                             {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                                {"component": "VTextField", "props": {"model": "brick_cooldown_minutes", "label": "搬砖冷却（分钟）", "type": "number", "min": 1, "hint": "默认1440分钟；使用服务端时间，每日最多50块。"}}
+                                {"component": "VTextField", "props": {"model": "brick_cooldown_minutes", "label": "旧版搬砖冷却（分钟）", "type": "number", "min": 1, "hint": "仅旧版固定间隔模式使用。站点冷却/固定时间模式以服务端每日50块及重置时间为准。"}}
                             ]}
                         ]
                     },
@@ -421,7 +429,9 @@ class SiQiCleanBeach(_PluginBase):
 
         history = stats.get("history", [])[-5:]
 
-        if self._schedule_mode == "interval":
+        if self._schedule_mode == "auto":
+            schedule_info = "按站点冷却（每分钟本地检查）"
+        elif self._schedule_mode == "interval":
             schedule_info = f"每{self._interval_minutes}分钟"
         else:
             schedule_info = f"Cron: {self._cron}"
@@ -457,6 +467,9 @@ class SiQiCleanBeach(_PluginBase):
                                 "component": "VRow",
                                 "content": [
                                     self.__info_col("⏰ 定时模式", schedule_info),
+                                    self.__info_col("🏖️ 沙滩下次可执行", self.__due_text("beach_due_at")),
+                                    self.__info_col("🧱 搬砖下次可执行", self.__due_text("brick_due_at") if self._auto_brick else "未开启"),
+                                    self.__info_col("⏳ 沙滩时间来源", stats.get("beach_due_source", "等待首次同步")),
                                     self.__info_col("📝 最后结果", stats.get("last_result", "-")),
                                     self.__info_col("🗑️ 清理结果", stats.get("clean_result", "-")),
                                     self.__info_col("🧱 搬砖结果", stats.get("brick_result", "-")),
@@ -764,13 +777,29 @@ class SiQiCleanBeach(_PluginBase):
             title="【思齐自动收垃圾插件】",
             text="任务已启动，完成后会发送通知。" if launched else "已有收垃圾任务正在执行或无法启动。"
         )
-    def run_clean_task(self, reserved: bool = False) -> Dict[str, Any]:
+    def __due_text(self, key: str) -> str:
+        due = self._stats.get(key)
+        if not isinstance(due, (int, float)):
+            return "等待首次同步"
+        remaining = max(0, int(due - time.time()))
+        return f"{datetime.fromtimestamp(due):%Y-%m-%d %H:%M:%S}（约{remaining // 3600}:{remaining // 60 % 60:02d}:{remaining % 60:02d}）"
+
+    def run_clean_task(self, reserved: bool = False, scheduled: bool = False) -> Dict[str, Any]:
         if not reserved and not self._lock.acquire(blocking=False):
             return {"status": "running", "message": "已有任务正在执行"}
+        auto = scheduled and self._schedule_mode == "auto"
+        now = time.time()
+        beach_at, brick_at = self._stats.get("beach_due_at"), self._stats.get("brick_due_at")
+        clean_due = not auto or not isinstance(beach_at, (int, float)) or now >= beach_at
+        brick_due = self._auto_brick and (not auto or not isinstance(brick_at, (int, float)) or now >= brick_at)
+        if auto and not clean_due and not brick_due:
+            self._lock.release()
+            return {"status": "waiting", "message": "等待站点冷却到期"}
         clean = {"success": False, "message": "未执行", "trash": 0}
         brick = {"success": True, "message": "未开启", "bricks_moved": 0}
         refreshed = False
         self._stats["inventory_refreshed"] = False
+        self._stats["beach_cooldown_refreshed"] = False
         try:
             cookie = (self._cookie or self.__get_site_cookie() or "").strip()
             if not cookie or "c_secure_pass=" not in cookie:
@@ -778,16 +807,21 @@ class SiQiCleanBeach(_PluginBase):
             else:
                 # 每轮共用连接池，避免50次搬砖反复建立TLS连接。
                 self._session = requests.Session()
-                clean = self.__enter_beach(cookie)
-                if clean.get("success"):
-                    clean = self.__collect_trash(cookie)
+                if clean_due:
+                    clean = self.__enter_beach(cookie)
+                    if clean.get("success"):
+                        clean = self.__collect_trash(cookie)
+                else:
+                    clean = {"success": True, "message": "沙滩冷却中，未发送清理请求", "skipped": True}
                 if clean.get("auth_failed"):
                     brick["message"] = "认证失败，停止后续请求"
                     brick["success"] = False
                     brick["auth_failed"] = True
                 else:
-                    if self._auto_brick:
+                    if brick_due:
                         brick = self.__move_bricks(cookie)
+                    elif self._auto_brick:
+                        brick["message"] = "未到下次搬砖检查时间，未发送搬砖请求"
                     if not brick.get("auth_failed"):
                         inventory = self.__fetch_inventory(cookie)
                         if inventory is not None:
@@ -807,7 +841,7 @@ class SiQiCleanBeach(_PluginBase):
             try:
                 total = sum(item.get("count", 0) for item in self._inventory.values())
                 stock = self._inventory.get("砖块", {}).get("count")
-                clean_text = f"收集{clean.get('trash', 0)}个垃圾" if clean.get("success") else clean.get("message", "未执行")
+                clean_text = f"收集{clean.get('trash', 0)}个垃圾" if clean.get("success") and not clean.get("skipped") else clean.get("message", "未执行")
                 brick_text = brick.get("message", "未知")
                 daily = brick.get("daily_bricks")
                 moved = brick.get("bricks_moved", 0)
@@ -825,6 +859,16 @@ class SiQiCleanBeach(_PluginBase):
                 history.append({"time": result["timestamp"], "result": message, "status": status,
                                 "total_count": total, **result["data"]})
                 self._stats["history"] = history[-20:]
+                if not self._stats.get("beach_cooldown_refreshed") and clean_due:
+                    self._stats["beach_due_at"] = time.time() + self._interval_minutes * 60
+                    self._stats["beach_due_source"] = "未读到站点冷却，回退配置间隔"
+                if brick_due:
+                    delay = 300
+                    if (brick.get("daily_bricks") == 50 or self._stats.get("brick_uncertain_reset") is not None):
+                        reset, server = brick.get("next_brick_reset_ts"), brick.get("server_now")
+                        if isinstance(reset, int) and isinstance(server, int) and reset > server:
+                            delay = reset - server + 5
+                    self._stats["brick_due_at"] = time.time() + delay
                 self.__finish_task(result)
             finally:
                 try:
@@ -941,7 +985,7 @@ class SiQiCleanBeach(_PluginBase):
             return {**result, "message": "上次写入结果不确定，等待服务端每日重置后再执行"}
         self._stats.pop("brick_uncertain_reset", None)
         last_run = self._stats.get("brick_last_run_server", 0)
-        if last_run and state["server_now"] - last_run < self._brick_cooldown_minutes * 60:
+        if self._schedule_mode == "interval" and last_run and state["server_now"] - last_run < self._brick_cooldown_minutes * 60:
             return {**result, "success": True, "message": "搬砖冷却中，正常跳过"}
         # 最多50次，串行间隔2秒；每次必须有服务端数量进展。
         for attempt in range(50):
@@ -1008,6 +1052,7 @@ class SiQiCleanBeach(_PluginBase):
             if soup.select_one("form[action*='login'], input[type='password']"):
                 logger.warning("库存页面疑似跳转至登录页面，请更新 Cookie")
                 return None
+            self.__read_beach_cooldown(soup)
             inventory: Dict[str, Any] = {}
             for item in soup.select(".inventory-item"):
                 name_node = item.select_one(".item-name")
@@ -1038,6 +1083,30 @@ class SiQiCleanBeach(_PluginBase):
         except Exception as exc:
             logger.error(f"思齐库存解析失败：{exc.__class__.__name__}")
             return None
+
+    def __read_beach_cooldown(self, soup):
+        """只解析初始化数字，不执行站点 JavaScript，不采信变化中的倒计时文本。"""
+        for script in soup.find_all("script"):
+            bootstrap = re.search(r"\b(?:let|const|var)\s+gameData\s*=\s*\{(.*?)\};", script.get_text(), re.S)
+            if not bootstrap:
+                continue
+            source = bootstrap.group(1)
+            if not re.search(r"\bserverTimeOffset\s*:\s*\d+\s*-\s*Math\.floor\(Date\.now\(\)\s*/\s*1000\)", source):
+                continue
+            values = {}
+            for key in ("lastBeachTime", "beachInterval", "serverTimeOffset"):
+                found = re.search(r"\b" + key + r"\s*:\s*(\d+)\b", source)
+                if found:
+                    values[key] = int(found.group(1))
+            if len(values) != 3:
+                continue
+            last, interval, server = values["lastBeachTime"], values["beachInterval"], values["serverTimeOffset"]
+            if not (server > 0 and 0 <= last <= server and 0 < interval <= 86400):
+                continue
+            self._stats["beach_due_at"] = time.time() + max(0, last + interval - server) + 5
+            self._stats["beach_cooldown_refreshed"] = True
+            self._stats["beach_due_source"] = "站点初始化时间（服务端校时，5秒余量）"
+            return
 
     def __get_site_cookie(self):
         site_cookie = ""
@@ -1132,6 +1201,10 @@ class SiQiCleanBeach(_PluginBase):
         total_count = sum(item.get("count", 0) for item in self._inventory.values())
         text += f"\n\n📊 物品种类：{len(self._inventory)} 种"
         text += f"\n📦 物品总数：{total_count:,} 个"
+        if self._schedule_mode == "auto":
+            text += f"\n🏖️ 沙滩下次检查：{self.__due_text('beach_due_at')}"
+            if self._auto_brick:
+                text += f"\n🧱 搬砖下次检查：{self.__due_text('brick_due_at')}"
 
         self.post_message(
             mtype=NotificationType.Plugin,
