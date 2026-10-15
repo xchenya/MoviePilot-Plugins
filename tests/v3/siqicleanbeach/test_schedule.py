@@ -60,7 +60,8 @@ def test_beach_time_uses_server_relative_delay_not_local_date(plugin, monkeypatc
 
 
 @pytest.mark.parametrize("markup", ["<script>unknown()</script>", html(last=3000), html(interval=0),
-                                    html(server=0), html().replace("2000 - Math.floor(Date.now() / 1000)", "12")])
+                                    html(server=0), html().replace("2000 - Math.floor(Date.now() / 1000)", "12"),
+                                    html().replace("beachInterval: 7200", "beachInterval: 7200 * 2")])
 def test_unknown_or_bad_bootstrap_not_guessed(plugin, markup):
     plugin._SiQiCleanBeach__read_beach_cooldown(BeautifulSoup(markup, "html.parser"))
     assert "beach_due_at" not in plugin._stats

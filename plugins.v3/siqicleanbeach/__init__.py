@@ -1091,11 +1091,12 @@ class SiQiCleanBeach(_PluginBase):
             if not bootstrap:
                 continue
             source = bootstrap.group(1)
-            if not re.search(r"\bserverTimeOffset\s*:\s*\d+\s*-\s*Math\.floor\(Date\.now\(\)\s*/\s*1000\)", source):
+            server_time = re.search(r"\bserverTimeOffset\s*:\s*(\d+)\s*-\s*Math\.floor\(Date\.now\(\)\s*/\s*1000\)", source)
+            if not server_time:
                 continue
-            values = {}
-            for key in ("lastBeachTime", "beachInterval", "serverTimeOffset"):
-                found = re.search(r"\b" + key + r"\s*:\s*(\d+)\b", source)
+            values = {"serverTimeOffset": int(server_time.group(1))}
+            for key in ("lastBeachTime", "beachInterval"):
+                found = re.search(r"\b" + key + r"\s*:\s*(\d+)\s*(?=,|\Z)", source)
                 if found:
                     values[key] = int(found.group(1))
             if len(values) != 3:
