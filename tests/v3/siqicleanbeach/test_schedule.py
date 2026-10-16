@@ -22,19 +22,21 @@ def test_new_install_auto_and_old_config_unchanged(plugin):
     plugin.init_plugin({})
     assert plugin._schedule_mode == "auto" and not plugin._auto_brick
     plugin.init_plugin({"enabled": True, "auto_brick": True, "brick_cooldown_minutes": 1440})
-    assert plugin._schedule_mode == "interval" and plugin._brick_cooldown_minutes == 1440
+    assert plugin._schedule_mode == "interval"
     plugin.init_plugin({"schedule_mode": "cron", "cron": "5 0 * * *"})
     assert plugin._cron == "5 0 * * *" and plugin._schedule_mode == "cron"
 
 
-def test_auto_trigger_defaults_to_ten_minute_local_check(plugin, monkeypatch):
+def test_auto_schedules_only_earliest_due_without_periodic_checks(plugin, monkeypatch):
     monkeypatch.setattr(time, "time", lambda: 1000)
-    plugin._enabled, plugin._schedule_mode = True, "auto"
-    service = plugin.get_service()[0]
-    plugin._test_interval.assert_called_once_with(minutes=10)
-    assert service["kwargs"] == {"scheduled": True}
-    plugin._stats.update(beach_due_at=4600, brick_due_at=4600)
-    assert service["func"](**service["kwargs"])["status"] == "waiting"
+    plugin.init_plugin({"enabled": True, "schedule_mode": "auto", "auto_brick": True,
+                        "check_interval_minutes": 60,
+                        "stats": {"due_schedule_version": 1, "beach_due_at": 1600, "brick_due_at": 4600}})
+    assert plugin.get_service() == []
+    plugin._test_interval.assert_not_called()
+    job = plugin._scheduler.add_job.call_args
+    assert job.kwargs["trigger"] == "date" and job.kwargs["run_date"].timestamp() == 1600
+    assert plugin.run_clean_task(scheduled=True)["status"] == "waiting"
     requests.Session.assert_not_called()
     plugin.update_config.assert_not_called()
     plugin.post_message.assert_not_called()
@@ -59,7 +61,7 @@ def test_server_reset_overrides_old_1440_minute_block_in_new_modes(plugin, monke
 def test_beach_time_uses_server_relative_delay_not_local_date(plugin, monkeypatch):
     monkeypatch.setattr("time.time", lambda: 100)
     plugin._SiQiCleanBeach__read_beach_cooldown(BeautifulSoup(html(), "html.parser"))
-    assert plugin._stats["beach_due_at"] == 7105
+    assert plugin._stats["beach_due_at"] == 7115
     assert plugin._stats["beach_cooldown_refreshed"]
 
 
@@ -81,14 +83,14 @@ def test_auto_beach_waits_while_bricks_run_and_records_reset(plugin, monkeypatch
     assert result["data"]["clean"]["skipped"]
     assert result["data"]["brick"]["bricks_moved"] == 1
     assert [c.kwargs["data"]["action"] for c in post.call_args_list] == ["sync_game_state", "move_brick"]
-    assert plugin._stats["brick_due_at"] == 51005
-    assert plugin._stats["beach_due_at"] == 8005
+    assert plugin._stats["brick_due_at"] == 51015
+    assert plugin._stats["beach_due_at"] == 8015
 
 
 def test_auto_brick_waits_while_beach_runs(plugin, monkeypatch):
     monkeypatch.setattr("time.time", lambda: 1000)
     plugin._schedule_mode = "auto"
-    plugin._stats["brick_due_at"] = 8000
+    plugin._stats.update(beach_due_at=999, brick_due_at=8000)
     post = posts(monkeypatch, response(dict(success=True)), response(dict(success=True, collected=3)))
     monkeypatch.setattr(requests, "get", Mock(return_value=response(text=html())))
     result = plugin.run_clean_task(scheduled=True)
@@ -106,20 +108,21 @@ def test_manual_run_still_checks_site_even_before_cached_due(plugin, monkeypatch
     assert post.call_count == 2
 
 
-def test_missing_beach_fields_falls_back_with_honest_source(plugin, monkeypatch):
+def test_missing_beach_fields_queries_later_without_blind_entry(plugin, monkeypatch):
     monkeypatch.setattr("time.time", lambda: 1000)
     plugin._schedule_mode, plugin._auto_brick = "auto", False
-    posts(monkeypatch, response(dict(success=False, message="冷却中")))
+    post = posts(monkeypatch)
     monkeypatch.setattr(requests, "get", Mock(return_value=response(text='<div class="inventory-grid"></div>')))
     plugin.run_clean_task(scheduled=True)
-    assert plugin._stats["beach_due_at"] == 8260
-    assert "回退" in plugin._stats["beach_due_source"]
+    assert plugin._stats["beach_due_at"] == 1300
+    assert "等待重查" in plugin._stats["beach_due_source"]
+    post.assert_not_called()
 
 
 def test_due_times_survive_every_save_and_reload(plugin, monkeypatch):
     monkeypatch.setattr(time, "time", lambda: 1000)
     plugin._schedule_mode = "auto"
-    plugin._stats.update(beach_due_at=4600, brick_due_at=4600)
+    plugin._stats.update(due_schedule_version=1, beach_due_at=4600, brick_due_at=4600)
     plugin._update_stats()
     saved = plugin.update_config.call_args.args[0]
     plugin.init_plugin(saved)
@@ -148,10 +151,11 @@ def test_bad_cached_dates_do_not_crash_page_or_stall_scheduler(plugin, monkeypat
     plugin._stats.update(beach_due_at=invalid, brick_due_at=invalid)
     assert "异常" in plugin._SiQiCleanBeach__due_text("brick_due_at")
     plugin.get_page()
-    post = posts(monkeypatch, response(dict(success=False, message="冷却中")), response(state(50)))
+    post = posts(monkeypatch, response(state(50)))
     monkeypatch.setattr(requests, "get", Mock(return_value=response(text=html())))
-    assert plugin.run_clean_task(scheduled=True)["status"] == "completed"
-    assert post.call_count == 2 and not plugin._lock.locked()
+    assert plugin.run_clean_task(scheduled=True)["status"] == "waiting"
+    assert post.call_count == 1 and not plugin._lock.locked()
+    assert post.call_args.kwargs["data"]["action"] == "sync_game_state"
 
 
 @pytest.mark.parametrize("remaining", [0, -1, 172801, 10**400])
@@ -167,6 +171,7 @@ def test_slow_inventory_does_not_shift_server_reset(plugin, monkeypatch, remaini
     clock = [1000]
     monkeypatch.setattr(time, "time", lambda: clock[0])
     plugin._schedule_mode = "auto"
+    plugin._stats["beach_due_at"] = 999
     posts(monkeypatch, response(dict(success=False, message="冷却中")), response(state(50, next_brick_reset_ts=2_000_000 + remaining)))
 
     def inventory(*args, **kwargs):
@@ -175,7 +180,7 @@ def test_slow_inventory_does_not_shift_server_reset(plugin, monkeypatch, remaini
 
     monkeypatch.setattr(requests, "get", inventory)
     plugin.run_clean_task(scheduled=True)
-    assert plugin._stats["brick_due_at"] == 1000 + remaining + 5
+    assert plugin._stats["brick_due_at"] == 1000 + remaining + 15
 
 
 def test_stopping_task_does_not_send_more_bricks_or_invent_uncertain_write(plugin, monkeypatch):
@@ -265,7 +270,7 @@ def test_stopping_queued_manual_task_is_not_cleared_by_worker_start(plugin, monk
 
 def test_non_finite_legacy_minutes_fall_back_without_crashing(plugin):
     plugin.init_plugin({"interval_minutes": float("inf"), "brick_cooldown_minutes": float("inf")})
-    assert plugin._interval_minutes == 121 and plugin._brick_cooldown_minutes == 1440
+    assert plugin._interval_minutes == 121
 
 
 def test_stopped_service_cannot_restart_from_already_queued_schedule(plugin):
@@ -277,6 +282,7 @@ def test_stopped_service_cannot_restart_from_already_queued_schedule(plugin):
 def test_bad_reset_in_failed_sync_cannot_overflow_final_scheduler(plugin, monkeypatch):
     monkeypatch.setattr(time, "time", lambda: 1000)
     plugin._schedule_mode = "auto"
+    plugin._stats["beach_due_at"] = 999
     posts(monkeypatch, response(dict(success=False, message="冷却中")),
           response(state(50, success=False, next_brick_reset_ts=10**400)))
     monkeypatch.setattr(requests, "get", Mock(return_value=response(text=html())))
@@ -284,24 +290,26 @@ def test_bad_reset_in_failed_sync_cannot_overflow_final_scheduler(plugin, monkey
     assert plugin._stats["brick_due_at"] == 1300 and not plugin._lock.locked()
 
 
-@pytest.mark.parametrize("value,expected", [(None, 10), ("25", 25), (0, 1), (-3, 1), ("bad", 10), (float("inf"), 10)])
-def test_check_interval_defaults_custom_value_and_validation(plugin, value, expected):
+@pytest.mark.parametrize("value", [None, "60", 0, -3, "bad", float("inf")])
+def test_obsolete_check_interval_does_not_delay_initial_sync(plugin, monkeypatch, value):
+    monkeypatch.setattr(time, "time", lambda: 1000)
     plugin.init_plugin({"enabled": True, "schedule_mode": "auto", "check_interval_minutes": value})
-    plugin.get_service()
-    plugin._test_interval.assert_called_once_with(minutes=expected)
+    assert plugin._scheduler.add_job.call_args.kwargs["run_date"].timestamp() == 1015
+    plugin._test_interval.assert_not_called()
 
 
-def test_custom_check_interval_survives_all_save_paths_and_display(plugin):
+def test_obsolete_interval_controls_are_removed_from_all_save_paths_and_form(plugin):
     plugin._queue_manual_run = Mock(return_value=True)
     plugin.init_plugin({"enabled": True, "schedule_mode": "auto", "check_interval_minutes": 25, "run_once": True})
-    assert plugin.update_config.call_args.args[0]["check_interval_minutes"] == 25
+    assert "check_interval_minutes" not in plugin.update_config.call_args.args[0]
     plugin._update_stats()
     saved = plugin.update_config.call_args.args[0]
-    assert saved["check_interval_minutes"] == 25
+    assert "check_interval_minutes" not in saved
     plugin.init_plugin(saved)
     form, defaults = plugin.get_form()
-    assert defaults["check_interval_minutes"] == 25
-    assert '"model": "check_interval_minutes"' in json.dumps(form)
+    assert "check_interval_minutes" not in defaults
+    assert '"model": "check_interval_minutes"' not in json.dumps(form)
+    assert '"model": "brick_cooldown_minutes"' not in json.dumps(form)
     assert "按站点冷却" in json.dumps(plugin.get_page(), ensure_ascii=False)
 
 
@@ -325,6 +333,7 @@ def test_panel_shows_compact_dates_and_result_without_changing_saved_details(plu
     assert "18:15:34（约" in plugin._SiQiCleanBeach__due_text("beach_due_at")
 
 
-def test_existing_auto_config_without_new_field_uses_ten_minutes(plugin):
+def test_existing_auto_config_ignores_legacy_execution_interval(plugin):
     plugin.init_plugin({"enabled": True, "schedule_mode": "auto", "interval_minutes": 121})
-    assert plugin._check_interval_minutes == 10 and plugin._interval_minutes == 121
+    plugin._test_interval.assert_not_called()
+    assert plugin._interval_minutes == 121

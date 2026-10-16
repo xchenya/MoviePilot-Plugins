@@ -5,7 +5,7 @@ import json
 import math
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import Mock
@@ -41,10 +41,11 @@ def plugin():
             method.decorator_list = []
     module = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
     ns = dict(Base=Base, requests=requests, BeautifulSoup=BeautifulSoup, threading=threading,
-              time=time, math=math, datetime=datetime, re=__import__("re"), Any=Any, Dict=Dict,
+              time=time, math=math, datetime=datetime, timezone=timezone, re=__import__("re"), Any=Any, Dict=Dict,
               List=List, Optional=Optional, Tuple=Tuple, Event=object,
               logger=Mock(), SiteOper=Mock(), NotificationType=SimpleNamespace(Plugin="plugin"),
-              IntervalTrigger=Mock(), CronTrigger=Mock(), EventType=SimpleNamespace(PluginAction="action"))
+              IntervalTrigger=Mock(), CronTrigger=Mock(), BackgroundScheduler=Mock(side_effect=lambda: Mock()),
+              EventType=SimpleNamespace(PluginAction="action"))
     exec(compile(module, str(CODE), "exec"), ns)
     p = ns["SiQiCleanBeach"]()
     p._SiQiCleanBeach__get_site_cookie = Mock(return_value="")
@@ -57,6 +58,7 @@ def plugin():
     p._test_site_oper = ns["SiteOper"]
     p._test_interval = ns["IntervalTrigger"]
     p._test_cron = ns["CronTrigger"]
+    p._test_scheduler = ns["BackgroundScheduler"]
     return p
 
 
@@ -163,12 +165,11 @@ def test_service_reset_unlocks_uncertain_request(plugin, monkeypatch):
     assert move(plugin)["success"]
 
 
-def test_cooldown_uses_server_time(plugin, monkeypatch):
+def test_server_day_replaces_legacy_24_hour_cooldown(plugin, monkeypatch):
     plugin._stats["brick_last_run_server"] = 1_999_000
-    post = posts(monkeypatch, response(state()))
-    assert "冷却" in move(plugin)["message"]
-    assert post.call_count == 1
-    # Server reset alone does not override the configured cooldown.
+    post = posts(monkeypatch, response(state()), response(state(50, 50)))
+    assert move(plugin)["bricks_moved"] == 50
+    assert post.call_count == 2
     posts(monkeypatch, response(state(last_daily_reset="new-day", server_now=2_100_000, next_brick_reset_ts=2_150_000)),
           response(state(50, 50, last_daily_reset="new-day", server_now=2_100_001, next_brick_reset_ts=2_150_000)))
     assert move(plugin)["bricks_moved"] == 50
@@ -220,16 +221,16 @@ def test_cached_inventory_not_reported_as_refreshed(plugin, monkeypatch):
 
 def test_old_config_and_every_save_path(plugin):
     plugin.init_plugin({"enabled": True, "inventory": {"砖块": {"count": 12}}})
-    assert not plugin._auto_brick and plugin._brick_cooldown_minutes == 1440
+    assert not plugin._auto_brick
     assert plugin._inventory["砖块"]["count"] == 12
     plugin._queue_manual_run = Mock(return_value=True)
     plugin.init_plugin(dict(auto_brick=True, brick_cooldown_minutes=30, run_once=True))
     assert plugin.update_config.call_args.args[0]["auto_brick"] is True
-    assert plugin.update_config.call_args.args[0]["brick_cooldown_minutes"] == 30
+    assert "brick_cooldown_minutes" not in plugin.update_config.call_args.args[0]
     plugin._update_stats()
     assert plugin.update_config.call_args.args[0]["auto_brick"] is True
     form, defaults = plugin.get_form()
-    assert defaults["auto_brick"] is True and defaults["brick_cooldown_minutes"] == 30
+    assert defaults["auto_brick"] is True and "brick_cooldown_minutes" not in defaults
     assert '"model": "auto_brick"' in json.dumps(form)
 
 
