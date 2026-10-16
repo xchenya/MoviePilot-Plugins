@@ -79,12 +79,12 @@ def response(data, status=200):
 
 def test_market_and_api_contract(plugin, module):
     entry = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))["SiqiFram"]
-    assert plugin.plugin_version == entry["version"] == "2.1.1"
+    assert plugin.plugin_version == entry["version"] == "2.1.2"
     assert entry["system_version"] == ">=3.0.0"
     assert entry["release"] is True  # Federation packaging requirement.
     assert "KoWming" in plugin.plugin_author
     assert "GNU GENERAL PUBLIC LICENSE" in (PLUGIN / "LICENSE").read_text(encoding="utf-8")
-    assert plugin.get_render_mode() == ("vue", "dist/assets-v2.1.1")
+    assert plugin.get_render_mode() == ("vue", "dist/assets-v2.1.2")
     assert (PLUGIN / plugin.get_render_mode()[1] / "remoteEntry.js").is_file()
     routes = plugin.get_api()
     assert len(routes) == 28
@@ -154,8 +154,8 @@ def test_full_seed_catalog_is_independent_of_steal_filter(plugin, selected):
     plugin.init_plugin({"seed_id": "120", "steal_crops": selected})
     plugin.get_farm_data = Mock(return_value={"success": True, "seeds": catalog,
                                               "user_stats": {"total_harvest": 50}})
-    assert plugin._get_seeds() == {"success": True, "seeds": catalog,
-                                   "user_stats": {"total_harvest": 50}}
+    assert plugin._get_seeds(refresh=True) == {"success": True, "seeds": catalog,
+                                   "user_stats": {"total_harvest": 50}, "cached": False}
     assert plugin._seed_id == "120"
     assert plugin.get_data("farm_status") is None
 
@@ -163,9 +163,88 @@ def test_full_seed_catalog_is_independent_of_steal_filter(plugin, selected):
 def test_seed_load_failure_does_not_replace_saved_default(plugin):
     plugin.init_plugin({"seed_id": "120"})
     plugin.get_farm_data = Mock(return_value={"success": False, "message": "读取失败"})
-    assert plugin._get_seeds() == {"success": False, "message": "读取失败"}
+    assert plugin._get_seeds(refresh=True) == {"success": False, "message": "读取失败"}
     plugin._save_steal_config({"steal_crops": ["萝卜"]})
     assert plugin._seed_id == plugin.config["seed_id"] == "120"
+
+
+@pytest.mark.parametrize("change", ["plugin_cookie", "site_cookie", "site_url"])
+def test_seed_cache_is_persistent_read_only_and_scoped_to_account(plugin, monkeypatch, change):
+    farm = {"success": True, "seeds": [{"id": 120, "name": "樱桃", "unlock_harvest": 40}],
+            "user_stats": {"total_harvest": 50}}
+    get = Mock(return_value=response(farm))
+    monkeypatch.setattr(requests, "get", get)
+    plugin._get_page_meta = Mock(return_value={})
+    plugin.init_plugin({"seed_id": "120"})
+    assert plugin._get_seeds()["needs_refresh"]
+    get.assert_not_called()
+    assert plugin._get_seeds(refresh=True)["cached"] is False
+    assert get.call_count == 1
+    expected = {"success": True, "seeds": farm["seeds"], "user_stats": farm["user_stats"], "cached": True}
+    assert plugin._get_seeds() == expected
+    plugin.init_plugin(plugin._get_config())
+    assert plugin._get_seeds() == expected
+    assert get.call_count == 1
+    # Scheduled/manual farm reads also keep the catalog and unlock counts current.
+    farm["user_stats"]["total_harvest"] = 100
+    get.return_value = response(farm)
+    plugin.get_farm_data()
+    assert plugin._get_seeds()["user_stats"]["total_harvest"] == 100
+    get.return_value = response({"success": False, "message": "读取失败"})
+    assert not plugin._get_seeds(refresh=True)["success"]
+    assert plugin._get_seeds()["user_stats"]["total_harvest"] == 100
+    before_change = get.call_count
+    if change == "plugin_cookie":
+        plugin._save_config({"cookie": "session=two"})
+    else:
+        site = SimpleNamespace(url="https://si-qi.xyz", ua="fixture-UA", cookie="session=one")
+        setattr(site, "cookie" if change == "site_cookie" else "url",
+                "session=two" if change == "site_cookie" else "https://siqi.xyz")
+        plugin._siteoper.get_by_domain = lambda _: site
+    assert plugin._get_seeds()["needs_refresh"]
+    assert get.call_count == before_change
+    assert "session=" not in json.dumps(plugin.get_data("seed_catalog"))
+    assert plugin._seed_id == "120"
+    requests.post.assert_not_called()
+
+
+@pytest.mark.parametrize("kind, message", [
+    ("read", "数据读取中"), ("farm", "农场任务执行中"), ("config", "配置保存中"),
+])
+def test_busy_reason_matches_active_operation_and_cached_seeds_never_wait(plugin, kind, message):
+    plugin.init_plugin({"enabled": True, "auto_harvest": False, "auto_plant": False, "notify": False})
+    plugin.save_data("seed_catalog", {"context": plugin._seed_cache_key(),
+                                      "seeds": [{"id": 120}], "user_stats": {"total_harvest": 50}})
+    entered, release = threading.Event(), threading.Event()
+
+    def blocked(*args):
+        entered.set()
+        assert release.wait(5)
+        return {"success": True, "seeds": [{"id": 120}]}
+
+    plugin.get_farm_data = Mock(side_effect=blocked)
+    if kind == "config":
+        plugin.update_config = Mock(side_effect=blocked)
+    routes = plugin.get_api()
+    seed_route = next(r["endpoint"] for r in routes if r["path"] == "/seeds")
+    save_route = next(r["endpoint"] for r in routes if r["path"] == "/config" and r["methods"] == ["POST"])
+    run = {"read": lambda: seed_route(refresh=True), "farm": plugin._farm_task,
+           "config": lambda: save_route({"notify": False})}[kind]
+    worker = threading.Thread(target=run)
+    worker.start()
+    try:
+        assert entered.wait(2)
+        assert seed_route()["cached"] is True
+        assert next(r["endpoint"] for r in routes if r["path"] == "/data")()["success"] is False
+        assert seed_route(refresh=True) == {"success": False, "message": message + "，请稍后重试"}
+        assert save_route({})["message"] == message + "，请稍后重试"
+    finally:
+        release.set()
+        worker.join(5)
+    assert not worker.is_alive()
+    assert plugin._run_activity == ""
+    requests.get.assert_not_called()
+    requests.post.assert_not_called()
 
 
 def steal_fixture(plugin, monkeypatch):
@@ -369,7 +448,7 @@ def test_stop_prevents_new_requests_and_parallel_api_is_busy(plugin):
         worker.start()
         worker.join(2)
     assert results and results[0]["success"] is False
-    assert "正在执行" in results[0]["message"]
+    assert "其他操作处理中" in results[0]["message"]
     plugin.stop_service()
     with pytest.raises(RuntimeError, match="已停止"):
         plugin._request("fetch")
@@ -397,7 +476,8 @@ def test_real_fastapi_registration_bodies_and_raw_payloads(plugin, monkeypatch):
         "seeds": [{"id": 91, "name": "萝卜", "unlock_harvest": 0},
                   {"id": 200, "name": "西瓜", "unlock_harvest": 100}],
         "user_stats": {"total_harvest": 50}})
-    assert len(client.get("/seeds").json()["seeds"]) == 2
+    assert client.get("/seeds").json()["needs_refresh"] is True
+    assert len(client.get("/seeds", params={"refresh": True}).json()["seeds"]) == 2
     monkeypatch.setattr(requests, "post", Mock(return_value=response({
         "success": True, "msg": "ok", "new_field": 42})))
     plugin.get_farm_data = Mock(return_value={"success": True, "user_lands": []})

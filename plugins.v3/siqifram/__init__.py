@@ -6,6 +6,7 @@ import json
 import time
 import base64
 import html
+import hashlib
 import re
 import requests
 import threading
@@ -91,6 +92,8 @@ class SeedCatalog(BaseModel):
     message: Optional[str] = None
     seeds: List[dict] = Field(default_factory=list)
     user_stats: dict = Field(default_factory=dict)
+    cached: bool = False
+    needs_refresh: bool = False
 
 
 class FarmStatus(BaseModel):
@@ -127,7 +130,7 @@ class SiqiFram(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/KoWming/MoviePilot-Plugins/main/icons/siqi.png"
     # 插件版本
-    plugin_version = "2.1.1"
+    plugin_version = "2.1.2"
     # 插件作者
     plugin_author = "KoWming（V3 适配：xchenya）"
     # 作者主页
@@ -178,6 +181,7 @@ class SiqiFram(_PluginBase):
     def __init__(self):
         super().__init__()
         self._run_lock = threading.RLock()
+        self._run_activity = ""
         self._stop_event = threading.Event()
         self._steal_crops = list(STEAL_CROPS)
         self._steal_target = {}
@@ -320,16 +324,19 @@ class SiqiFram(_PluginBase):
         except Exception as e:
             logger.debug(f"{self.plugin_name} 停止服务失败: {e}")
 
-    def _api_endpoint(self, endpoint):
+    def _api_endpoint(self, endpoint, activity="农场任务执行中"):
         @wraps(endpoint)
         def run(*args, **kwargs):
             if not self._run_lock.acquire(blocking=False):
-                return {"success": False, "message": "农场任务正在执行，请稍后重试"}
+                return {"success": False, "message": f"{self._run_activity or '其他操作处理中'}，请稍后重试"}
+            previous_activity = self._run_activity
+            self._run_activity = activity
             try:
                 return endpoint(*args, **kwargs)
             except UncertainWriteError as e:
                 return {"success": False, "message": str(e), "uncertain": True}
             finally:
+                self._run_activity = previous_activity
                 self._run_lock.release()
         return run
 
@@ -340,7 +347,7 @@ class SiqiFram(_PluginBase):
             {"path": "/config", "endpoint": self._save_config, "methods": ["POST"], "auth": "bear", "summary": "保存配置"},
             {"path": "/steal-config", "endpoint": self._get_steal_config, "methods": ["GET"], "auth": "bear", "summary": "获取独立偷菜配置"},
             {"path": "/steal-config", "endpoint": self._save_steal_config, "methods": ["POST"], "auth": "bear", "summary": "仅保存偷菜配置"},
-            {"path": "/seeds", "endpoint": self._get_seeds, "methods": ["GET"], "auth": "bear", "summary": "读取完整种子及解锁状态"},
+            {"path": "/seeds", "endpoint": self._get_seeds, "methods": ["GET"], "auth": "bear", "summary": "读取缓存种子及解锁状态，按需刷新"},
             {"path": "/status", "endpoint": self._get_status, "methods": ["GET"], "auth": "bear", "summary": "插件状态"},
             {"path": "/data", "endpoint": self._get_data, "methods": ["GET"], "auth": "bear", "summary": "获取缓存农场数据"},
             {"path": "/refresh", "endpoint": self._refresh_data, "methods": ["POST"], "auth": "bear", "summary": "刷新农场数据"},
@@ -378,8 +385,13 @@ class SiqiFram(_PluginBase):
                          "/cookie": CookieResult}.get(path, FarmResult)
             route["response_model"] = model
             route["response_model_exclude_unset"] = True
-            if path not in {"/status", "/cookie"} and not (path in {"/config", "/steal-config"} and route["methods"] == ["GET"]):
-                route["endpoint"] = self._api_endpoint(route["endpoint"])
+            if path not in {"/status", "/cookie", "/seeds", "/data"} and not (path in {"/config", "/steal-config"} and route["methods"] == ["GET"]):
+                activity = "农场任务执行中"
+                if path in {"/config", "/steal-config"}:
+                    activity = "配置保存中"
+                elif route["methods"] == ["GET"] or path in {"/refresh", "/visit-farm", "/visit-random"}:
+                    activity = "数据读取中"
+                route["endpoint"] = self._api_endpoint(route["endpoint"], activity)
         return routes
 
     def _get_config(self) -> Dict[str, Any]:
@@ -434,13 +446,32 @@ class SiqiFram(_PluginBase):
         self._save_config(values)
         return {"success": True, "message": "偷菜配置已保存", "config": self._get_steal_config()}
 
-    def _get_seeds(self) -> Dict[str, Any]:
-        """只读站点完整种子目录，不按偷菜范围过滤或修改默认种子。"""
+    def _seed_cache_key(self) -> Optional[str]:
+        """账号凭据只用于缓存隔离，持久化摘要而不保存原始 Cookie。"""
+        site_url, _ = self._get_site_info()
+        cookie = self.__get_cookie().get("cookie")
+        if not site_url or not cookie:
+            return None
+        return hashlib.sha256(json.dumps([site_url, cookie]).encode()).hexdigest()
+
+    def _get_seeds(self, refresh: bool = False) -> Dict[str, Any]:
+        """缓存读取不占农场执行锁，只有显式刷新才访问站点。"""
+        if refresh:
+            return self._api_endpoint(self._refresh_seeds, "数据读取中")()
+        catalog = self.get_data("seed_catalog")
+        context = self._seed_cache_key()
+        if context and isinstance(catalog, dict) and catalog.get("context") == context:
+            return {"success": True, "seeds": catalog["seeds"],
+                    "user_stats": catalog["user_stats"], "cached": True}
+        return {"success": False, "message": "暂无当前账号的种子缓存，请刷新种子列表", "needs_refresh": True}
+
+    def _refresh_seeds(self) -> Dict[str, Any]:
+        """只读完整种子目录，不过滤偷菜范围或修改默认种子及调度。"""
         data = self.get_farm_data()
         if not data.get("success") or not isinstance(data.get("seeds"), list) or not data["seeds"]:
             return {"success": False, "message": data.get("message") or data.get("msg")
                     or "未获取到站点种子列表，请重试；当前默认种子保持不变"}
-        return {"success": True, "seeds": data["seeds"], "user_stats": data.get("user_stats") or {}}
+        return {"success": True, "seeds": data["seeds"], "user_stats": data.get("user_stats") or {}, "cached": False}
 
     def _get_status(self) -> Dict[str, Any]:
         """获取插件运行状态与最近任务结果。"""
@@ -633,6 +664,7 @@ class SiqiFram(_PluginBase):
 
     def get_farm_data(self) -> Dict[str, Any]:
         """请求站点 fetch 接口并补充汇总统计与页面元信息。"""
+        context = self._seed_cache_key()
         res = self._request("fetch", "GET")
         data = self._json_response(res)
         if data.get("success"):
@@ -641,6 +673,10 @@ class SiqiFram(_PluginBase):
             data["current_username"] = data.get("current_username") or page_meta.get("current_username", "")
             data["user_steal_gain"] = data.get("user_steal_gain", page_meta.get("user_steal_gain", 0))
             data["user_farm_like_total"] = data.get("user_farm_like_total", page_meta.get("user_farm_like_total", 0))
+            if (context and context == self._seed_cache_key()
+                    and isinstance(data.get("seeds"), list) and data["seeds"]):
+                self.save_data("seed_catalog", {"context": context, "seeds": data["seeds"],
+                                                "user_stats": data.get("user_stats") or {}})
         return data
 
     def _get_current_username(self) -> str:
@@ -1244,6 +1280,8 @@ class SiqiFram(_PluginBase):
         """执行定时自动化任务，完成后按最早成熟时间重排精准任务。"""
         if not self._enabled or self._stop_event.is_set() or not self._run_lock.acquire(blocking=False):
             return
+        previous_activity = self._run_activity
+        self._run_activity = "农场任务执行中"
         logs = []
         try:
             run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1317,4 +1355,5 @@ class SiqiFram(_PluginBase):
             if self._notify:
                 self.post_message(mtype=NotificationType.SiteMessage, title="【🌱思齐农场】任务失败", text=result)
         finally:
+            self._run_activity = previous_activity
             self._run_lock.release()

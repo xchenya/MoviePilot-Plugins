@@ -83,7 +83,7 @@ function configHarness(api, initialConfig = {}) {
   const script = descriptor.scriptSetup.content.split('\n')
     .filter(line => !line.startsWith('import ')).join('\n')
   return new Function('reactive', 'ref', 'onMounted', 'defineProps', 'defineEmits',
-    'setTimeout', 'clearTimeout', script + '\nreturn { config, stealConfig, seedOptions, seedError, configLoaded, stealLoaded, loadConfig, loadSeeds, loadStealConfig, saveConfig, saveStealConfig }')(
+    'setTimeout', 'clearTimeout', script + '\nreturn { config, stealConfig, seedOptions, seedError, seedCached, seedLoading, configLoaded, stealLoaded, loadConfig, loadSeeds, loadStealConfig, saveConfig, saveStealConfig }')(
       value => value, value => ({ value }), () => {},
       () => ({ api, pluginId: 'SiqiFram', initialConfig }), () => () => {},
       () => 0, () => {},
@@ -155,5 +155,93 @@ test('failed configuration reads cannot save frontend fallback defaults', async 
   await state.saveConfig()
   await state.saveStealConfig()
   assert.equal(writes, 0)
+  assert.equal(state.config.seed_id, '120')
+})
+
+test('opening with a cached catalog sends no site refresh; explicit refresh preserves the selection', async () => {
+  const calls = []
+  const state = configHarness({ get: async url => {
+    calls.push(url)
+    return { success: true, cached: !url.includes('?'),
+      seeds: [{ id: 120, name: '樱桃', unlock_harvest: 40 }],
+      user_stats: { total_harvest: url.includes('?') ? 50 : 20 } }
+  } }, { seed_id: '120' })
+  await state.loadSeeds()
+  assert.equal(state.seedCached.value, true)
+  assert.equal(state.seedOptions.value[0].locked, true)
+  assert.deepEqual(calls, ['plugin/SiqiFram/seeds'])
+  await state.loadSeeds(true)
+  assert.equal(state.seedCached.value, false)
+  assert.equal(state.seedOptions.value[0].locked, false)
+  assert.equal(state.config.seed_id, '120')
+  assert.deepEqual(calls, ['plugin/SiqiFram/seeds', 'plugin/SiqiFram/seeds?refresh=true'])
+})
+
+test('a missing cache triggers only one refresh and does not overwrite the planting seed', async () => {
+  const calls = []
+  const state = configHarness({ get: async url => {
+    calls.push(url)
+    return url.includes('?') ? { success: true, cached: false, seeds: [{ id: 91, name: '萝卜' }] }
+      : { success: false, needs_refresh: true }
+  } }, { seed_id: '120' })
+  await state.loadSeeds()
+  assert.deepEqual(calls, ['plugin/SiqiFram/seeds', 'plugin/SiqiFram/seeds?refresh=true'])
+  assert.equal(state.config.seed_id, '120')
+  assert.deepEqual(state.seedOptions.value.map(s => s.value), ['91'])
+})
+
+test('busy refresh keeps the loaded catalog and distinguishes reading from farming without retrying', async () => {
+  let refreshes = 0
+  let reason = '数据读取中'
+  const state = configHarness({ get: async url => {
+    if (url.includes('?')) { refreshes++; return { success: false, message: reason + '，请稍后重试' } }
+    return { success: true, cached: true, seeds: [{ id: 120, name: '樱桃' }] }
+  } }, { seed_id: '120' })
+  await state.loadSeeds()
+  const options = structuredClone(state.seedOptions.value)
+  for (reason of ['数据读取中', '农场任务执行中']) {
+    await state.loadSeeds(true)
+    assert.equal(state.seedError.value, reason + '，请稍后重试')
+    assert.deepEqual(state.seedOptions.value, options)
+    assert.equal(state.seedCached.value, true)
+    assert.equal(state.seedLoading.value, false)
+    assert.equal(state.config.seed_id, '120')
+  }
+  assert.equal(refreshes, 2)
+})
+
+test('refresh cannot be started twice and a saved Cookie change clears the old account list', async () => {
+  let finish
+  let requests = 0
+  let posts = 0
+  const pending = new Promise(resolve => { finish = resolve })
+  const state = configHarness({
+    get: async url => {
+      if (url.endsWith('/config')) return { seed_id: '120', cookie: '' }
+      requests++
+      if (requests > 1) {
+        assert.deepEqual(state.seedOptions.value, [])
+        return { success: false, message: '新账号读取失败' }
+      }
+      return pending
+    },
+    post: async (url, data) => { posts++; return { success: true, config: data } },
+  })
+  await state.loadConfig()
+  const loading = state.loadSeeds(true)
+  await state.loadSeeds(true)
+  assert.equal(requests, 1)
+  assert.equal(state.seedLoading.value, true)
+  await state.saveConfig()
+  assert.equal(posts, 0)
+  finish({ success: true, seeds: [{ id: 120, name: '樱桃' }] })
+  await loading
+  state.config.cookie = 'session=changed'
+  state.seedOptions.value = [{ value: 'old-account' }]
+  await state.saveConfig()
+  assert.equal(requests, 2)
+  assert.equal(posts, 1)
+  assert.deepEqual(state.seedOptions.value, [])
+  assert.equal(state.seedError.value, '新账号读取失败')
   assert.equal(state.config.seed_id, '120')
 })

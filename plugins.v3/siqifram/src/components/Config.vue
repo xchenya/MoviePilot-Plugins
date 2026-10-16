@@ -6,7 +6,7 @@
           <v-icon icon="mdi-cog-outline" size="24" />
         </div>
         <div>
-          <div class="siqi-topbar__title">思齐农场 · 配置 · v2.1.1</div>
+          <div class="siqi-topbar__title">思齐农场 · 配置 · v2.1.2</div>
           <div class="siqi-topbar__sub">管理定时任务、自动化策略与站点 Cookie</div>
         </div>
       </div>
@@ -16,7 +16,7 @@
             <v-icon icon="mdi-view-dashboard" size="18" class="mr-sm-1" />
             <span class="d-none d-sm-inline">状态页</span>
           </v-btn>
-          <v-btn color="success" size="small" min-width="40" class="px-0 px-sm-3" @click="saveConfig" :loading="saving" :disabled="!configLoaded">
+          <v-btn color="success" size="small" min-width="40" class="px-0 px-sm-3" @click="saveConfig" :loading="saving" :disabled="!configLoaded || seedLoading">
             <v-icon icon="mdi-content-save" size="18" class="mr-sm-1" />
             <span class="d-none d-sm-inline">保存</span>
           </v-btn>
@@ -130,9 +130,12 @@
           <v-text-field v-model.number="config.retry_interval" label="读取重试间隔（秒）" type="number" density="compact" variant="outlined" hide-details class="siqi-input" prepend-inner-icon="mdi-timer-sand" />
         </div>
         <div class="siqi-field-hint">默认种子用于自动补种空地；下拉列表来自站点种子商店，建议选择已解锁种子。</div>
+        <div class="d-flex align-center flex-wrap ga-2">
+          <span class="text-caption text-medium-emphasis" role="status" aria-live="polite">{{ seedLoading ? '种子数据读取中…' : seedOptions.length ? (seedCached ? '已显示缓存种子列表，解锁状态变化后可刷新。' : '已读取最新种子列表。') : '暂无种子列表。' }}</span>
+          <v-btn size="small" variant="text" @click="loadSeeds(true)" :loading="seedLoading" :disabled="seedLoading || saving">刷新种子列表</v-btn>
+        </div>
         <div v-if="seedError" class="d-flex align-center ga-2" role="alert">
           <span class="text-error">{{ seedError }}；当前默认种子保持不变。</span>
-          <v-btn size="small" variant="text" @click="loadSeeds" :loading="seedLoading">重试种子列表</v-btn>
         </div>
         <v-textarea v-model="config.cookie" label="Cookie（留空时尝试读取站点cookie）" rows="2" auto-grow variant="outlined" class="siqi-input mt-3" :class="{'siqi-secret-input': !showCookie}" prepend-inner-icon="mdi-cookie" autocomplete="off">
           <template #append-inner>
@@ -180,6 +183,7 @@ const configLoaded = ref(false)
 const stealLoaded = ref(false)
 const stealSaving = ref(false)
 const seedLoading = ref(false)
+const seedCached = ref(false)
 const seedError = ref('')
 const showCookie = ref(false)
 const aiAvailable = ref(false)
@@ -187,6 +191,7 @@ const seedOptions = ref([])
 const message = ref('')
 const messageType = ref('success')
 let messageTimer = null
+let loadedCookie = ''
 
 const apiGet = (path) => props.api.get(`plugin/${props.pluginId}${path}`)
 const apiPost = (path, data) => props.api.post(`plugin/${props.pluginId}${path}`, data)
@@ -208,6 +213,7 @@ async function loadConfig() {
     const { auto_steal, steal_crops, ...plantConfig } = res
     Object.assign(config, plantConfig)
     config.seed_id = String(config.seed_id || '1')
+    loadedCookie = config.cookie || ''
     aiAvailable.value = !!res.ai_available
     if (!res.ai_available) config.use_ai_captcha = false
     configLoaded.value = true
@@ -218,13 +224,16 @@ async function loadConfig() {
   }
 }
 
-async function loadSeeds() {
+async function loadSeeds(refresh = false) {
+  if (seedLoading.value) return
   seedLoading.value = true
   seedError.value = ''
   try {
-    const res = await apiGet('/seeds')
+    let res = await apiGet(refresh ? '/seeds?refresh=true' : '/seeds')
+    if (!refresh && res.needs_refresh) res = await apiGet('/seeds?refresh=true')
     const seeds = Array.isArray(res?.seeds) ? res.seeds : []
     if (!res.success || !seeds.length) throw new Error(res.message || '种子列表暂不可用')
+    seedCached.value = !!res.cached
     const totalHarvest = Number(res?.user_stats?.total_harvest || 0)
     if (seeds.length) {
       seedOptions.value = seeds.map(seed => ({
@@ -246,12 +255,20 @@ async function loadSeeds() {
 
 async function saveConfig() {
   if (!configLoaded.value) return show('配置尚未加载成功，请关闭后重新打开', 'error')
+  if (seedLoading.value) return show('种子数据读取中，请稍后保存配置', 'info')
   const delay = Number(config.harvest_delay_minutes)
   config.harvest_delay_minutes = Number.isFinite(delay) ? Math.min(30, Math.max(0, Math.trunc(delay))) : 2
   saving.value = true
   try {
     const res = await apiPost('/config', { ...config })
-    if (res.success && res.config) emit('config-updated', res.config)
+    if (res.success && res.config) {
+      emit('config-updated', res.config)
+      if (loadedCookie !== (res.config.cookie || '')) {
+        seedOptions.value = []
+        await loadSeeds()
+      }
+      loadedCookie = res.config.cookie || ''
+    }
     show(res.message || (res.success ? '保存成功' : '保存失败'), res.success ? 'success' : 'error')
   } catch (e) {
     show(`保存失败：${e.message}`, 'error')
