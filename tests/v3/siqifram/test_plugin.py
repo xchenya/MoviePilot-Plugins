@@ -79,7 +79,7 @@ def response(data, status=200):
 
 def test_market_and_api_contract(plugin, module):
     entry = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))["SiqiFram"]
-    assert plugin.plugin_version == entry["version"] == "2.0.0"
+    assert plugin.plugin_version == entry["version"] == "2.1.0"
     assert entry["system_version"] == ">=3.0.0"
     assert entry["release"] is True  # Federation packaging requirement.
     assert "KoWming" in plugin.plugin_author
@@ -114,6 +114,111 @@ def test_reload_resets_config_and_ai_requires_available_tool(plugin, module):
     assert not plugin._get_config()["ai_available"]
     module.RecognizeCaptchaTool = Mock()
     assert plugin._get_config()["ai_available"]
+
+
+def test_crop_config_defaults_subset_empty_and_clone_isolation(plugin, module):
+    defaults = ["萝卜", "西红柿", "玉米", "茄子", "蘑菇", "樱桃"]
+    assert plugin._get_config()["steal_crops"] == defaults
+    assert module.FarmConfig().steal_crops == defaults
+    result = plugin._save_config({"steal_crops": ["玉米", "萝卜", "玉米", "西瓜"]})
+    assert result["config"]["steal_crops"] == ["萝卜", "玉米"]
+    assert plugin.config["steal_crops"] == ["萝卜", "玉米"]
+    assert plugin._save_config({})["config"]["steal_crops"] == ["萝卜", "玉米"]
+    assert plugin._save_config({"steal_crops": []})["config"]["steal_crops"] == []
+    assert module.SiqiFram()._steal_crops == defaults
+    plugin.init_plugin({"steal_crops": "萝卜"})
+    assert plugin._steal_crops == []
+
+
+def steal_fixture(plugin, monkeypatch):
+    # Deliberately non-sequential IDs: crop names must come from the site catalog.
+    crops = [(91, "萝卜"), (5, "西红柿"), (62, "玉米"),
+             (27, "茄子"), (9, "蘑菇"), (120, "樱桃"), (1, "西瓜")]
+    farm = {"success": True, "seeds": [{"id": i, "name": name} for i, name in crops]}
+    victim = {"success": True, "victim_id": 88, "max_steal_count": 20,
+              "steal_count_today": 0, "victim_lands": [{"id": 3, "unlocked": 1}],
+              "victim_plots": [
+                  {"land_id": 3, "plot_index": n, "seed_id": i, "is_ready": 1}
+                  for n, (i, name) in enumerate(crops)
+              ] + [{"land_id": 3, "plot_index": 7, "seed_id": 999,
+                    "seed_name": "萝卜", "is_ready": 1}]}
+    plugin.get_farm_data = Mock(return_value=farm)
+    post = Mock(side_effect=lambda url, **kwargs: response(
+        victim if kwargs["data"]["action"] == "get_victim_farm"
+        else {"success": True, "reward": 2}))
+    monkeypatch.setattr(requests, "post", post)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    return victim, post
+
+
+def test_automatic_steal_only_six_named_crops_from_catalog(plugin, monkeypatch):
+    victim, post = steal_fixture(plugin, monkeypatch)
+    result = plugin._steal_once()
+    writes = [call.kwargs["data"] for call in post.call_args_list
+              if call.kwargs["data"]["action"] == "steal_vegetable"]
+    assert result["success"] and len(writes) == 6
+    assert [item["plot_index"] for item in writes] == [0, 1, 2, 3, 4, 5]
+    assert plugin._is_daily_action_done("steal")
+
+
+def test_subset_filters_maturity_and_leaves_daily_retry_available(plugin, monkeypatch):
+    victim, post = steal_fixture(plugin, monkeypatch)
+    plugin._steal_crops = ["樱桃"]
+    victim["victim_plots"][5].update(is_ready=0, harvest_time=int(time.time()) + 500)
+    result = plugin._steal_once()
+    assert not result["success"] and "所选范围" in result["message"]
+    assert not plugin._is_daily_action_done("steal")
+    assert [call.kwargs["data"]["action"] for call in post.call_args_list] == ["get_victim_farm"]
+    victim["victim_plots"][5]["is_ready"] = 1
+    assert plugin._steal_once()["success"]
+    writes = [call.kwargs["data"] for call in post.call_args_list
+              if call.kwargs["data"]["action"] == "steal_vegetable"]
+    assert [item["plot_index"] for item in writes] == [5]
+
+
+@pytest.mark.parametrize("catalog", [None, {"success": False}, {"success": True, "seeds": []}])
+def test_empty_selection_or_missing_catalog_sends_no_steal_requests(plugin, catalog):
+    if catalog is None:
+        plugin._steal_crops = []
+    else:
+        plugin.get_farm_data = Mock(return_value=catalog)
+    assert not plugin._steal_once()["success"]
+    assert not plugin._is_daily_action_done("steal")
+    requests.get.assert_not_called()
+    requests.post.assert_not_called()
+
+
+def test_manual_api_rejects_unselected_unknown_forged_and_replayed_plots(plugin, monkeypatch):
+    victim, post = steal_fixture(plugin, monkeypatch)
+    plugin._steal_crops = ["萝卜"]
+    target = plugin._get_steal_target()
+    assert target["victim_plots"][0]["steal_allowed"]
+    assert not target["victim_plots"][1]["steal_allowed"]
+    post.reset_mock()
+    for payload in [
+        {"victim_id": 88, "land_id": 3, "plot_index": 1},
+        {"victim_id": 88, "land_id": 3, "plot_index": 7, "seed_name": "萝卜"},
+        {"victim_id": 99, "land_id": 3, "plot_index": 0},
+        {"victim_id": 88, "land_id": 3},
+    ]:
+        assert not plugin._steal_plot(payload)["success"]
+    post.assert_not_called()
+    allowed = {"victim_id": 88, "land_id": 3, "plot_index": 0}
+    assert plugin._steal_plot(allowed)["success"]
+    assert not plugin._steal_plot(allowed)["success"]
+    assert post.call_count == 1
+    plugin._finish_stealing()
+    assert plugin._steal_target == {}
+
+
+def test_crop_filter_supports_legacy_nested_plots(plugin, monkeypatch):
+    victim, post = steal_fixture(plugin, monkeypatch)
+    nested = victim.pop("victim_plots")[:1]
+    victim["lands"] = [{"id": 3, "plots": [{k: v for k, v in nested[0].items() if k != "land_id"}]}]
+    assert plugin._steal_once()["success"]
+    writes = [call.kwargs["data"] for call in post.call_args_list
+              if call.kwargs["data"]["action"] == "steal_vegetable"]
+    assert len(writes) == 1 and writes[0]["land_id"] == 3
 
 
 def test_old_config_normalization_and_schedule(plugin, module):

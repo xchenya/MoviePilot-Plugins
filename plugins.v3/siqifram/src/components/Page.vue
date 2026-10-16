@@ -89,6 +89,7 @@
                       <small>{{ plot.seed_name || seedById(plot.seed_id)?.name || '' }}</small>
                       <span v-if="plot.stolen" class="steal-badge stolen">已偷</span>
                       <span v-else-if="isStealablePlot(plot)" class="steal-badge ready">可偷</span>
+                      <span v-else-if="!plot.steal_allowed" class="steal-badge">未选作物</span>
                     </template>
                     <template v-else>
                       <span class="neu-plot-empty-icon">🌱</span>
@@ -779,13 +780,14 @@ function stealPlotsForLand(land) {
   }
   return rows
 }
-function isStealablePlot(plot) { return !!plot?.seed_id && (Number(plot.is_ready || 0) === 1 || (plot.harvest_time && Number(plot.harvest_time) <= nowSec())) }
-function stealPlotClass(plot) { return { planted: !!plot.seed_id, ready: isStealablePlot(plot), stealable: isStealablePlot(plot) && !plot.stolen, stolen: !!plot.stolen } }
+function isStealPlotReady(plot) { return !!plot?.seed_id && (Number(plot.is_ready || 0) === 1 || (plot.harvest_time && Number(plot.harvest_time) <= nowSec())) }
+function isStealablePlot(plot) { return plot?.steal_allowed === true && isStealPlotReady(plot) }
+function stealPlotClass(plot) { return { planted: !!plot.seed_id, ready: isStealPlotReady(plot), stealable: isStealablePlot(plot) && !plot.stolen, stolen: !!plot.stolen } }
 function getStealStageImg(plot) {
   const seed = seedById(plot.seed_id)
   const icons = plot.stage_icons || seed?.stage_icons
   if (!icons) return null
-  if (isStealablePlot(plot)) return stageImageCache[icons.mature] || stageImageCache[icons.growth] || null
+  if (isStealPlotReady(plot)) return stageImageCache[icons.mature] || stageImageCache[icons.growth] || null
   return stageImageCache[icons.growth] || stageImageCache[icons.seedling] || null
 }
 async function stealPlotAction(land, plot) {

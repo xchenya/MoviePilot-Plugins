@@ -60,3 +60,38 @@ test('batch sale stops after an uncertain write', async () => {
   assert.equal(loading.value, false)
   assert.equal(dialog.value, false)
 })
+
+test('manual steal keeps maturity visible and disables unselected crops', () => {
+  const source = fs.readFileSync(path.join(plugin, 'src/components/Page.vue'), 'utf8')
+  const helpers = source.split('\n').filter(line => [
+    'function isStealPlotReady(', 'function isStealablePlot(', 'function stealPlotClass(',
+  ].some(prefix => line.startsWith(prefix))).join('\n')
+  const { isStealablePlot, stealPlotClass } = new Function('nowSec',
+    helpers + '\nreturn { isStealablePlot, stealPlotClass }')(() => 100)
+  const mature = { seed_id: 91, is_ready: 1, steal_allowed: false }
+  assert.equal(isStealablePlot(mature), false)
+  assert.equal(stealPlotClass(mature).ready, true)
+  assert.equal(stealPlotClass(mature).stealable, false)
+  assert.equal(isStealablePlot({ ...mature, steal_allowed: true }), true)
+  assert.equal(isStealablePlot({ ...mature, steal_allowed: undefined }), false)
+  assert.equal(isStealablePlot({ seed_id: 91, harvest_time: 200, steal_allowed: true }), false)
+})
+
+test('crop choices are saved as a subset and clearing all stays empty', async () => {
+  const source = fs.readFileSync(path.join(plugin, 'src/components/Config.vue'), 'utf8')
+  const options = source.split('\n').find(line => line.startsWith('const stealCropOptions ='))
+  assert.deepEqual(new Function(options + '; return stealCropOptions')(),
+    ['萝卜', '西红柿', '玉米', '茄子', '蘑菇', '樱桃'])
+  const method = 'async function saveConfig()' + source.split('async function saveConfig()')[1]
+    .split('onMounted(')[0]
+  const posts = []
+  const config = { steal_crops: ['萝卜', '樱桃'], harvest_delay_minutes: 2 }
+  const run = new Function('config', 'saving', 'apiPost', 'emit', 'show',
+    method + '; return saveConfig')(config, { value: false },
+      async (url, data) => { posts.push([url, data]); return { success: true, config: data } },
+      () => {}, () => {})
+  await run()
+  config.steal_crops = []
+  await run()
+  assert.deepEqual(posts.map(([, data]) => data.steal_crops), [['萝卜', '樱桃'], []])
+})

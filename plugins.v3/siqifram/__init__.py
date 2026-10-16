@@ -11,7 +11,7 @@ import requests
 import threading
 from functools import wraps
 from urllib.parse import urljoin, urlsplit
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
@@ -31,6 +31,7 @@ except ImportError:
 
 # 验证码识别重试次数
 _CAPTCHA_RETRY = 3
+STEAL_CROPS = ("萝卜", "西红柿", "玉米", "茄子", "蘑菇", "樱桃")
 
 
 class FarmConfig(BaseModel):
@@ -43,6 +44,7 @@ class FarmConfig(BaseModel):
     auto_harvest: bool = True
     auto_sell: bool = False
     auto_steal: bool = False
+    steal_crops: List[str] = Field(default_factory=lambda: list(STEAL_CROPS))
     auto_like: bool = False
     use_proxy: bool = False
     use_ai_captcha: bool = False
@@ -107,7 +109,7 @@ class SiqiFram(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/KoWming/MoviePilot-Plugins/main/icons/siqi.png"
     # 插件版本
-    plugin_version = "2.0.0"
+    plugin_version = "2.1.0"
     # 插件作者
     plugin_author = "KoWming（V3 适配：xchenya）"
     # 作者主页
@@ -159,6 +161,14 @@ class SiqiFram(_PluginBase):
         super().__init__()
         self._run_lock = threading.RLock()
         self._stop_event = threading.Event()
+        self._steal_crops = list(STEAL_CROPS)
+        self._steal_target = {}
+
+    @staticmethod
+    def _normalize_steal_crops(value: Any) -> List[str]:
+        if not isinstance(value, list):
+            return []
+        return [name for name in STEAL_CROPS if name in value]
 
     @staticmethod
     def _to_bool(val: Any) -> bool:
@@ -199,6 +209,8 @@ class SiqiFram(_PluginBase):
                 self._enabled = False
                 self._next_run_time = None
                 self._cookie = ""
+                self._steal_target = {}
+                self._steal_crops = self._normalize_steal_crops(config["steal_crops"])
                 if config:
                     if "enabled" in config:
                         self._enabled = self._to_bool(config["enabled"])
@@ -358,6 +370,7 @@ class SiqiFram(_PluginBase):
             "auto_harvest": self._auto_harvest,
             "auto_sell": self._auto_sell,
             "auto_steal": self._auto_steal,
+            "steal_crops": list(self._steal_crops),
             "auto_like": self._auto_like,
             "use_proxy": self._use_proxy,
             "use_ai_captcha": self._use_ai_captcha,
@@ -371,6 +384,9 @@ class SiqiFram(_PluginBase):
         """保存插件配置并重新初始化服务。"""
         if config is None:
             config = {}
+        config["steal_crops"] = self._normalize_steal_crops(
+            config.get("steal_crops", self._steal_crops)
+        )
         config["cron"] = self._normalize_cron(config.get("cron"))
         config["harvest_delay_minutes"] = max(0, min(30, self._to_int(
             config.get("harvest_delay_minutes"), 2
@@ -937,17 +953,62 @@ class SiqiFram(_PluginBase):
         return {"success": True, "message": f"已尝试出售 {len(logs)} 类库存" if logs else "背包暂无可出售库存", "logs": logs, "farm_status": fresh}
 
     def _get_steal_target(self, payload: dict = None) -> Dict[str, Any]:
-        """获取可偷菜目标农场。"""
-        return self._json_response(self._request("get_victim_farm", "POST"))
+        """使用站点种子目录识别作物，并保存当前目标供手动操作核对。"""
+        self._steal_target = {}
+        if not self._steal_crops:
+            return {"success": False, "message": "未选择允许偷取的作物，已跳过偷菜"}
+        farm = self.get_farm_data()
+        if not farm.get("success"):
+            return {"success": False, "message": "无法读取种子目录，已跳过偷菜"}
+        names = {
+            str(seed["id"]): str(seed.get("name") or "").strip()
+            for seed in farm.get("seeds") or []
+            if isinstance(seed, dict) and seed.get("id") is not None
+        }
+        if not names:
+            return {"success": False, "message": "种子目录为空，无法识别作物，已跳过偷菜"}
+        victim = self._json_response(self._request("get_victim_farm", "POST"))
+        if not victim.get("success"):
+            return victim
+        plots = victim.get("victim_plots") or []
+        if not plots:
+            for land in victim.get("lands") or victim.get("user_lands") or []:
+                if isinstance(land, dict):
+                    land_id = land.get("id") or land.get("land_id")
+                    plots.extend({**plot, "land_id": plot.get("land_id") or land_id}
+                                 for plot in land.get("plots") or [] if isinstance(plot, dict))
+        victim["victim_plots"] = [
+            {**plot, "steal_crop_name": names.get(str(plot.get("seed_id")), ""),
+             "steal_allowed": names.get(str(plot.get("seed_id")), "") in self._steal_crops}
+            for plot in plots if isinstance(plot, dict)
+        ]
+        self._steal_target = victim
+        return victim
+
+    def _can_steal_plot(self, plot: dict) -> bool:
+        return (plot.get("steal_crop_name") in self._steal_crops
+                and self._is_plot_ready(plot) and not plot.get("stolen"))
 
     def _steal_plot(self, payload: dict = None) -> Dict[str, Any]:
         """偷取指定目标农场的指定坑位作物。"""
         payload = payload or {}
+        # shortcut: 按本轮目标快照核对作物，站点提供原子种子条件后再消除换种竞态。
+        plot = next((
+            item for item in self._steal_target.get("victim_plots", [])
+            if all(payload.get(key) is not None and str(item.get(key)) == str(payload[key])
+                   for key in ("land_id", "plot_index"))
+        ), None)
+        if (not self._steal_target.get("victim_id")
+                or str(payload.get("victim_id")) != str(self._steal_target["victim_id"])
+                or plot is None or not self._can_steal_plot(plot)):
+            return {"success": False, "message": "该作物不在允许偷取范围或目标已失效，请重新获取目标"}
         result = self._json_response(self._request("steal_vegetable", "POST", data={
             "victim_id": payload.get("victim_id"),
             "land_id": payload.get("land_id"),
             "plot_index": payload.get("plot_index"),
         }))
+        if result.get("success"):
+            plot["stolen"] = True
         self._save_latest_if_success(result)
         return result
 
@@ -955,6 +1016,7 @@ class SiqiFram(_PluginBase):
         """结束当前偷菜会话并刷新农场状态。"""
         result = self._json_response(self._request("finish_stealing", "POST"))
         if result.get("success"):
+            self._steal_target = {}
             fresh = self.get_farm_data()
             if fresh.get("success"):
                 self.save_data("farm_status", fresh)
@@ -962,7 +1024,7 @@ class SiqiFram(_PluginBase):
 
     def _steal_once(self, payload: dict = None) -> Dict[str, Any]:
         """自动寻找可偷作物，并按今日剩余可偷数量执行偷菜流程。"""
-        victim = self._json_response(self._request("get_victim_farm", "POST"))
+        victim = self._get_steal_target()
         if not victim.get("success"):
             if self._is_daily_action_exhausted(victim):
                 self._mark_daily_action_done("steal", victim)
@@ -984,25 +1046,16 @@ class SiqiFram(_PluginBase):
         }
         plots = []
         candidate_plots = victim.get("victim_plots") or []
-        # 兼容旧结构：lands/user_lands 内嵌 plots
-        if not candidate_plots:
-            for land in victim.get("lands") or victim.get("user_lands") or []:
-                if not isinstance(land, dict):
-                    continue
-                land_id = land.get("id") or land.get("land_id")
-                for plot in land.get("plots") or []:
-                    if isinstance(plot, dict):
-                        candidate_plots.append({**plot, "land_id": plot.get("land_id") or land_id})
         for plot in candidate_plots:
             if not isinstance(plot, dict):
                 continue
             land_id = plot.get("land_id")
             if victim_lands and (land_id is None or int(land_id) not in unlocked_lands):
                 continue
-            if self._is_plot_ready(plot):
+            if self._can_steal_plot(plot):
                 plots.append((land_id, plot.get("plot_index")))
         if not plots:
-            return {"success": False, "message": "未找到可偷作物", "victim": victim}
+            return {"success": False, "message": "未找到所选范围内的成熟作物", "victim": victim}
 
         logs = []
         success_count = 0
@@ -1023,6 +1076,7 @@ class SiqiFram(_PluginBase):
 
         if success_count > 0:
             self._json_response(self._request("finish_stealing", "POST"))
+            self._steal_target = {}
             fresh = self.get_farm_data()
             if fresh.get("success"):
                 self.save_data("farm_status", fresh)

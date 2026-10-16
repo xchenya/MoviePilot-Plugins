@@ -134,6 +134,15 @@
           <v-text-field v-model.number="config.retry_interval" label="读取重试间隔（秒）" type="number" density="compact" variant="outlined" hide-details class="siqi-input" prepend-inner-icon="mdi-timer-sand" />
         </div>
         <div class="siqi-field-hint">默认种子用于自动补种空地；下拉列表来自站点种子商店，建议选择已解锁种子。</div>
+        <v-select
+          v-model="config.steal_crops"
+          :items="stealCropOptions"
+          label="允许偷取的作物"
+          multiple chips closable-chips
+          density="compact" variant="outlined" hide-details
+          class="siqi-input"
+        />
+        <div class="siqi-field-hint">自动偷菜和手动选菜只允许偷取勾选的作物；全部取消则不偷菜。自动偷菜与总 Cron、成熟任务一起检查。</div>
         <v-textarea v-model="config.cookie" label="Cookie（留空时尝试读取站点cookie）" rows="2" auto-grow variant="outlined" class="siqi-input mt-3" :class="{'siqi-secret-input': !showCookie}" prepend-inner-icon="mdi-cookie" autocomplete="off">
           <template #append-inner>
             <v-btn variant="text" density="comfortable" size="x-small" icon class="siqi-secret-toggle" @click.stop="showCookie = !showCookie">
@@ -152,7 +161,8 @@ import { reactive, ref, onMounted } from 'vue'
 
 const props = defineProps({ api: Object, pluginId: { type: String, default: 'SiqiFram' }, initialConfig: { type: Object, default: () => ({}) } })
 const emit = defineEmits(['switch', 'close', 'config-updated'])
-const config = reactive({ enabled: false, notify: true, cron: '5 */4 * * *', cookie: '', seed_id: '1', auto_plant: true, auto_harvest: true, auto_sell: false, auto_steal: false, auto_like: false, use_proxy: false, use_ai_captcha: false, harvest_delay_minutes: 2, retry_count: 2, retry_interval: 3, ...props.initialConfig })
+const stealCropOptions = ['萝卜', '西红柿', '玉米', '茄子', '蘑菇', '樱桃']
+const config = reactive({ enabled: false, notify: true, cron: '5 */4 * * *', cookie: '', seed_id: '1', auto_plant: true, auto_harvest: true, auto_sell: false, auto_steal: false, steal_crops: [...stealCropOptions], auto_like: false, use_proxy: false, use_ai_captcha: false, harvest_delay_minutes: 2, retry_count: 2, retry_interval: 3, ...props.initialConfig })
 const loading = ref(false)
 const saving = ref(false)
 const seedLoading = ref(false)
