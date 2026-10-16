@@ -75,6 +75,24 @@ class ConfigResult(BaseModel):
     config: Optional[FarmConfig] = None
 
 
+class StealConfig(BaseModel):
+    auto_steal: bool = False
+    steal_crops: List[str] = Field(default_factory=lambda: list(STEAL_CROPS))
+
+
+class StealConfigResult(BaseModel):
+    success: bool
+    message: str
+    config: Optional[StealConfig] = None
+
+
+class SeedCatalog(BaseModel):
+    success: bool
+    message: Optional[str] = None
+    seeds: List[dict] = Field(default_factory=list)
+    user_stats: dict = Field(default_factory=dict)
+
+
 class FarmStatus(BaseModel):
     enabled: bool
     cron: Optional[str]
@@ -109,7 +127,7 @@ class SiqiFram(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/KoWming/MoviePilot-Plugins/main/icons/siqi.png"
     # 插件版本
-    plugin_version = "2.1.0"
+    plugin_version = "2.1.1"
     # 插件作者
     plugin_author = "KoWming（V3 适配：xchenya）"
     # 作者主页
@@ -256,7 +274,7 @@ class SiqiFram(_PluginBase):
 
     def get_render_mode(self) -> Tuple[str, Optional[str]]:
         """返回渲染模式和前端资源目录。"""
-        return "vue", "dist/assets"
+        return "vue", f"dist/assets-v{self.plugin_version}"
 
     def get_page(self) -> List[dict]:
         """Vue 模式下不返回传统页面配置。"""
@@ -320,6 +338,9 @@ class SiqiFram(_PluginBase):
         routes = [
             {"path": "/config", "endpoint": self._get_config, "methods": ["GET"], "auth": "bear", "summary": "获取配置"},
             {"path": "/config", "endpoint": self._save_config, "methods": ["POST"], "auth": "bear", "summary": "保存配置"},
+            {"path": "/steal-config", "endpoint": self._get_steal_config, "methods": ["GET"], "auth": "bear", "summary": "获取独立偷菜配置"},
+            {"path": "/steal-config", "endpoint": self._save_steal_config, "methods": ["POST"], "auth": "bear", "summary": "仅保存偷菜配置"},
+            {"path": "/seeds", "endpoint": self._get_seeds, "methods": ["GET"], "auth": "bear", "summary": "读取完整种子及解锁状态"},
             {"path": "/status", "endpoint": self._get_status, "methods": ["GET"], "auth": "bear", "summary": "插件状态"},
             {"path": "/data", "endpoint": self._get_data, "methods": ["GET"], "auth": "bear", "summary": "获取缓存农场数据"},
             {"path": "/refresh", "endpoint": self._refresh_data, "methods": ["POST"], "auth": "bear", "summary": "刷新农场数据"},
@@ -349,12 +370,15 @@ class SiqiFram(_PluginBase):
             path = route["path"]
             if path == "/config":
                 model = FarmConfig if route["methods"] == ["GET"] else ConfigResult
+            elif path == "/steal-config":
+                model = StealConfig if route["methods"] == ["GET"] else StealConfigResult
             else:
                 model = {"/status": FarmStatus, "/stage-image": ImageResult,
+                         "/seeds": SeedCatalog,
                          "/cookie": CookieResult}.get(path, FarmResult)
             route["response_model"] = model
             route["response_model_exclude_unset"] = True
-            if path not in {"/status", "/cookie"} and not (path == "/config" and route["methods"] == ["GET"]):
+            if path not in {"/status", "/cookie"} and not (path in {"/config", "/steal-config"} and route["methods"] == ["GET"]):
                 route["endpoint"] = self._api_endpoint(route["endpoint"])
         return routes
 
@@ -382,8 +406,7 @@ class SiqiFram(_PluginBase):
 
     def _save_config(self, config: dict = None) -> Dict[str, Any]:
         """保存插件配置并重新初始化服务。"""
-        if config is None:
-            config = {}
+        config = {**self._get_config(), **(config or {})}
         config["steal_crops"] = self._normalize_steal_crops(
             config.get("steal_crops", self._steal_crops)
         )
@@ -400,6 +423,24 @@ class SiqiFram(_PluginBase):
         )
         update_plugin_job(self._runtime_plugin_id())
         return {"success": True, "message": "配置已保存", "config": self._get_config()}
+
+    def _get_steal_config(self) -> Dict[str, Any]:
+        return {"auto_steal": self._auto_steal, "steal_crops": list(self._steal_crops)}
+
+    def _save_steal_config(self, config: dict = None) -> Dict[str, Any]:
+        """偷菜接口只接受自身字段，不覆盖种植种子及其他设置。"""
+        values = self._get_steal_config()
+        values.update({key: value for key, value in (config or {}).items() if key in values})
+        self._save_config(values)
+        return {"success": True, "message": "偷菜配置已保存", "config": self._get_steal_config()}
+
+    def _get_seeds(self) -> Dict[str, Any]:
+        """只读站点完整种子目录，不按偷菜范围过滤或修改默认种子。"""
+        data = self.get_farm_data()
+        if not data.get("success") or not isinstance(data.get("seeds"), list) or not data["seeds"]:
+            return {"success": False, "message": data.get("message") or data.get("msg")
+                    or "未获取到站点种子列表，请重试；当前默认种子保持不变"}
+        return {"success": True, "seeds": data["seeds"], "user_stats": data.get("user_stats") or {}}
 
     def _get_status(self) -> Dict[str, Any]:
         """获取插件运行状态与最近任务结果。"""

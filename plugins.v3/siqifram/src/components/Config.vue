@@ -6,7 +6,7 @@
           <v-icon icon="mdi-cog-outline" size="24" />
         </div>
         <div>
-          <div class="siqi-topbar__title">思齐农场 · 配置</div>
+          <div class="siqi-topbar__title">思齐农场 · 配置 · v2.1.1</div>
           <div class="siqi-topbar__sub">管理定时任务、自动化策略与站点 Cookie</div>
         </div>
       </div>
@@ -16,7 +16,7 @@
             <v-icon icon="mdi-view-dashboard" size="18" class="mr-sm-1" />
             <span class="d-none d-sm-inline">状态页</span>
           </v-btn>
-          <v-btn color="success" size="small" min-width="40" class="px-0 px-sm-3" @click="saveConfig" :loading="saving">
+          <v-btn color="success" size="small" min-width="40" class="px-0 px-sm-3" @click="saveConfig" :loading="saving" :disabled="!configLoaded">
             <v-icon icon="mdi-content-save" size="18" class="mr-sm-1" />
             <span class="d-none d-sm-inline">保存</span>
           </v-btn>
@@ -98,10 +98,6 @@
             <div class="siqi-switch-main"><v-icon icon="mdi-seed" size="18" /><div><div class="siqi-switch-label">自动补种</div><div class="siqi-switch-desc">为空地补种默认种子</div></div></div>
             <v-switch v-model="config.auto_plant" color="green" hide-details density="compact" />
           </div>
-          <div class="siqi-switch-item" :class="{'siqi-switch-item--active': config.auto_steal}" style="--siqi-accent:239,68,68">
-            <div class="siqi-switch-main"><v-icon icon="mdi-incognito" size="18" /><div><div class="siqi-switch-label">自动偷菜</div><div class="siqi-switch-desc">每日尝试偷取一次</div></div></div>
-            <v-switch v-model="config.auto_steal" color="red" hide-details density="compact" />
-          </div>
           <div class="siqi-switch-item" :class="{'siqi-switch-item--active': config.auto_like}" style="--siqi-accent:236,72,153">
             <div class="siqi-switch-main"><v-icon icon="mdi-thumb-up-outline" size="18" /><div><div class="siqi-switch-label">自动点赞</div><div class="siqi-switch-desc">随机批量点赞农场</div></div></div>
             <v-switch v-model="config.auto_like" color="pink" hide-details density="compact" />
@@ -134,15 +130,10 @@
           <v-text-field v-model.number="config.retry_interval" label="读取重试间隔（秒）" type="number" density="compact" variant="outlined" hide-details class="siqi-input" prepend-inner-icon="mdi-timer-sand" />
         </div>
         <div class="siqi-field-hint">默认种子用于自动补种空地；下拉列表来自站点种子商店，建议选择已解锁种子。</div>
-        <v-select
-          v-model="config.steal_crops"
-          :items="stealCropOptions"
-          label="允许偷取的作物"
-          multiple chips closable-chips
-          density="compact" variant="outlined" hide-details
-          class="siqi-input"
-        />
-        <div class="siqi-field-hint">自动偷菜和手动选菜只允许偷取勾选的作物；全部取消则不偷菜。自动偷菜与总 Cron、成熟任务一起检查。</div>
+        <div v-if="seedError" class="d-flex align-center ga-2" role="alert">
+          <span class="text-error">{{ seedError }}；当前默认种子保持不变。</span>
+          <v-btn size="small" variant="text" @click="loadSeeds" :loading="seedLoading">重试种子列表</v-btn>
+        </div>
         <v-textarea v-model="config.cookie" label="Cookie（留空时尝试读取站点cookie）" rows="2" auto-grow variant="outlined" class="siqi-input mt-3" :class="{'siqi-secret-input': !showCookie}" prepend-inner-icon="mdi-cookie" autocomplete="off">
           <template #append-inner>
             <v-btn variant="text" density="comfortable" size="x-small" icon class="siqi-secret-toggle" @click.stop="showCookie = !showCookie">
@@ -152,6 +143,24 @@
         </v-textarea>
       </div>
 
+      <div class="siqi-card">
+        <div class="siqi-card__header">
+          <span class="siqi-card__title d-flex align-center">
+            <v-icon icon="mdi-incognito" size="18" color="red" class="mr-1" />偷菜设置
+          </span>
+          <v-btn color="red" size="small" variant="tonal" @click="saveStealConfig" :loading="stealSaving" :disabled="!stealLoaded">保存偷菜设置</v-btn>
+        </div>
+        <v-switch v-model="stealConfig.auto_steal" label="自动偷菜" color="red" hide-details density="compact" />
+        <v-select
+          v-model="stealConfig.steal_crops"
+          :items="stealCropOptions"
+          label="允许偷取的作物"
+          multiple chips closable-chips
+          density="compact" variant="outlined" hide-details
+          class="siqi-input"
+        />
+        <div class="siqi-field-hint">只影响偷菜，不改变默认种子或种子解锁列表；全部取消则不偷菜。自动偷菜仍与总 Cron、成熟任务一起检查。</div>
+      </div>
     </div>
   </div>
 </template>
@@ -162,13 +171,19 @@ import { reactive, ref, onMounted } from 'vue'
 const props = defineProps({ api: Object, pluginId: { type: String, default: 'SiqiFram' }, initialConfig: { type: Object, default: () => ({}) } })
 const emit = defineEmits(['switch', 'close', 'config-updated'])
 const stealCropOptions = ['萝卜', '西红柿', '玉米', '茄子', '蘑菇', '樱桃']
-const config = reactive({ enabled: false, notify: true, cron: '5 */4 * * *', cookie: '', seed_id: '1', auto_plant: true, auto_harvest: true, auto_sell: false, auto_steal: false, steal_crops: [...stealCropOptions], auto_like: false, use_proxy: false, use_ai_captcha: false, harvest_delay_minutes: 2, retry_count: 2, retry_interval: 3, ...props.initialConfig })
+const { auto_steal, steal_crops, ...initialPlantConfig } = props.initialConfig
+const config = reactive({ enabled: false, notify: true, cron: '5 */4 * * *', cookie: '', seed_id: '1', auto_plant: true, auto_harvest: true, auto_sell: false, auto_like: false, use_proxy: false, use_ai_captcha: false, harvest_delay_minutes: 2, retry_count: 2, retry_interval: 3, ...initialPlantConfig })
+const stealConfig = reactive({ auto_steal: !!auto_steal, steal_crops: Array.isArray(steal_crops) ? [...steal_crops] : [...stealCropOptions] })
 const loading = ref(false)
 const saving = ref(false)
+const configLoaded = ref(false)
+const stealLoaded = ref(false)
+const stealSaving = ref(false)
 const seedLoading = ref(false)
+const seedError = ref('')
 const showCookie = ref(false)
 const aiAvailable = ref(false)
-const seedOptions = ref([{ title: '🥕 萝卜（ID 1）', value: '1', locked: false, unlockHarvest: 0 }])
+const seedOptions = ref([])
 const message = ref('')
 const messageType = ref('success')
 let messageTimer = null
@@ -190,10 +205,12 @@ async function loadConfig() {
   loading.value = true
   try {
     const res = await apiGet('/config')
-    Object.assign(config, res)
+    const { auto_steal, steal_crops, ...plantConfig } = res
+    Object.assign(config, plantConfig)
     config.seed_id = String(config.seed_id || '1')
     aiAvailable.value = !!res.ai_available
     if (!res.ai_available) config.use_ai_captcha = false
+    configLoaded.value = true
   } catch (e) {
     show(`加载失败：${e.message}`, 'error')
   } finally {
@@ -203,9 +220,11 @@ async function loadConfig() {
 
 async function loadSeeds() {
   seedLoading.value = true
+  seedError.value = ''
   try {
-    const res = await apiGet('/data')
+    const res = await apiGet('/seeds')
     const seeds = Array.isArray(res?.seeds) ? res.seeds : []
+    if (!res.success || !seeds.length) throw new Error(res.message || '种子列表暂不可用')
     const totalHarvest = Number(res?.user_stats?.total_harvest || 0)
     if (seeds.length) {
       seedOptions.value = seeds.map(seed => ({
@@ -219,13 +238,14 @@ async function loadSeeds() {
       }))
     }
   } catch (e) {
-    // 保留默认兜底选项
+    seedError.value = e.message || '种子列表加载失败'
   } finally {
     seedLoading.value = false
   }
 }
 
 async function saveConfig() {
+  if (!configLoaded.value) return show('配置尚未加载成功，请关闭后重新打开', 'error')
   const delay = Number(config.harvest_delay_minutes)
   config.harvest_delay_minutes = Number.isFinite(delay) ? Math.min(30, Math.max(0, Math.trunc(delay))) : 2
   saving.value = true
@@ -240,9 +260,33 @@ async function saveConfig() {
   }
 }
 
+async function loadStealConfig() {
+  try {
+    Object.assign(stealConfig, await apiGet('/steal-config'))
+    stealLoaded.value = true
+  } catch (e) {
+    show(`偷菜配置加载失败：${e.message}`, 'error')
+  }
+}
+
+async function saveStealConfig() {
+  if (!stealLoaded.value) return show('偷菜配置尚未加载成功，请关闭后重新打开', 'error')
+  stealSaving.value = true
+  try {
+    const res = await apiPost('/steal-config', { auto_steal: stealConfig.auto_steal, steal_crops: [...stealConfig.steal_crops] })
+    if (res.success && res.config) Object.assign(stealConfig, res.config)
+    show(res.message || (res.success ? '偷菜配置已保存' : '偷菜配置保存失败'), res.success ? 'success' : 'error')
+  } catch (e) {
+    show(`偷菜配置保存失败：${e.message}`, 'error')
+  } finally {
+    stealSaving.value = false
+  }
+}
+
 onMounted(() => {
   loadConfig()
   loadSeeds()
+  loadStealConfig()
 })
 </script>
 

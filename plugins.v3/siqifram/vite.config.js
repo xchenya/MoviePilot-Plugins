@@ -1,6 +1,10 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import federation from '@originjs/vite-plugin-federation'
+import { readFileSync } from 'node:fs'
+
+const pluginVersion = readFileSync(new URL('./__init__.py', import.meta.url), 'utf8')
+  .match(/plugin_version = "([0-9.]+)"/)[1]
 
 export default defineConfig({
   plugins: [
@@ -49,7 +53,7 @@ export default defineConfig({
     minify: false,
     cssCodeSplit: false,
     outDir: 'dist',
-    assetsDir: 'assets',
+    assetsDir: `assets-v${pluginVersion}`,
     emptyOutDir: true
   }
 })

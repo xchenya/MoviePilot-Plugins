@@ -79,14 +79,15 @@ def response(data, status=200):
 
 def test_market_and_api_contract(plugin, module):
     entry = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))["SiqiFram"]
-    assert plugin.plugin_version == entry["version"] == "2.1.0"
+    assert plugin.plugin_version == entry["version"] == "2.1.1"
     assert entry["system_version"] == ">=3.0.0"
     assert entry["release"] is True  # Federation packaging requirement.
     assert "KoWming" in plugin.plugin_author
     assert "GNU GENERAL PUBLIC LICENSE" in (PLUGIN / "LICENSE").read_text(encoding="utf-8")
-    assert plugin.get_render_mode() == ("vue", "dist/assets")
+    assert plugin.get_render_mode() == ("vue", "dist/assets-v2.1.1")
+    assert (PLUGIN / plugin.get_render_mode()[1] / "remoteEntry.js").is_file()
     routes = plugin.get_api()
-    assert len(routes) == 25
+    assert len(routes) == 28
     assert all(route["auth"] == "bear" for route in routes)
     assert all(issubclass(route["response_model"], BaseModel) for route in routes)
     assert all(route["methods"] == ["POST"] for route in routes
@@ -128,6 +129,43 @@ def test_crop_config_defaults_subset_empty_and_clone_isolation(plugin, module):
     assert module.SiqiFram()._steal_crops == defaults
     plugin.init_plugin({"steal_crops": "萝卜"})
     assert plugin._steal_crops == []
+
+
+def test_separate_steal_save_keeps_planting_seed_and_all_other_settings(plugin):
+    plugin.init_plugin({"enabled": True, "seed_id": "120", "auto_plant": True,
+                        "cron": "20 */3 * * *", "cookie": "session=custom"})
+    before = {k: v for k, v in plugin._get_config().items() if k not in {"auto_steal", "steal_crops"}}
+    saved = plugin._save_steal_config({"auto_steal": True, "steal_crops": ["玉米"],
+                                      "seed_id": "1", "cron": "bad"})
+    assert saved["config"] == {"auto_steal": True, "steal_crops": ["玉米"]}
+    assert {k: v for k, v in plugin._get_config().items() if k in before} == before
+    assert plugin.config["seed_id"] == "120"
+    plugin._save_config({"notify": False})
+    assert plugin._seed_id == "120" and plugin._auto_steal and plugin._steal_crops == ["玉米"]
+    plugin.init_plugin(plugin.config)
+    assert plugin._seed_id == "120" and plugin._steal_crops == ["玉米"]
+
+
+@pytest.mark.parametrize("selected", [[], ["萝卜"], ["玉米", "樱桃"]])
+def test_full_seed_catalog_is_independent_of_steal_filter(plugin, selected):
+    catalog = [{"id": 91, "name": "萝卜", "unlock_harvest": 0},
+               {"id": 120, "name": "樱桃", "unlock_harvest": 40},
+               {"id": 200, "name": "西瓜", "unlock_harvest": 100}]
+    plugin.init_plugin({"seed_id": "120", "steal_crops": selected})
+    plugin.get_farm_data = Mock(return_value={"success": True, "seeds": catalog,
+                                              "user_stats": {"total_harvest": 50}})
+    assert plugin._get_seeds() == {"success": True, "seeds": catalog,
+                                   "user_stats": {"total_harvest": 50}}
+    assert plugin._seed_id == "120"
+    assert plugin.get_data("farm_status") is None
+
+
+def test_seed_load_failure_does_not_replace_saved_default(plugin):
+    plugin.init_plugin({"seed_id": "120"})
+    plugin.get_farm_data = Mock(return_value={"success": False, "message": "读取失败"})
+    assert plugin._get_seeds() == {"success": False, "message": "读取失败"}
+    plugin._save_steal_config({"steal_crops": ["萝卜"]})
+    assert plugin._seed_id == plugin.config["seed_id"] == "120"
 
 
 def steal_fixture(plugin, monkeypatch):
@@ -349,6 +387,17 @@ def test_real_fastapi_registration_bodies_and_raw_payloads(plugin, monkeypatch):
     assert client.get("/status").json()["enabled"] is False
     saved = client.post("/config", json={"enabled": False, "seed_id": "9"}).json()
     assert saved["success"] and saved["config"]["seed_id"] == "9"
+    stealing = client.post("/steal-config", json={
+        "auto_steal": True, "steal_crops": ["玉米"], "seed_id": "1",
+    }).json()
+    assert stealing == {"success": True, "message": "偷菜配置已保存",
+                        "config": {"auto_steal": True, "steal_crops": ["玉米"]}}
+    assert client.get("/config").json()["seed_id"] == "9"
+    plugin.get_farm_data = Mock(return_value={"success": True,
+        "seeds": [{"id": 91, "name": "萝卜", "unlock_harvest": 0},
+                  {"id": 200, "name": "西瓜", "unlock_harvest": 100}],
+        "user_stats": {"total_harvest": 50}})
+    assert len(client.get("/seeds").json()["seeds"]) == 2
     monkeypatch.setattr(requests, "post", Mock(return_value=response({
         "success": True, "msg": "ok", "new_field": 42})))
     plugin.get_farm_data = Mock(return_value={"success": True, "user_lands": []})

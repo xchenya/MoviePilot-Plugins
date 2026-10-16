@@ -77,21 +77,83 @@ test('manual steal keeps maturity visible and disables unselected crops', () => 
   assert.equal(isStealablePlot({ seed_id: 91, harvest_time: 200, steal_allowed: true }), false)
 })
 
-test('crop choices are saved as a subset and clearing all stays empty', async () => {
+function configHarness(api, initialConfig = {}) {
   const source = fs.readFileSync(path.join(plugin, 'src/components/Config.vue'), 'utf8')
-  const options = source.split('\n').find(line => line.startsWith('const stealCropOptions ='))
-  assert.deepEqual(new Function(options + '; return stealCropOptions')(),
-    ['萝卜', '西红柿', '玉米', '茄子', '蘑菇', '樱桃'])
-  const method = 'async function saveConfig()' + source.split('async function saveConfig()')[1]
-    .split('onMounted(')[0]
+  const { descriptor } = parse(source)
+  const script = descriptor.scriptSetup.content.split('\n')
+    .filter(line => !line.startsWith('import ')).join('\n')
+  return new Function('reactive', 'ref', 'onMounted', 'defineProps', 'defineEmits',
+    'setTimeout', 'clearTimeout', script + '\nreturn { config, stealConfig, seedOptions, seedError, configLoaded, stealLoaded, loadConfig, loadSeeds, loadStealConfig, saveConfig, saveStealConfig }')(
+      value => value, value => ({ value }), () => {},
+      () => ({ api, pluginId: 'SiqiFram', initialConfig }), () => () => {},
+      () => 0, () => {},
+    )
+}
+
+test('planting seed list keeps all crops and unlock status, separate steal save cannot change it', async () => {
   const posts = []
-  const config = { steal_crops: ['萝卜', '樱桃'], harvest_delay_minutes: 2 }
-  const run = new Function('config', 'saving', 'apiPost', 'emit', 'show',
-    method + '; return saveConfig')(config, { value: false },
-      async (url, data) => { posts.push([url, data]); return { success: true, config: data } },
-      () => {}, () => {})
-  await run()
-  config.steal_crops = []
-  await run()
-  assert.deepEqual(posts.map(([, data]) => data.steal_crops), [['萝卜', '樱桃'], []])
+  const api = {
+    get: async url => {
+      if (url.endsWith('/steal-config')) return { auto_steal: true, steal_crops: ['萝卜'] }
+      if (url.endsWith('/config')) return { seed_id: '120', ai_available: false, auto_steal: true, steal_crops: ['萝卜'] }
+      assert.ok(url.endsWith('/seeds'))
+      return { success: true, seeds: [
+        { id: 91, name: '萝卜', unlock_harvest: 0 },
+        { id: 120, name: '樱桃', unlock_harvest: 40 },
+        { id: 200, name: '西瓜', unlock_harvest: 100 },
+      ], user_stats: { total_harvest: 50 } }
+    },
+    post: async (url, data) => { posts.push([url, structuredClone(data)]); return { success: true, config: data } },
+  }
+  const state = configHarness(api, { seed_id: '120', steal_crops: ['萝卜'] })
+  await Promise.all([state.loadConfig(), state.loadSeeds(), state.loadStealConfig()])
+  assert.deepEqual(state.seedOptions.value.map(s => [s.value, s.locked]),
+    [['91', false], ['120', false], ['200', true]])
+  assert.equal(state.config.seed_id, '120')
+  assert.equal('steal_crops' in state.config, false)
+  assert.equal('auto_steal' in state.config, false)
+  state.stealConfig.steal_crops = ['玉米', '樱桃']
+  await state.saveStealConfig()
+  state.stealConfig.steal_crops = []
+  await state.saveStealConfig()
+  await state.saveConfig()
+  assert.deepEqual(posts.slice(0, 2), [
+    ['plugin/SiqiFram/steal-config', { auto_steal: true, steal_crops: ['玉米', '樱桃'] }],
+    ['plugin/SiqiFram/steal-config', { auto_steal: true, steal_crops: [] }],
+  ])
+  assert.equal(posts[2][0], 'plugin/SiqiFram/config')
+  assert.equal(posts[2][1].seed_id, '120')
+  assert.equal('steal_crops' in posts[2][1], false)
+  assert.equal(state.config.seed_id, '120')
+})
+
+test('seed read errors stay visible without a fake radish option or default overwrite', async () => {
+  const posts = []
+  const state = configHarness({
+    get: async url => {
+      if (url.endsWith('/steal-config')) return { auto_steal: false, steal_crops: ['玉米'] }
+      if (url.endsWith('/config')) return { seed_id: '120' }
+      throw new Error('站点读取失败')
+    },
+    post: async (url, data) => { posts.push([url, data]); return { success: true, config: data } },
+  })
+  await Promise.all([state.loadConfig(), state.loadSeeds(), state.loadStealConfig()])
+  assert.deepEqual(state.seedOptions.value, [])
+  assert.equal(state.seedError.value, '站点读取失败')
+  await state.saveStealConfig()
+  assert.equal(state.config.seed_id, '120')
+  assert.ok(posts.every(([url, data]) => url.endsWith('/steal-config') && !('seed_id' in data)))
+})
+
+test('failed configuration reads cannot save frontend fallback defaults', async () => {
+  let writes = 0
+  const state = configHarness({
+    get: async () => { throw new Error('连接失败') },
+    post: async () => { writes++; return { success: true } },
+  }, { seed_id: '120' })
+  await Promise.all([state.loadConfig(), state.loadStealConfig()])
+  await state.saveConfig()
+  await state.saveStealConfig()
+  assert.equal(writes, 0)
+  assert.equal(state.config.seed_id, '120')
 })
