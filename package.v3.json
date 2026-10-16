@@ -56,7 +56,7 @@
     "name": "思齐自动收垃圾",
     "description": "保留自动收垃圾，新增可选自动搬砖、服务端每日状态与独立结果统计（未经真实联调）。",
     "labels": "站点,自动化,思齐",
-    "version": "2.3.0",
+    "version": "2.4.0",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Moviepilot_A.png",
     "author": "bfjy（V3 适配：xchenya）",
     "author_url": "https://github.com/bfjy2024/MoviePilot-Plugins",
@@ -64,6 +64,7 @@
     "system_version": ">=3.0.0",
     "release": false,
     "history": {
+      "v2.4.0": "新增可选搬砖独立Cron及失败重试次数（默认1次）；保留每日50块上限、认证阻断及不确定写入保护。面板搬砖结果显示当天成功时间和结果，不再被清理等待覆盖；Mock验证，未经宿主联调。",
       "v2.3.0": "自动模式按沙滩两小时、搬砖服务端每日零点独立安排一次性任务，等待期间不访问站点；移除检查间隔及24小时搬砖限制。支持collected_items数量表，正常等待计为完成，未知数量如实标注；Mock验证，未经宿主联调。",
       "v2.2.2": "精简面板：定时模式显示按站点冷却，下次执行时间精确到分钟，最后结果仅显示清理和搬砖消息；保留原有调度、统计及通知。未经宿主界面联调。",
       "v2.2.1": "站点冷却的本地检查间隔支持自定义，默认10分钟、最小1分钟；兼容旧配置，所有保存路径保留设置，面板显示实际间隔。",

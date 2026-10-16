@@ -2,6 +2,7 @@
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from unittest.mock import Mock
 
 import pytest
@@ -161,7 +162,7 @@ def test_overdue_restart_plans_within_five_minutes_without_catchup_storm(plugin,
                         "stats": {"due_schedule_version": 1, "beach_due_at": 500, "brick_due_at": 100}})
     plugin._scheduler.add_job.assert_called_once()
     assert plugin._scheduler.add_job.call_args.kwargs["run_date"].timestamp() == 1015
-    assert plugin._SiQiCleanBeach__due_text("beach_due_at", compact=True) == datetime.fromtimestamp(1015).strftime("%Y-%m-%d %H:%M")
+    assert plugin._SiQiCleanBeach__due_text("beach_due_at", compact=True) == datetime.fromtimestamp(1015, ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M")
     requests.Session.assert_not_called()
 
 

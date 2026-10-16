@@ -6,6 +6,7 @@ import math
 import threading
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import Mock
@@ -13,6 +14,7 @@ from unittest.mock import Mock
 import pytest
 import requests
 from bs4 import BeautifulSoup
+from apscheduler.triggers.cron import CronTrigger
 
 from .test_plugin import CODE, _plugin_class
 
@@ -41,10 +43,11 @@ def plugin():
             method.decorator_list = []
     module = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
     ns = dict(Base=Base, requests=requests, BeautifulSoup=BeautifulSoup, threading=threading,
-              time=time, math=math, datetime=datetime, timezone=timezone, re=__import__("re"), Any=Any, Dict=Dict,
+              time=time, math=math, datetime=datetime, timezone=timezone, ZoneInfo=ZoneInfo,
+              settings=SimpleNamespace(TZ="Asia/Shanghai"), re=__import__("re"), Any=Any, Dict=Dict,
               List=List, Optional=Optional, Tuple=Tuple, Event=object,
               logger=Mock(), SiteOper=Mock(), NotificationType=SimpleNamespace(Plugin="plugin"),
-              IntervalTrigger=Mock(), CronTrigger=Mock(), BackgroundScheduler=Mock(side_effect=lambda: Mock()),
+              IntervalTrigger=Mock(), CronTrigger=Mock(wraps=CronTrigger), BackgroundScheduler=Mock(side_effect=lambda: Mock()),
               EventType=SimpleNamespace(PluginAction="action"))
     exec(compile(module, str(CODE), "exec"), ns)
     p = ns["SiQiCleanBeach"]()

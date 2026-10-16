@@ -10,6 +10,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
@@ -20,6 +21,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 
 from app.sdk.events import Event, eventmanager
+from app.core.config import settings
 from app.db.oper.site import SiteOper
 from app.sdk.logging import logger
 from app.plugins import _PluginBase
@@ -40,7 +42,7 @@ class SiQiCleanBeach(_PluginBase):
     plugin_name = "思齐自动收垃圾"
     plugin_desc = "自动清理沙滩和可选搬砖，支持站点冷却或固定时间；新调度未经真实联调。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Moviepilot_A.png"
-    plugin_version = "2.3.0"
+    plugin_version = "2.4.0"
     plugin_author = "bfjy（V3 适配：xchenya）"
     author_url = "https://bfjy2024.github.io/bfjy"
     plugin_config_prefix = "siqicleanbeach_"
@@ -114,6 +116,9 @@ class SiQiCleanBeach(_PluginBase):
         self._cron = "1 */2 * * *"
         self._interval_minutes = 121
         self._auto_brick = False
+        self._brick_cron = ""
+        self._brick_cron_error = ""
+        self._brick_retry_limit = 1
         self._notify = True
         self._run_once = False
         self._inventory: Dict[str, Dict[str, Any]] = {}
@@ -151,6 +156,9 @@ class SiQiCleanBeach(_PluginBase):
         self._cron = (config.get("cron") or "1 */2 * * *").strip()
         self._interval_minutes = self.__safe_int(config.get("interval_minutes"), 121, min_value=1)
         self._auto_brick = bool(config.get("auto_brick", False))
+        self._brick_cron = str(config.get("brick_cron") or "").strip()
+        self._brick_cron_error = ""
+        self._brick_retry_limit = min(10, self.__safe_int(config.get("brick_retry_limit"), 1, min_value=0))
         self._notify = bool(config.get("notify", True))
         self._run_once = bool(config.get("run_once", False))
 
@@ -167,6 +175,26 @@ class SiQiCleanBeach(_PluginBase):
             self._stats.pop("beach_due_at", None)
             self._stats.pop("brick_due_at", None)
             self._stats["due_schedule_version"] = 1
+        if self._stats.get("brick_retry_policy") != 1:
+            self._stats["brick_retry_count"] = 0
+            self._stats["brick_retry_policy"] = 1
+        if (self._stats.get("brick_schedule_cron", "") != self._brick_cron
+                or self._brick_cron and self._stats.get("brick_schedule_timezone", settings.TZ) != settings.TZ):
+            self._stats.pop("brick_due_at", None)
+            self._stats["brick_retry_count"] = 0
+        self._stats["brick_schedule_cron"] = self._brick_cron
+        self._stats["brick_schedule_timezone"] = settings.TZ
+        if self._brick_cron:
+            next_brick = self.__next_brick_time(time.time())
+            if not self.__valid_due(self._stats.get("brick_due_at")) or next_brick is None:
+                self._stats["brick_due_at"] = next_brick
+        if self.__safe_int(self._stats.get("brick_retry_count"), 0) > self._brick_retry_limit:
+            self._stats["brick_retry_count"] = 0
+            self._stats["brick_due_at"] = self.__next_brick_time(time.time())
+        if not running and not self._stats.get("brick_success"):
+            for record in reversed(self._stats.get("history", [])):
+                if isinstance(record, dict) and self.__record_brick_success(record.get("brick", {})):
+                    break
         self._stopped = False
 
         logger.info(
@@ -181,6 +209,8 @@ class SiQiCleanBeach(_PluginBase):
             self.update_config({
                 "enabled": self._enabled,
                 "auto_brick": self._auto_brick,
+                "brick_cron": self._brick_cron,
+                "brick_retry_limit": self._brick_retry_limit,
                 "cookie": self._cookie,
                 "schedule_mode": self._schedule_mode,
                 "cron": self._cron,
@@ -379,6 +409,12 @@ class SiQiCleanBeach(_PluginBase):
                         "content": [
                             {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
                                 {"component": "VSwitch", "props": {"model": "auto_brick", "label": "自动搬砖（默认关闭）"}}
+                            ]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                                {"component": "VTextField", "props": {"model": "brick_cron", "label": "搬砖独立 Cron（可选）", "clearable": True, "placeholder": "0 10,16 * * *", "hint": "留空沿用原调度；填写后搬砖独立执行，按 MoviePilot 时区。示例：每天10点、16点。每日上限仍为50块。"}}
+                            ]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                                {"component": "VTextField", "props": {"model": "brick_retry_limit", "label": "搬砖失败重试次数", "type": "number", "min": 0, "max": 10, "hint": "控制失败后的整轮重试，默认1次，0关闭；5分钟后开始。认证失败或写入结果不确定时不重试写入。"}}
                             ]}
                         ]
                     },
@@ -408,6 +444,8 @@ class SiQiCleanBeach(_PluginBase):
         ], {
             "enabled": self._enabled,
             "auto_brick": self._auto_brick,
+            "brick_cron": self._brick_cron,
+            "brick_retry_limit": self._brick_retry_limit,
             "cookie": cookie_value,
             "schedule_mode": self._schedule_mode,
             "cron": self._cron,
@@ -491,7 +529,7 @@ class SiQiCleanBeach(_PluginBase):
                                     self.__info_col("⏳ 沙滩时间来源", stats.get("beach_due_source", "等待首次同步")),
                                     self.__info_col("📝 最后结果", last_result),
                                     self.__info_col("🗑️ 清理结果", stats.get("clean_result", "-")),
-                                    self.__info_col("🧱 搬砖结果", stats.get("brick_result", "-")),
+                                    self.__info_col("🧱 搬砖结果", self.__brick_today_result()),
                                     self.__info_col("🧱 本次 / 今日 / 库存", f"{stats.get('bricks_moved', 0)} / {stats.get('daily_bricks') if stats.get('daily_bricks') is not None else '未知'} / {inventory.get('砖块', {}).get('count', '未知')}"),
                                     self.__info_col("📦 库存状态", "本次已刷新" if stats.get("inventory_refreshed") else "缓存，非本次刷新"),
                                     self.__info_col("🔔 通知", "开启" if self._notify else "关闭"),
@@ -607,10 +645,15 @@ class SiQiCleanBeach(_PluginBase):
 
     def __schedule_next(self, not_before: float = 0):
         with self._schedule_lock:
-            if not self._enabled or self._stopped or self._schedule_mode != "auto" or self._auth_blocked:
+            if not self._enabled or self._stopped or self._auth_blocked:
                 return
             now = time.time()
-            keys = ["beach_due_at"] + (["brick_due_at"] if self._auto_brick else [])
+            keys = ["beach_due_at"] if self._schedule_mode == "auto" else []
+            if (self._auto_brick and not self._brick_cron_error
+                    and (self._schedule_mode == "auto" or self._brick_cron or self._stats.get("brick_retry_count"))):
+                keys.append("brick_due_at")
+            if not keys:
+                return
             dates = [self._stats.get(key) for key in keys]
             due = min(value if self.__valid_due(value) else now + 15 for value in dates)
             if self._scheduler is None:
@@ -624,7 +667,7 @@ class SiQiCleanBeach(_PluginBase):
             )
 
     def __run_due_job(self, generation: int):
-        result = self.run_clean_task(scheduled=True, generation=generation)
+        result = self.run_clean_task(scheduled=True, generation=generation, brick_only=self._schedule_mode != "auto")
         if result["status"] in {"running", "waiting"}:
             self.__schedule_next(not_before=time.time() + 30)
 
@@ -633,6 +676,62 @@ class SiQiCleanBeach(_PluginBase):
         count = min(self.__safe_int(self._stats.get(key), 0, min_value=0) + 1, 4)
         self._stats[key] = count
         return time.time() + (300, 900, 1800, 3600)[count - 1]
+
+    def __next_brick_time(self, after: float) -> Optional[float]:
+        try:
+            zone = settings.TZ if self._brick_cron else "Asia/Shanghai"
+            trigger = CronTrigger.from_crontab(self._brick_cron or "0 0 * * *", timezone=zone)
+            instant = datetime.fromtimestamp(after, timezone.utc)
+            next_time = trigger.get_next_fire_time(instant, instant)
+            if next_time is not None:
+                return next_time.timestamp() + (0 if self._brick_cron else 15)
+        except (ValueError, TypeError, KeyError):
+            pass
+        self._brick_cron_error = "搬砖 Cron 无效，请检查5段表达式和宿主时区"
+        logger.warning(self._brick_cron_error)
+        return None
+
+    def __plan_brick(self, brick: dict):
+        now = time.time()
+        reset_at = self._stats.get("brick_day_reset_at")
+        if (self.__valid_brick_state({**brick, "bricks_moved": brick.get("bricks_moved", 0)})
+                and self.__valid_due(brick.get("_received_at"))):
+            reset_at = brick["_received_at"] + brick["next_brick_reset_ts"] - brick["server_now"]
+            self._stats["brick_day_reset_at"] = reset_at
+        regular = self.__next_brick_time(now) if self._brick_cron or not self.__valid_due(reset_at) or reset_at <= now else reset_at + 15
+        retries = self.__safe_int(self._stats.get("brick_retry_count"), 0, min_value=0)
+        if (not brick.get("success") and not brick.get("auth_failed") and not brick.get("cancelled")
+                and self._stats.get("brick_uncertain_reset") is None and retries < self._brick_retry_limit):
+            retry_at = now + (300, 900, 1800, 3600)[min(retries, 3)]
+            if regular is not None and retry_at < regular:
+                self._stats["brick_retry_count"] = retries + 1
+                self._stats["brick_due_at"] = retry_at
+                return
+        self._stats["brick_retry_count"] = 0
+        self._stats["brick_due_at"] = regular
+
+    def __record_brick_success(self, brick: dict) -> bool:
+        if (not isinstance(brick, dict) or brick.get("success") is not True
+                or not self.__valid_brick_state(brick) or brick.get("bricks_moved", 0) <= 0
+                or not self.__valid_due(brick.get("_received_at"))):
+            return False
+        self._stats["brick_success"] = {
+            "at": brick["_received_at"], "moved": brick["bricks_moved"], "daily": brick["daily_bricks"],
+            "reset_at": brick["_received_at"] + brick["next_brick_reset_ts"] - brick["server_now"],
+        }
+        return True
+
+    def __brick_today_result(self) -> str:
+        success = self._stats.get("brick_success")
+        now = time.time()
+        if (isinstance(success, dict) and self.__valid_due(success.get("at"))
+                and self.__valid_due(success.get("reset_at")) and success["at"] <= now < success["reset_at"]):
+            when = datetime.fromtimestamp(success["at"], ZoneInfo(settings.TZ)).strftime("%Y-%m-%d %H:%M")
+            return f"{when} 搬砖成功，本次{success.get('moved', '未知')}块，今日{success.get('daily', '未知')}/50"
+        reset_at = self._stats.get("brick_day_reset_at")
+        if self._stats.get("daily_bricks") == 50 and self.__valid_due(reset_at) and now < reset_at:
+            return "今日已达上限（成功时间未知）"
+        return "今日暂无成功搬砖记录"
 
     def __inventory_items(self, sorted_items: list) -> List[Dict[str, Any]]:
         """生成物品卡片网格 - 优化文字颜色对比度"""
@@ -839,23 +938,26 @@ class SiQiCleanBeach(_PluginBase):
                 and 0 < value < 253402300800 and math.isfinite(value))
 
     def __due_text(self, key: str, compact: bool = False) -> str:
-        if self._schedule_mode == "auto" and self._auth_blocked:
+        if key == "brick_due_at" and self._brick_cron_error:
+            return self._brick_cron_error
+        if (self._schedule_mode == "auto" or key == "brick_due_at" and self._brick_cron) and self._auth_blocked:
             return "等待更新 Cookie"
         due = self._stats.get(key)
         if not self.__valid_due(due):
             return "等待首次同步" if due is None else "时间异常，等待重新同步"
-        if self._schedule_mode == "auto" and self.__valid_due(self._next_run_at):
+        if (self._schedule_mode == "auto" or key == "brick_due_at" and self._brick_cron) and self.__valid_due(self._next_run_at):
             due = max(due, self._next_run_at)
         try:
+            local_due = datetime.fromtimestamp(due, ZoneInfo(settings.TZ))
             if compact:
-                return f"{datetime.fromtimestamp(due):%Y-%m-%d %H:%M}"
+                return f"{local_due:%Y-%m-%d %H:%M}"
             remaining = max(0, int(due - time.time()))
-            return f"{datetime.fromtimestamp(due):%Y-%m-%d %H:%M:%S}（约{remaining // 3600}:{remaining // 60 % 60:02d}:{remaining % 60:02d}）"
+            return f"{local_due:%Y-%m-%d %H:%M:%S}（约{remaining // 3600}:{remaining // 60 % 60:02d}:{remaining % 60:02d}）"
         except (ValueError, OverflowError, OSError):
             return "时间异常，等待重新同步"
 
     def run_clean_task(self, reserved: bool = False, scheduled: bool = False,
-                       generation: Optional[int] = None) -> Dict[str, Any]:
+                       generation: Optional[int] = None, brick_only: bool = False) -> Dict[str, Any]:
         with self._schedule_lock:
             if scheduled and (not self._enabled or self._stopped or self._auth_blocked
                               or (generation is not None and generation != self._schedule_generation)):
@@ -868,12 +970,14 @@ class SiQiCleanBeach(_PluginBase):
         auto = scheduled and self._schedule_mode == "auto"
         now = time.time()
         beach_at, brick_at = self._stats.get("beach_due_at"), self._stats.get("brick_due_at")
-        clean_due = not auto or not self.__valid_due(beach_at) or now >= beach_at
-        brick_due = self._auto_brick and (not auto or not self.__valid_due(brick_at) or now >= brick_at)
-        if auto and not clean_due and not brick_due:
+        clean_due = not brick_only and (not auto or not self.__valid_due(beach_at) or now >= beach_at)
+        brick_timed = auto or bool(self._brick_cron) or bool(self._stats.get("brick_retry_count")) or brick_only
+        brick_due = self._auto_brick and (not scheduled or not self._brick_cron_error and (
+            not brick_timed or not self.__valid_due(brick_at) or now >= brick_at))
+        if scheduled and not clean_due and not brick_due:
             self._lock.release()
             return {"status": "waiting", "message": "等待站点冷却到期"}
-        clean = {"success": True, "message": "沙滩冷却中，正常等待", "skipped": True, "trash": 0}
+        clean = {"success": True, "message": "本轮未安排清理" if brick_only else "沙滩冷却中，正常等待", "skipped": True, "trash": 0}
         brick = {"success": True, "message": "未到每日搬砖时间，正常等待" if self._auto_brick else "未开启",
                  "skipped": True, "bricks_moved": 0}
         refreshed = False
@@ -958,13 +1062,14 @@ class SiQiCleanBeach(_PluginBase):
                 message = (f"清理：{clean_text}；搬砖：{brick_text}；本次{moved}块，"
                            f"今日{daily if daily is not None else '未知'}/50，库存{stock if stock is not None else '未知'}"
                            f"（{'本次已刷新' if refreshed else '缓存，非本次刷新'}）")
-                record = not (auto and status == "completed" and clean.get("skipped") and brick.get("skipped"))
+                record = not ((auto or brick_only) and status == "completed" and clean.get("skipped") and brick.get("skipped"))
                 if record:
                     self._stats.update(clean_result=clean_text, brick_result=brick_text,
                                        bricks_moved=moved, last_result=message, last_run=time.time())
                 self._stats.update(inventory_refreshed=refreshed, total_items_count=total)
                 if brick_ran:
                     self._stats["daily_bricks"] = daily
+                    self.__record_brick_success(brick)
                 if not record:
                     status = "waiting"
                 result = self.__new_result(status=status, message=message)
@@ -986,14 +1091,8 @@ class SiQiCleanBeach(_PluginBase):
                     self._stats["beach_due_at"] = self.__retry_due("beach")
                     self._stats["beach_due_source"] = "同步或执行失败，等待重查"
                     self._stats["beach_needs_sync"] = True
-                if brick_due:
-                    if ((brick.get("daily_bricks") == 50 or self._stats.get("brick_uncertain_reset") is not None)
-                            and self.__valid_brick_state({**brick, "bricks_moved": 0})
-                            and self.__valid_due(brick.get("_received_at"))):
-                        self._stats["brick_due_at"] = brick["_received_at"] + brick["next_brick_reset_ts"] - brick["server_now"] + 15
-                        self._stats["brick_retry_count"] = 0
-                    else:
-                        self._stats["brick_due_at"] = self.__retry_due("brick")
+                if brick_ran:
+                    self.__plan_brick(brick)
                 if status == "auth_failed" and run_generation == self._schedule_generation:
                     self._auth_blocked = True
                 elif status == "completed" and run_generation == self._schedule_generation:
@@ -1154,6 +1253,11 @@ class SiQiCleanBeach(_PluginBase):
                     result.update({k: response[k] for k in ("daily_bricks", "server_now", "last_daily_reset", "next_brick_reset_ts", "_received_at")})
                     if response["daily_bricks"] == 50 and not response.get("auth_failed"):
                         return {**result, "success": True, "message": "已达每日上限，正常跳过"}
+                    if (not response.get("auth_failed") and response["last_daily_reset"] == state["last_daily_reset"]
+                            and response["daily_bricks"] == state["daily_bricks"]
+                            and response["server_now"] >= state["server_now"]):
+                        # 服务端明确业务失败且当天计数未变，允许稍后重新同步再重试。
+                        return {**result, "message": response["message"]}
                 self._stats["brick_uncertain_reset"] = result["last_daily_reset"]
                 return {**result, "auth_failed": response.get("auth_failed", False), "message": response["message"]}
             if not self.__valid_brick_state(response):
@@ -1317,6 +1421,8 @@ class SiQiCleanBeach(_PluginBase):
             self.update_config({
                 "enabled": self._enabled,
                 "auto_brick": self._auto_brick,
+                "brick_cron": self._brick_cron,
+                "brick_retry_limit": self._brick_retry_limit,
                 "cookie": self._cookie,
                 "schedule_mode": self._schedule_mode,
                 "cron": self._cron,
@@ -1354,8 +1460,8 @@ class SiQiCleanBeach(_PluginBase):
         text += f"\n📦 物品总数：{total_count:,} 个"
         if self._schedule_mode == "auto":
             text += f"\n🏖️ 沙滩下次执行时间：{self.__due_text('beach_due_at', compact=True)}"
-            if self._auto_brick:
-                text += f"\n🧱 搬砖下次执行时间：{self.__due_text('brick_due_at', compact=True)}"
+        if self._auto_brick and (self._schedule_mode == "auto" or self._brick_cron):
+            text += f"\n🧱 搬砖下次执行时间：{self.__due_text('brick_due_at', compact=True)}"
 
         self.post_message(
             mtype=NotificationType.Plugin,
