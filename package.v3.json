@@ -75,5 +75,21 @@
       "v2.0.0": "V3 移植：SDK、站点 Oper、请求 TLS 校验、线程独立状态、DOM 库存解析、鉴权 API 和回归测试。",
       "v1.0.0": "原作者 bfjy：思齐沙滩自动收集垃圾，支持定时/立即执行。"
     }
+  },
+  "SiqiFram": {
+    "name": "Vue-思齐农场",
+    "description": "农场管理、种植、收获、偷菜、点赞。",
+    "labels": "站点,农场,思齐",
+    "version": "2.0.0",
+    "icon": "https://raw.githubusercontent.com/KoWming/MoviePilot-Plugins/main/icons/siqi.png",
+    "author": "KoWming（V3 适配：xchenya）",
+    "author_url": "https://github.com/KoWming",
+    "level": 2,
+    "system_version": ">=3.0.0",
+    "release": true,
+    "history": {
+      "v2.0.0": "V3 迁移测试版：使用公开插件/调度 SDK 与 SiteOper，补齐 API 模型及分身隔离；保留农场功能和 Vue 界面，隔离 Vuetify 全局样式，写请求结果不明时停止本轮操作。已完成 Mock/构建验证，未经宿主及真实站点联调。",
+      "v1.0.3": "基于 KoWming 原版思齐农场，保留种植、收获、出售、偷菜、点赞与 OCR/可选 AI 识别。"
+    }
   }
 }

@@ -1,0 +1,36 @@
+# 思齐农场 V3
+
+移植自 [KoWming/MoviePilot-Plugins 的 siqifram 1.0.3](https://github.com/KoWming/MoviePilot-Plugins/tree/main/plugins.v2/siqifram)，保留原作者 KoWming 署名，按上游 GPL-3.0 许可分发。V3 适配维护：xchenya。
+
+当前版本 **2.0.0**，要求 **MoviePilot V3**。保留原 Vue 配置页、农场管理页、种植/补种、收获、出售、偷菜、点赞、农场访问、成熟时间调度及 OCR/可选 AI 验证码识别。
+
+## 配置与使用
+
+1. 在 MoviePilot 站点管理添加思齐站点及有效 Cookie，插件优先使用站点地址和 User-Agent；也可在插件内填写独立 Cookie。
+2. 首次安装默认关闭自动任务。打开页面读取本地缓存，点击刷新才请求站点。
+3. 先检查农场账号及数据，再按需启用自动收获、补种等功能。自动出售、偷菜、点赞和 AI 辅助默认关闭。
+4. Cron 默认为每四小时第 5 分钟巡检；另按最早作物成熟时间加默认 2 分钟延迟安排收获。日期和调度使用 MoviePilot 配置时区。
+5. OCR 使用 MoviePilot 的 OCR_HOST；AI 辅助还要求宿主启用智能助手并提供验证码工具。
+
+购买坑位及批量出售保留原页面确认。涉及站点魔力和库存变化，操作前核对账号与数量。
+
+## V3 适配
+
+- 使用当前公开的插件、配置、日志及调度 SDK；站点查询使用 SiteOper。
+- API 保留原插件业务响应，所有路由声明响应模型并要求 Bearer 认证；前端复用宿主注入的 api 和 pluginId。
+- 调度清理只影响当前实例，任务及手动操作互斥，停止后不继续发送后续农场请求。
+- 图片代理和验证码下载限制同源并禁止自动跟随跳转；TLS 校验保持启用。
+- 读取失败可以重试；写请求不自动重试。超时、异常 HTTP 或格式不明时停止本轮操作，提示刷新核对，避免直接重发购买或出售。
+- 保留站点动作的附加响应字段，过滤 Vuetify/MDI 基础样式，前端构建产物随插件提供。
+
+市场索引的 release=true 用于本仓库要求的 Vue 资源打包，不表示完成真实联调。当前仅完成离线 Mock、接口及构建验证，尚未在 MoviePilot 宿主或真实思齐站点验证功能、扣费及验证码识别。
+
+## 开发验证
+
+后端测试：python -m pytest tests/v3/siqifram -q
+
+前端：在本目录运行 npm ci，再运行 npm run build:web；在仓库根运行 node --test tests/v3/siqifram/test_frontend.mjs。
+
+构建后运行 python .github/scripts/check_federation_css.py 和 python .github/scripts/check_plugin_versions.py package.json package.v2.json package.v3.json。
+
+前端开发依赖保持上游锁文件版本。离线测试替代宿主服务并拦截站点请求，不能替代宿主安装、页面加载和真实账号验收。
