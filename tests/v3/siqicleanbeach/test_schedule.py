@@ -3,6 +3,7 @@ import json
 import time
 import threading
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from unittest.mock import Mock
 
 import pytest
@@ -316,7 +317,7 @@ def test_obsolete_interval_controls_are_removed_from_all_save_paths_and_form(plu
 @pytest.mark.parametrize("separate_results", [False, True])
 def test_panel_shows_compact_dates_and_result_without_changing_saved_details(plugin, separate_results):
     plugin._schedule_mode = "auto"
-    due = datetime(2026, 10, 15, 18, 15, 34).timestamp()
+    due = datetime(2026, 10, 15, 18, 15, 34, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp()
     brief = "清理：沙滩冷却中，请稍候！；搬砖：已达每日上限，正常跳过"
     legacy = "旧配置执行结果"
     plugin._stats.update(beach_due_at=due, brick_due_at=due, last_result=legacy)
