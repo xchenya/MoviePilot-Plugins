@@ -130,7 +130,7 @@ class SiqiFram(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/KoWming/MoviePilot-Plugins/main/icons/siqi.png"
     # 插件版本
-    plugin_version = "2.1.2"
+    plugin_version = "2.1.3"
     # 插件作者
     plugin_author = "KoWming（V3 适配：xchenya）"
     # 作者主页
@@ -455,15 +455,16 @@ class SiqiFram(_PluginBase):
         return hashlib.sha256(json.dumps([site_url, cookie]).encode()).hexdigest()
 
     def _get_seeds(self, refresh: bool = False) -> Dict[str, Any]:
-        """缓存读取不占农场执行锁，只有显式刷新才访问站点。"""
-        if refresh:
-            return self._api_endpoint(self._refresh_seeds, "数据读取中")()
-        catalog = self.get_data("seed_catalog")
+        """优先复用农场快照；无可用缓存时兼容旧配置页自动只读刷新。"""
         context = self._seed_cache_key()
-        if context and isinstance(catalog, dict) and catalog.get("context") == context:
-            return {"success": True, "seeds": catalog["seeds"],
-                    "user_stats": catalog["user_stats"], "cached": True}
-        return {"success": False, "message": "暂无当前账号的种子缓存，请刷新种子列表", "needs_refresh": True}
+        if not refresh:
+            for key, context_field in (("farm_status", "_cache_context"), ("seed_catalog", "context")):
+                catalog = self.get_data(key)
+                if (context and isinstance(catalog, dict) and catalog.get(context_field) == context
+                        and isinstance(catalog.get("seeds"), list) and catalog["seeds"]):
+                    return {"success": True, "seeds": catalog["seeds"],
+                            "user_stats": catalog.get("user_stats") or {}, "cached": True}
+        return self._api_endpoint(self._refresh_seeds, "数据读取中")()
 
     def _refresh_seeds(self) -> Dict[str, Any]:
         """只读完整种子目录，不过滤偷菜范围或修改默认种子及调度。"""
@@ -675,8 +676,8 @@ class SiqiFram(_PluginBase):
             data["user_farm_like_total"] = data.get("user_farm_like_total", page_meta.get("user_farm_like_total", 0))
             if (context and context == self._seed_cache_key()
                     and isinstance(data.get("seeds"), list) and data["seeds"]):
-                self.save_data("seed_catalog", {"context": context, "seeds": data["seeds"],
-                                                "user_stats": data.get("user_stats") or {}})
+                data["_cache_context"] = context
+                self.save_data("farm_status", data)
         return data
 
     def _get_current_username(self) -> str:

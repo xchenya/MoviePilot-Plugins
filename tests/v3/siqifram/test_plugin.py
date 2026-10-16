@@ -79,12 +79,12 @@ def response(data, status=200):
 
 def test_market_and_api_contract(plugin, module):
     entry = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))["SiqiFram"]
-    assert plugin.plugin_version == entry["version"] == "2.1.2"
+    assert plugin.plugin_version == entry["version"] == "2.1.3"
     assert entry["system_version"] == ">=3.0.0"
     assert entry["release"] is True  # Federation packaging requirement.
     assert "KoWming" in plugin.plugin_author
     assert "GNU GENERAL PUBLIC LICENSE" in (PLUGIN / "LICENSE").read_text(encoding="utf-8")
-    assert plugin.get_render_mode() == ("vue", "dist/assets-v2.1.2")
+    assert plugin.get_render_mode() == ("vue", "dist/assets-v2.1.3")
     assert (PLUGIN / plugin.get_render_mode()[1] / "remoteEntry.js").is_file()
     routes = plugin.get_api()
     assert len(routes) == 28
@@ -176,9 +176,8 @@ def test_seed_cache_is_persistent_read_only_and_scoped_to_account(plugin, monkey
     monkeypatch.setattr(requests, "get", get)
     plugin._get_page_meta = Mock(return_value={})
     plugin.init_plugin({"seed_id": "120"})
-    assert plugin._get_seeds()["needs_refresh"]
     get.assert_not_called()
-    assert plugin._get_seeds(refresh=True)["cached"] is False
+    assert plugin._get_seeds()["cached"] is False
     assert get.call_count == 1
     expected = {"success": True, "seeds": farm["seeds"], "user_stats": farm["user_stats"], "cached": True}
     assert plugin._get_seeds() == expected
@@ -201,10 +200,68 @@ def test_seed_cache_is_persistent_read_only_and_scoped_to_account(plugin, monkey
         setattr(site, "cookie" if change == "site_cookie" else "url",
                 "session=two" if change == "site_cookie" else "https://siqi.xyz")
         plugin._siteoper.get_by_domain = lambda _: site
-    assert plugin._get_seeds()["needs_refresh"]
-    assert get.call_count == before_change
-    assert "session=" not in json.dumps(plugin.get_data("seed_catalog"))
+    assert not plugin._get_seeds()["success"]
+    assert get.call_count == before_change + 1
+    assert "session=" not in json.dumps(plugin.get_data("farm_status"))
+    get.return_value = response({"success": True, "seeds": [{"id": 200, "name": "西瓜"}],
+                                 "user_stats": {"total_harvest": 0}})
+    assert plugin._get_seeds()["cached"] is False
+    assert plugin._get_seeds()["seeds"] == [{"id": 200, "name": "西瓜"}]
     assert plugin._seed_id == "120"
+    requests.post.assert_not_called()
+
+
+@pytest.mark.parametrize("old_snapshot", [None, {"success": True, "seeds": []},
+    {"success": True, "seeds": [{"id": 999}], "user_stats": {"total_harvest": 9999}}])
+def test_old_frontend_plain_seed_get_refreshes_missing_or_unverified_cache(plugin, monkeypatch, old_snapshot):
+    # v2.1.1 only calls GET /seeds; it never sends refresh=true or handles needs_refresh.
+    plugin.save_data("farm_status", old_snapshot)
+    get = Mock(return_value=response({"success": True,
+        "seeds": [{"id": 120, "name": "樱桃"}], "user_stats": {"total_harvest": 50}}))
+    monkeypatch.setattr(requests, "get", get)
+    plugin._get_page_meta = Mock(return_value={})
+    endpoint = next(r["endpoint"] for r in plugin.get_api() if r["path"] == "/seeds")
+    fresh = endpoint()
+    assert fresh == {"success": True, "seeds": [{"id": 120, "name": "樱桃"}],
+                     "user_stats": {"total_harvest": 50}, "cached": False}
+    assert endpoint() == {**fresh, "cached": True}
+    assert get.call_count == 1
+    assert plugin.get_data("seed_catalog") is None
+    assert plugin._get_data()["seeds"] == fresh["seeds"]
+    requests.post.assert_not_called()
+
+
+def test_completed_task_and_reloaded_config_share_the_same_snapshot(plugin, module, monkeypatch):
+    plugin.init_plugin({"enabled": True, "auto_plant": False, "auto_harvest": False, "notify": False,
+                        "seed_id": "120", "steal_crops": ["玉米"]})
+    monkeypatch.setattr(requests, "get", Mock(return_value=response({"success": True,
+        "current_username": "fixture-user", "seeds": [{"id": 120, "name": "樱桃"}],
+        "user_stats": {"total_harvest": 50}, "user_lands": []})))
+    plugin._get_page_meta = Mock(return_value={})
+    plugin._farm_task()
+    stored = json.loads(json.dumps(plugin.data))
+    assert "seed_catalog" not in stored
+    reloaded = module.SiqiFram()
+    reloaded.data = stored
+    reloaded.init_plugin(plugin._get_config())
+    requests.get.reset_mock()
+    assert reloaded._get_data()["current_username"] == "fixture-user"
+    assert reloaded._get_seeds() == {"success": True, "seeds": stored["farm_status"]["seeds"],
+                                    "user_stats": {"total_harvest": 50}, "cached": True}
+    assert reloaded._seed_id == "120" and reloaded._steal_crops == ["玉米"]
+    requests.get.assert_not_called()
+    requests.post.assert_not_called()
+
+
+def test_shared_farm_snapshot_takes_precedence_over_legacy_seed_catalog(plugin):
+    context = plugin._seed_cache_key()
+    plugin.save_data("farm_status", {"success": True, "_cache_context": context,
+                                      "seeds": [{"id": 200}], "user_stats": {"total_harvest": 100}})
+    plugin.save_data("seed_catalog", {"context": context, "seeds": [{"id": 120}],
+                                      "user_stats": {"total_harvest": 50}})
+    assert plugin._get_seeds() == {"success": True, "seeds": [{"id": 200}],
+                                   "user_stats": {"total_harvest": 100}, "cached": True}
+    requests.get.assert_not_called()
     requests.post.assert_not_called()
 
 
@@ -476,7 +533,7 @@ def test_real_fastapi_registration_bodies_and_raw_payloads(plugin, monkeypatch):
         "seeds": [{"id": 91, "name": "萝卜", "unlock_harvest": 0},
                   {"id": 200, "name": "西瓜", "unlock_harvest": 100}],
         "user_stats": {"total_harvest": 50}})
-    assert client.get("/seeds").json()["needs_refresh"] is True
+    assert len(client.get("/seeds").json()["seeds"]) == 2
     assert len(client.get("/seeds", params={"refresh": True}).json()["seeds"]) == 2
     monkeypatch.setattr(requests, "post", Mock(return_value=response({
         "success": True, "msg": "ok", "new_field": 42})))
