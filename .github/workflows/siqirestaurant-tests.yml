@@ -1,0 +1,31 @@
+name: SiqiRestaurant tests
+on:
+  push:
+    paths:
+      - 'plugins.v3/siqirestaurant/**'
+      - 'tests/v3/siqirestaurant/**'
+      - '.github/workflows/siqirestaurant-tests.yml'
+  pull_request:
+    paths:
+      - 'plugins.v3/siqirestaurant/**'
+      - 'tests/v3/siqirestaurant/**'
+      - '.github/workflows/siqirestaurant-tests.yml'
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - run: python -m pip install pytest requests pydantic fastapi httpx
+      - run: python -m pytest -q tests/v3/siqirestaurant
+      - run: npm ci --prefix plugins.v3/siqirestaurant
+      - run: node tests/v3/siqirestaurant/test_frontend.mjs
+      - run: npm run build --prefix plugins.v3/siqirestaurant
+      - run: python .github/scripts/check_federation_css.py

@@ -95,5 +95,19 @@
       "v2.0.0": "V3 迁移测试版：使用公开插件/调度 SDK 与 SiteOper，补齐 API 模型及分身隔离；保留农场功能和 Vue 界面，隔离 Vuetify 全局样式，写请求结果不明时停止本轮操作。已完成 Mock/构建验证，未经宿主及真实站点联调。",
       "v1.0.3": "基于 KoWming 原版思齐农场，保留种植、收获、出售、偷菜、点赞与 OCR/可选 AI 识别。"
     }
+  },
+  "SiqiRestaurant": {
+    "name": "思齐餐厅",
+    "description": "原生餐厅操作面板：厨房、员工、食材、下馆子和经营日志，预留自动化接口。",
+    "labels": "思齐,娱乐,餐厅",
+    "version": "1.0.0",
+    "icon": "https://si-qi.xyz/favicon.ico",
+    "author": "xchenya",
+    "level": 2,
+    "system_version": ">=3.0.0",
+    "release": true,
+    "history": {
+      "v1.0.0": "新增餐厅原生操作面板，厨房状态持久化、员工页面服务、请求防重与不确定写入保护。"
+    }
   }
 }
