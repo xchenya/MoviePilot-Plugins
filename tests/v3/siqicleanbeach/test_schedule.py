@@ -130,7 +130,8 @@ def test_due_times_survive_every_save_and_reload(plugin, monkeypatch):
     assert plugin.run_clean_task(scheduled=True)["status"] == "waiting"
     form, defaults = plugin.get_form()
     assert defaults["schedule_mode"] == "auto"
-    assert "站点冷却" in json.dumps(form, ensure_ascii=False)
+    assert form is None
+    assert "站点冷却" in plugin.get_stats_api()["data"]["display"]["schedule"]
     saved["run_once"] = True
     plugin._queue_manual_run = Mock(return_value=True)
     plugin.init_plugin(saved)
@@ -151,7 +152,7 @@ def test_bad_cached_dates_do_not_crash_page_or_stall_scheduler(plugin, monkeypat
     plugin._schedule_mode = "auto"
     plugin._stats.update(beach_due_at=invalid, brick_due_at=invalid)
     assert "异常" in plugin._SiQiCleanBeach__due_text("brick_due_at")
-    plugin.get_page()
+    plugin.get_stats_api()
     post = posts(monkeypatch, response(state(50)))
     monkeypatch.setattr(requests, "get", Mock(return_value=response(text=html())))
     assert plugin.run_clean_task(scheduled=True)["status"] == "waiting"
@@ -311,7 +312,7 @@ def test_obsolete_interval_controls_are_removed_from_all_save_paths_and_form(plu
     assert "check_interval_minutes" not in defaults
     assert '"model": "check_interval_minutes"' not in json.dumps(form)
     assert '"model": "brick_cooldown_minutes"' not in json.dumps(form)
-    assert "按站点冷却" in json.dumps(plugin.get_page(), ensure_ascii=False)
+    assert plugin.get_stats_api()["data"]["display"]["schedule"] == "按站点冷却"
 
 
 @pytest.mark.parametrize("separate_results", [False, True])
@@ -325,11 +326,10 @@ def test_panel_shows_compact_dates_and_result_without_changing_saved_details(plu
         plugin._stats.update(clean_result="沙滩冷却中，请稍候！", brick_result="已达每日上限，正常跳过",
                              last_result=brief + "；本次0块，今日50/50，库存2001（本次已刷新）")
     saved_result = plugin._stats["last_result"]
-    cols = plugin.get_page()[0]["content"][2]["content"][0]["content"]
-    info = {col["content"][0]["text"]: col["content"][1]["text"] for col in cols}
-    assert info["⏰ 定时模式"] == "按站点冷却"
-    assert info["🏖️ 沙滩下次执行时间"] == info["🧱 搬砖下次执行时间"] == "2026-10-15 18:15"
-    assert info["📝 最后结果"] == (brief if separate_results else legacy)
+    info = plugin.get_stats_api()["data"]["display"]
+    assert info["schedule"] == "按站点冷却"
+    assert info["beach_next"] == info["brick_next"] == "2026-10-15 18:15"
+    assert info["last_result"] == (brief if separate_results else legacy)
     assert plugin._stats["last_result"] == saved_result
     assert "18:15:34（约" in plugin._SiQiCleanBeach__due_text("beach_due_at")
 

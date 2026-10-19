@@ -10,12 +10,14 @@ import time
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, Dict, Literal, Optional, List, Tuple
 from unittest.mock import Mock
 
 import pytest
 import requests
 from bs4 import BeautifulSoup
+from apscheduler.triggers.cron import CronTrigger
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 ROOT = Path(__file__).resolve().parents[3]
 CODE = ROOT / "plugins.v3" / "siqicleanbeach" / "__init__.py"
@@ -30,6 +32,17 @@ def _plugin_class() -> ast.ClassDef:
         node for node in ast.parse(_source()).body
         if isinstance(node, ast.ClassDef) and node.name == "SiQiCleanBeach"
     )
+
+
+def _config_models():
+    names = {"ActionResponse", "StatsResponse", "CleanBeachConfig", "ConfigResponse"}
+    body = [node for node in ast.parse(_source()).body
+            if isinstance(node, ast.ClassDef) and node.name in names]
+    namespace = dict(BaseModel=BaseModel, ConfigDict=ConfigDict, Field=Field,
+                     field_validator=field_validator, Dict=Dict, Any=Any, Optional=Optional,
+                     Literal=Literal, CronTrigger=CronTrigger)
+    exec(compile(ast.Module(body=body, type_ignores=[]), str(CODE), "exec", dont_inherit=True), namespace)
+    return {name: namespace[name] for name in names}
 
 
 def _method(name: str) -> ast.FunctionDef:
@@ -81,10 +94,11 @@ def test_v3_metadata_and_source_license():
     }
     market = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))
     entry = market["SiQiCleanBeach"]
-    assert attrs["plugin_version"] == entry["version"] == "2.4.0"
+    assert attrs["plugin_version"] == entry["version"] == "2.5.0"
     assert entry["system_version"] == ">=3.0.0"
-    assert entry["release"] is False
-    assert attrs["plugin_author"].startswith("bfjy")
+    assert entry["release"] is True
+    assert attrs["plugin_author"] == entry["author"] == "xchenya"
+    assert attrs["author_url"] == entry["author_url"] == "https://github.com/xchenya"
     assert "GPL-3.0" in _source()
 
 
@@ -100,8 +114,8 @@ def test_sdk_and_security_contracts():
     assert "class StatsResponse(BaseModel)" in source
     api = ast.get_source_segment(source, _method("get_api"))
     assert api is not None
-    assert api.count('"response_model"') == 2
-    assert api.count('"auth": "bear"') == 2
+    assert api.count('"response_model"') == 6
+    assert api.count('"auth": "bear"') == 6
     assert '"methods": ["POST"]' in api
 
 
