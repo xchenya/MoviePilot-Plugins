@@ -80,7 +80,7 @@ class SiqiRestaurant(_PluginBase):
     plugin_name = "思齐餐厅"
     plugin_desc = "思齐餐厅后台自动经营：每日开业、并行烹饪、及时上菜、限额补货及原生管理面板。"
     plugin_icon = "https://si-qi.xyz/favicon.ico"
-    plugin_version = "1.3.1"
+    plugin_version = "1.3.2"
     plugin_author = "xchenya"
     author_url = "https://github.com/xchenya"
     plugin_config_prefix = "siqirestaurant_"

@@ -300,12 +300,12 @@ return (_ctx, _cache) => {
                 label: `用户名 ${i+1}（选填）`,
                 "aria-label": `下馆子用户名 ${i+1}`,
                 maxlength: "64",
-                placeholder: "留空可随机",
+                placeholder: "填写准确的站点用户名",
                 "prepend-inner-icon": "mdi-account-outline"
               }, null, 8, ["modelValue", "onUpdate:modelValue", "label", "aria-label"]))
             }), 128))
           ]),
-          _cache[16] || (_cache[16] = _createElementVNode("p", { class: "sr-hint" }, "全部留空时，每天随机选择 3 位不同用户；填写后只到访名单中的用户，空位不补人。不可到访的用户会跳过并记录原因。", -1)),
+          _cache[16] || (_cache[16] = _createElementVNode("p", { class: "sr-hint" }, "全部留空时，每天随机选择 3 位不同用户；只填 1–2 人也可以，空位不随机补人。用户名不存在或不可到访时会跳过并记录原因，不影响其余名单。", -1)),
           _cache[17] || (_cache[17] = _createElementVNode("p", { class: "sr-hint" }, "沿用开业时间，可单独开启下馆子。已用次数会扣除，重启不会重复到访；开启后按原站“一键下馆子”规则确认到访，为对方增加顾客。", -1))
         ]),
         _createVNode(_component_v_expansion_panels, {

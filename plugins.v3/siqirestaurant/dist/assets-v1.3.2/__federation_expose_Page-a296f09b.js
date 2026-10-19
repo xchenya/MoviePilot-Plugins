@@ -133,6 +133,7 @@ const targetName = ref(''), recommendations = ref([]), logDays = ref(0), activeT
 const now = ref(Date.now()/1000), confirmation = ref(null);
 let clockOffset=0, timer=null, clock=null, alive=false, confirmResolver=null;
 const data = computed(()=>view.value.restaurant || {}), state = computed(()=>data.value.state || {});
+const fastPolling = computed(()=>state.value.session_status==='open' || (view.value.kitchen || []).some(stove=>stove.status==='cooking') || Object.keys(view.value.cleaning || {}).length>0);
 const blocked = computed(()=>busy.value || !!view.value.uncertain || !!view.value.automation?.enabled || !!view.value.automation?.active || !data.value.state);
 const uiDefaults = { VBtn: { size: 'small', variant: 'tonal', color: 'success' }, VTextField: { density: 'compact', variant: 'outlined', hideDetails: 'auto', color: 'success' }, VSelect: { density: 'compact', variant: 'outlined', hideDetails: 'auto', color: 'success' }, VChip: { size: 'x-small', variant: 'tonal' } };
 const dishOptions = computed(()=>unlockedDishes.value.map(d=>({title:`${d.name} · ${d.cook_time} 秒`,value:d.key})));
@@ -159,7 +160,7 @@ function stoveStatus(s){return {idle:'空闲',prepping:prepared(s)?'已备齐':'
 function assigned(index,role){const a=data.value.staff?.assignments_map || data.value.staff?.assignments || {};const value=(Array.isArray(a)?a.find(x=>Number(x.station_index)===index):a[index])?.[role];return value===true || value===1 || value==='1'}
 function unwrap(result){if(result?.restaurant || typeof result?.success==='boolean')return result;if(result?.data && typeof result.data.success==='boolean')return result.data;throw new Error('插件接口返回格式不正确')}
 function update(result){if(!alive)return;view.value=result;clockOffset=(result.server_now || Date.now()/1000)-Date.now()/1000;now.value=Date.now()/1000+clockOffset;for(const s of result.kitchen||[]){selected[s.index]??='';const matches=matchingCustomers(s);if(!matches.some(c=>String(c.id)===String(serveTargets[s.index])))serveTargets[s.index]=matches.find(c=>Number(c.seat)===s.index)?.id || matches[0]?.id || '';}for(const item of result.restaurant?.config?.ingredients || [])quantities[item.key]??=1;if(result.uncertain || result.automation?.enabled)runStaff.value=false;}
-async function request(path,payload,verb='post',quiet=false){if(busy.value)return null;busy.value=true;try{const r=unwrap(await props.api[verb](`plugin/${props.pluginId}${path}`,payload));update(r);if(!quiet || !r.success){message.value=r.message || (r.success?'操作完成':'操作失败');ok.value=r.success;}return r}catch(e){if(alive){message.value=e.message || '请求失败，请刷新后核对';ok.value=false;runStaff.value=false;}return null}finally{busy.value=false;}}
+async function request(path,payload,verb='post',quiet=false){if(busy.value)return null;busy.value=true;try{const r=unwrap(await props.api[verb](`plugin/${props.pluginId}${path}`,payload));update(r);if(!quiet || !r.success){message.value=r.message || (r.success?'操作完成':'操作失败');ok.value=r.success;}return r}catch(e){if(alive){message.value=e.message || '请求失败，请刷新后核对';ok.value=false;runStaff.value=false;}return null}finally{busy.value=false;schedule();}}
 const act=(action,args={})=>request('/action',{action,args,request_id:(crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`)});
 const refresh=()=>request('/refresh',{});
 function confirm(title,text){return new Promise(resolve=>{confirmation.value={title,text};confirmResolver=resolve;})}
@@ -174,9 +175,27 @@ async function recommend(){const r=await act('list_visitable_restaurants');if(r?
 async function lookup(){const r=await act('inspect_restaurant_target',{target_username:targetName.value});if(r?.success)recommendations.value=r.candidate?[r.candidate]:[];}
 async function visit(name){if(!await confirm('前往用餐',`前往 ${name} 的餐馆，将使用今日一次下馆子机会。`))return;let r=await act('visit_restaurant',{target_username:name});if(r?.requires_confirmation && await confirm('站点确认',r.message || '站点要求再次确认前往'))await act('visit_restaurant',{target_username:name,confirm:'yes'});}
 async function resolveUncertain(){if(await confirm('核对后解锁','请确认已经核对网站的余额、库存、员工与顾客状态。解除后不会重发原请求；结果不明的成品将释放本地预留。'))await request('/resolve',{acknowledged:true});}
-async function poll(){if(!alive)return;try{if(!document.hidden && !busy.value && !confirmation.value && data.value.state)await (view.value.automation?.enabled ? request('/state',undefined,'get',true) : request('/tick',{run_staff:runStaff.value},'post',true));}finally{if(alive)timer=setTimeout(poll,2000);}}
-function start(){if(alive)return;alive=true;request('/state',undefined,'get',true);clock=setInterval(()=>{now.value=Date.now()/1000+clockOffset;},500);timer=setTimeout(poll,2000);}
-function stop(){alive=false;runStaff.value=false;clearTimeout(timer);clearInterval(clock);cancelConfirm();}
+function clearTimers(){clearTimeout(timer);clearInterval(clock);timer=null;clock=null;}
+function schedule(){
+  clearTimers();
+  if(!alive || document.hidden)return
+  timer=setTimeout(poll,fastPolling.value?2000:60000);
+  // Only running kitchen tasks need a local countdown between responses.
+  if(fastPolling.value)clock=setInterval(()=>{now.value=Date.now()/1000+clockOffset;},500);
+}
+async function poll(){
+  if(!alive)return
+  if(document.hidden || busy.value || confirmation.value){schedule();return}
+  if(!data.value.state || view.value.automation?.active || view.value.automation?.enabled)await request('/state',undefined,'get',true);
+  else await request('/tick',{run_staff:runStaff.value},'post',true);
+}
+function visibilityChanged(){
+  if(document.hidden){clearTimers();return}
+  if(alive && !busy.value && !confirmation.value)request('/state',undefined,'get',true);
+  else schedule();
+}
+function start(){if(alive)return;alive=true;document.addEventListener('visibilitychange',visibilityChanged);if(!document.hidden)request('/state',undefined,'get',true);}
+function stop(){alive=false;runStaff.value=false;clearTimers();document.removeEventListener('visibilitychange',visibilityChanged);cancelConfirm();}
 onMounted(start);onActivated(start);onDeactivated(stop);onUnmounted(stop);
 
 return (_ctx, _cache) => {
@@ -223,7 +242,7 @@ return (_ctx, _cache) => {
                   _: 1
                 }, 8, ["color"])
               ]),
-              _cache[13] || (_cache[13] = _createElementVNode("p", null, "管理厨房、食材、员工与餐厅互动", -1))
+              _createElementVNode("p", null, _toDisplayString(data.value.state ? (fastPolling.value ? '营业或烹饪中，每 2 秒更新状态' : '空闲中，每 60 秒更新状态') : '管理厨房、食材、员工与餐厅互动'), 1)
             ])
           ]),
           _createVNode(_component_v_btn_group, {
@@ -245,7 +264,7 @@ return (_ctx, _cache) => {
                     icon: "mdi-refresh",
                     size: "18"
                   }),
-                  _cache[14] || (_cache[14] = _createElementVNode("span", null, "刷新", -1))
+                  _cache[13] || (_cache[13] = _createElementVNode("span", null, "刷新", -1))
                 ]),
                 _: 1
               }, 8, ["loading", "disabled"]),
@@ -260,7 +279,7 @@ return (_ctx, _cache) => {
                     icon: "mdi-cog-outline",
                     size: "18"
                   }),
-                  _cache[15] || (_cache[15] = _createElementVNode("span", null, "配置", -1))
+                  _cache[14] || (_cache[14] = _createElementVNode("span", null, "配置", -1))
                 ]),
                 _: 1
               }),
@@ -275,7 +294,7 @@ return (_ctx, _cache) => {
                     icon: "mdi-close",
                     size: "18"
                   }),
-                  _cache[16] || (_cache[16] = _createElementVNode("span", null, "关闭", -1))
+                  _cache[15] || (_cache[15] = _createElementVNode("span", null, "关闭", -1))
                 ]),
                 _: 1
               })
@@ -308,13 +327,13 @@ return (_ctx, _cache) => {
             }, {
               default: _withCtx(() => [
                 _createElementVNode("div", _hoisted_6, [
-                  _cache[18] || (_cache[18] = _createElementVNode("span", null, "上次站点操作结果不明，已暂停写入。请先刷新并核对网站。", -1)),
+                  _cache[17] || (_cache[17] = _createElementVNode("span", null, "上次站点操作结果不明，已暂停写入。请先刷新并核对网站。", -1)),
                   _createVNode(_component_v_btn, {
                     color: "warning",
                     onClick: resolveUncertain,
                     disabled: busy.value
                   }, {
-                    default: _withCtx(() => [...(_cache[17] || (_cache[17] = [
+                    default: _withCtx(() => [...(_cache[16] || (_cache[16] = [
                       _createTextVNode("已核对，解除锁定", -1)
                     ]))]),
                     _: 1
@@ -360,7 +379,7 @@ return (_ctx, _cache) => {
                 size: "19",
                 color: "success"
               }),
-              _cache[19] || (_cache[19] = _createTextVNode("后台自动经营 ", -1)),
+              _cache[18] || (_cache[18] = _createTextVNode("后台自动经营 ", -1)),
               _createVNode(_component_v_chip, {
                 color: view.value.automation?.enabled?'success':'default'
               }, {
@@ -388,7 +407,7 @@ return (_ctx, _cache) => {
             ]),
             _createElementVNode("div", _hoisted_13, [
               _createElementVNode("div", null, [
-                _cache[20] || (_cache[20] = _createElementVNode("span", null, "今日补货预算", -1)),
+                _cache[19] || (_cache[19] = _createElementVNode("span", null, "今日补货预算", -1)),
                 _createElementVNode("strong", null, _toDisplayString(number(view.value.automation?.spent)) + " / " + _toDisplayString(number(view.value.automation?.daily_budget)), 1)
               ]),
               _createVNode(_component_v_progress_linear, {
@@ -435,7 +454,7 @@ return (_ctx, _cache) => {
                       icon: "mdi-stove",
                       size: "19"
                     }),
-                    _cache[21] || (_cache[21] = _createTextVNode("厨房与餐位", -1))
+                    _cache[20] || (_cache[20] = _createTextVNode("厨房与餐位", -1))
                   ]),
                   _createElementVNode("div", _hoisted_17, [
                     _createVNode(_component_v_chip, null, {
@@ -459,7 +478,7 @@ return (_ctx, _cache) => {
                       disabled: blocked.value || state.value.session_status!=='ready' || !state.value.customers_total,
                       onClick: startSession
                     }, {
-                      default: _withCtx(() => [...(_cache[22] || (_cache[22] = [
+                      default: _withCtx(() => [...(_cache[21] || (_cache[21] = [
                         _createTextVNode("开始今日经营", -1)
                       ]))]),
                       _: 1
@@ -550,7 +569,7 @@ return (_ctx, _cache) => {
                                 disabled: blocked.value || !selected[stove.index],
                                 onClick: $event => (act('assign_dish',{station_index:stove.index,dish_key:selected[stove.index]}))
                               }, {
-                                default: _withCtx(() => [...(_cache[23] || (_cache[23] = [
+                                default: _withCtx(() => [...(_cache[22] || (_cache[22] = [
                                   _createTextVNode("选择菜品", -1)
                                 ]))]),
                                 _: 1
@@ -562,7 +581,7 @@ return (_ctx, _cache) => {
                                   disabled: blocked.value,
                                   onClick: $event => (act('prepare',{station_index:stove.index}))
                                 }, {
-                                  default: _withCtx(() => [...(_cache[24] || (_cache[24] = [
+                                  default: _withCtx(() => [...(_cache[23] || (_cache[23] = [
                                     _createTextVNode("备齐食材与工具", -1)
                                   ]))]),
                                   _: 1
@@ -571,7 +590,7 @@ return (_ctx, _cache) => {
                                   disabled: blocked.value || !prepared(stove),
                                   onClick: $event => (act('cook',{station_index:stove.index}))
                                 }, {
-                                  default: _withCtx(() => [...(_cache[25] || (_cache[25] = [
+                                  default: _withCtx(() => [...(_cache[24] || (_cache[24] = [
                                     _createTextVNode("开始烹饪", -1)
                                   ]))]),
                                   _: 1
@@ -582,7 +601,7 @@ return (_ctx, _cache) => {
                                   disabled: blocked.value,
                                   onClick: $event => (act('cancel',{station_index:stove.index}))
                                 }, {
-                                  default: _withCtx(() => [...(_cache[26] || (_cache[26] = [
+                                  default: _withCtx(() => [...(_cache[25] || (_cache[25] = [
                                     _createTextVNode("取消", -1)
                                   ]))]),
                                   _: 1
@@ -616,7 +635,7 @@ return (_ctx, _cache) => {
                                   disabled: blocked.value || !serveTargets[stove.index],
                                   onClick: $event => (act('serve',{station_index:stove.index,customer_id:serveTargets[stove.index]}))
                                 }, {
-                                  default: _withCtx(() => [...(_cache[27] || (_cache[27] = [
+                                  default: _withCtx(() => [...(_cache[26] || (_cache[26] = [
                                     _createTextVNode("上菜", -1)
                                   ]))]),
                                   _: 1
@@ -626,7 +645,7 @@ return (_ctx, _cache) => {
                                   disabled: blocked.value,
                                   onClick: $event => (askReturn(stove))
                                 }, {
-                                  default: _withCtx(() => [...(_cache[28] || (_cache[28] = [
+                                  default: _withCtx(() => [...(_cache[27] || (_cache[27] = [
                                     _createTextVNode("归位", -1)
                                   ]))]),
                                   _: 1
@@ -637,7 +656,7 @@ return (_ctx, _cache) => {
                                   disabled: blocked.value,
                                   onClick: $event => (askDiscard(stove))
                                 }, {
-                                  default: _withCtx(() => [...(_cache[29] || (_cache[29] = [
+                                  default: _withCtx(() => [...(_cache[28] || (_cache[28] = [
                                     _createTextVNode("丢弃", -1)
                                   ]))]),
                                   _: 1
@@ -673,10 +692,10 @@ return (_ctx, _cache) => {
                           icon: "mdi-storefront-outline",
                           size: "32"
                         }),
-                        _cache[30] || (_cache[30] = _createElementVNode("p", null, "请先启用插件并刷新餐厅数据", -1))
+                        _cache[29] || (_cache[29] = _createElementVNode("p", null, "请先启用插件并刷新餐厅数据", -1))
                       ]))
                     : _createCommentVNode("", true),
-                  _cache[31] || (_cache[31] = _createElementVNode("p", { class: "sr-hint" }, "选择菜品 → 备齐食材与工具 → 开始烹饪 → 上菜。刷新页面可继续厨房进度。", -1))
+                  _cache[30] || (_cache[30] = _createElementVNode("p", { class: "sr-hint" }, "选择菜品 → 备齐食材与工具 → 开始烹饪 → 上菜。刷新页面可继续厨房进度。", -1))
                 ])
               ])
             ]))
@@ -690,9 +709,9 @@ return (_ctx, _cache) => {
                       icon: "mdi-basket-outline",
                       size: "19"
                     }),
-                    _cache[32] || (_cache[32] = _createTextVNode("食材商店与仓库", -1))
+                    _cache[31] || (_cache[31] = _createTextVNode("食材商店与仓库", -1))
                   ]),
-                  _cache[33] || (_cache[33] = _createElementVNode("span", { class: "sr-hint" }, "可用库存已扣除厨房预留", -1))
+                  _cache[32] || (_cache[32] = _createElementVNode("span", { class: "sr-hint" }, "可用库存已扣除厨房预留", -1))
                 ]),
                 _createElementVNode("div", _hoisted_31, [
                   (_openBlock(true), _createElementBlock(_Fragment, null, _renderList(data.value.config?.ingredients || [], (item) => {
@@ -729,7 +748,7 @@ return (_ctx, _cache) => {
                           disabled: blocked.value,
                           onClick: $event => (buy(item))
                         }, {
-                          default: _withCtx(() => [...(_cache[34] || (_cache[34] = [
+                          default: _withCtx(() => [...(_cache[33] || (_cache[33] = [
                             _createTextVNode("购买", -1)
                           ]))]),
                           _: 1
@@ -749,7 +768,7 @@ return (_ctx, _cache) => {
                       icon: "mdi-book-open-page-variant-outline",
                       size: "19"
                     }),
-                    _cache[35] || (_cache[35] = _createTextVNode("菜品手册", -1))
+                    _cache[34] || (_cache[34] = _createTextVNode("菜品手册", -1))
                   ])
                 ]),
                 _createElementVNode("div", _hoisted_37, [
@@ -775,7 +794,7 @@ return (_ctx, _cache) => {
                   }), 128))
                 ]),
                 _createElementVNode("div", _hoisted_39, [
-                  _cache[36] || (_cache[36] = _createElementVNode("span", { class: "sr-hint" }, "烹饪工具", -1)),
+                  _cache[35] || (_cache[35] = _createElementVNode("span", { class: "sr-hint" }, "烹饪工具", -1)),
                   (_openBlock(true), _createElementBlock(_Fragment, null, _renderList(data.value.config?.tools || [], (tool) => {
                     return (_openBlock(), _createBlock(_component_v_chip, {
                       key: tool.key,
@@ -799,11 +818,11 @@ return (_ctx, _cache) => {
                     icon: "mdi-account-group-outline",
                     size: "19"
                   }),
-                  _cache[37] || (_cache[37] = _createTextVNode("员工管理", -1))
+                  _cache[36] || (_cache[36] = _createTextVNode("员工管理", -1))
                 ])
               ]),
               _createElementVNode("div", _hoisted_42, [
-                _cache[39] || (_cache[39] = _createElementVNode("p", { class: "sr-hint" }, "雇佣后在厨房分配到灶台，再开启“运行已雇员工”。每次雇佣 1 人，使用站点当前报价。", -1)),
+                _cache[38] || (_cache[38] = _createElementVNode("p", { class: "sr-hint" }, "雇佣后在厨房分配到灶台，再开启“运行已雇员工”。每次雇佣 1 人，使用站点当前报价。", -1)),
                 _createElementVNode("div", _hoisted_43, [
                   (_openBlock(), _createElementBlock(_Fragment, null, _renderList(roles, (role) => {
                     return _createElementVNode("article", {
@@ -825,7 +844,7 @@ return (_ctx, _cache) => {
                           disabled: blocked.value || !data.value.staff?.next_prices?.[role.key],
                           onClick: $event => (hire(role))
                         }, {
-                          default: _withCtx(() => [...(_cache[38] || (_cache[38] = [
+                          default: _withCtx(() => [...(_cache[37] || (_cache[37] = [
                             _createTextVNode("雇佣 1 人", -1)
                           ]))]),
                           _: 1
@@ -852,7 +871,7 @@ return (_ctx, _cache) => {
                       icon: "mdi-silverware-fork-knife",
                       size: "19"
                     }),
-                    _cache[40] || (_cache[40] = _createTextVNode("下馆子 ", -1)),
+                    _cache[39] || (_cache[39] = _createTextVNode("下馆子 ", -1)),
                     _createVNode(_component_v_chip, { color: "#ec4899" }, {
                       default: _withCtx(() => [
                         _createTextVNode("今日 " + _toDisplayString(data.value.visits?.count || 0) + " / " + _toDisplayString(data.value.visits?.limit || 3), 1)
@@ -866,7 +885,7 @@ return (_ctx, _cache) => {
                     "prepend-icon": "mdi-tune-variant",
                     onClick: _cache[6] || (_cache[6] = $event => (emit('switch','config')))
                   }, {
-                    default: _withCtx(() => [...(_cache[41] || (_cache[41] = [
+                    default: _withCtx(() => [...(_cache[40] || (_cache[40] = [
                       _createTextVNode("设置名单与通知", -1)
                     ]))]),
                     _: 1
@@ -920,7 +939,7 @@ return (_ctx, _cache) => {
                       disabled: busy.value || !targetName.value,
                       onClick: lookup
                     }, {
-                      default: _withCtx(() => [...(_cache[42] || (_cache[42] = [
+                      default: _withCtx(() => [...(_cache[41] || (_cache[41] = [
                         _createTextVNode("查询", -1)
                       ]))]),
                       _: 1
@@ -930,7 +949,7 @@ return (_ctx, _cache) => {
                       disabled: busy.value,
                       onClick: recommend
                     }, {
-                      default: _withCtx(() => [...(_cache[43] || (_cache[43] = [
+                      default: _withCtx(() => [...(_cache[42] || (_cache[42] = [
                         _createTextVNode("随机推荐", -1)
                       ]))]),
                       _: 1
@@ -940,7 +959,7 @@ return (_ctx, _cache) => {
                       disabled: blocked.value || !targetName.value,
                       onClick: _cache[9] || (_cache[9] = $event => (visit(targetName.value)))
                     }, {
-                      default: _withCtx(() => [...(_cache[44] || (_cache[44] = [
+                      default: _withCtx(() => [...(_cache[43] || (_cache[43] = [
                         _createTextVNode("前往用餐", -1)
                       ]))]),
                       _: 1
@@ -963,7 +982,7 @@ return (_ctx, _cache) => {
                               disabled: blocked.value || item.can_visit===false,
                               onClick: $event => (visit(item.username))
                             }, {
-                              default: _withCtx(() => [...(_cache[45] || (_cache[45] = [
+                              default: _withCtx(() => [...(_cache[44] || (_cache[44] = [
                                 _createTextVNode("前往用餐", -1)
                               ]))]),
                               _: 1
@@ -981,7 +1000,7 @@ return (_ctx, _cache) => {
                       icon: "mdi-map-marker-check-outline",
                       size: "19"
                     }),
-                    _cache[46] || (_cache[46] = _createTextVNode("今日到访", -1))
+                    _cache[45] || (_cache[45] = _createTextVNode("今日到访", -1))
                   ])
                 ]),
                 _createElementVNode("div", _hoisted_59, [
@@ -1014,7 +1033,7 @@ return (_ctx, _cache) => {
                       icon: "mdi-chart-timeline-variant",
                       size: "19"
                     }),
-                    _cache[47] || (_cache[47] = _createTextVNode("经营日志", -1))
+                    _cache[46] || (_cache[46] = _createTextVNode("经营日志", -1))
                   ]),
                   _createVNode(_component_v_select, {
                     modelValue: logDays.value,
@@ -1032,7 +1051,7 @@ return (_ctx, _cache) => {
                   class: "sr-table"
                 }, {
                   default: _withCtx(() => [
-                    _cache[49] || (_cache[49] = _createElementVNode("thead", null, [
+                    _cache[48] || (_cache[48] = _createElementVNode("thead", null, [
                       _createElementVNode("tr", null, [
                         _createElementVNode("th", null, "日期"),
                         _createElementVNode("th", null, "顾客完成 / 总数"),
@@ -1054,7 +1073,7 @@ return (_ctx, _cache) => {
                         ]))
                       }), 128)),
                       (!filteredLogs.value.length)
-                        ? (_openBlock(), _createElementBlock("tr", _hoisted_66, [...(_cache[48] || (_cache[48] = [
+                        ? (_openBlock(), _createElementBlock("tr", _hoisted_66, [...(_cache[47] || (_cache[47] = [
                             _createElementVNode("td", {
                               colspan: "5",
                               class: "sr-empty"
@@ -1073,7 +1092,7 @@ return (_ctx, _cache) => {
                       icon: "mdi-history",
                       size: "19"
                     }),
-                    _cache[50] || (_cache[50] = _createTextVNode("最近操作", -1))
+                    _cache[49] || (_cache[49] = _createTextVNode("最近操作", -1))
                   ])
                 ]),
                 _createVNode(_component_v_table, {
@@ -1081,7 +1100,7 @@ return (_ctx, _cache) => {
                   class: "sr-table"
                 }, {
                   default: _withCtx(() => [
-                    _cache[52] || (_cache[52] = _createElementVNode("thead", null, [
+                    _cache[51] || (_cache[51] = _createElementVNode("thead", null, [
                       _createElementVNode("tr", null, [
                         _createElementVNode("th", null, "时间"),
                         _createElementVNode("th", null, "操作"),
@@ -1097,7 +1116,7 @@ return (_ctx, _cache) => {
                         ]))
                       }), 128)),
                       (!view.value.events?.length)
-                        ? (_openBlock(), _createElementBlock("tr", _hoisted_70, [...(_cache[51] || (_cache[51] = [
+                        ? (_openBlock(), _createElementBlock("tr", _hoisted_70, [...(_cache[50] || (_cache[50] = [
                             _createElementVNode("td", {
                               colspan: "3",
                               class: "sr-empty"
@@ -1143,7 +1162,7 @@ return (_ctx, _cache) => {
                       variant: "text",
                       onClick: cancelConfirm
                     }, {
-                      default: _withCtx(() => [...(_cache[53] || (_cache[53] = [
+                      default: _withCtx(() => [...(_cache[52] || (_cache[52] = [
                         _createTextVNode("取消", -1)
                       ]))]),
                       _: 1
@@ -1153,7 +1172,7 @@ return (_ctx, _cache) => {
                       variant: "tonal",
                       onClick: acceptConfirm
                     }, {
-                      default: _withCtx(() => [...(_cache[54] || (_cache[54] = [
+                      default: _withCtx(() => [...(_cache[53] || (_cache[53] = [
                         _createTextVNode("确认", -1)
                       ]))]),
                       _: 1

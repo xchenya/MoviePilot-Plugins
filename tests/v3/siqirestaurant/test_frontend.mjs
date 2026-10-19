@@ -1,5 +1,6 @@
 // Mount the real compiled Vue components against a synthetic MP API in jsdom.
 import assert from 'node:assert/strict'
+import { mock } from 'node:test'
 import { createRequire, registerHooks } from 'node:module'
 import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -32,7 +33,8 @@ const installUi = app => app.use(createVuetify({ components, directives }))
 const { createApp, nextTick } = await import(pathToFileURL(require.resolve('vue')).href)
 const output = mkdtempSync(path.join(plugin,'.ui-test-'))
 let app
-const settle = async()=>{for(let i=0;i<5;i++){await new Promise(r=>setTimeout(r,0));await nextTick()}}
+const realTimeout = globalThis.setTimeout
+const settle = async()=>{for(let i=0;i<5;i++){await new Promise(r=>realTimeout(r,0));await nextTick()}}
 const click = async text=>{
   const b=[...document.querySelectorAll('button')].find(b=>(b.textContent.trim()===text || b.getAttribute('aria-label')===text))
   assert(b,`missing button: ${text}`);assert(!b.disabled,`disabled button: ${text}`)
@@ -115,5 +117,50 @@ try {
   await click('下馆子')
   assert(![...document.querySelectorAll('button')].find(b=>b.textContent==='随机推荐').disabled)
   assert(document.body.textContent.includes('设置名单与通知'))
+  app.unmount();app=null;document.querySelector('#app').innerHTML=''
+
+  // Advance real component timers without waiting a minute or touching a live site.
+  mock.timers.enable({apis:['setTimeout','setInterval','Date'],now:1792380000000})
+  let current=response(), hidden=false, pollCalls=[]
+  Object.defineProperty(document,'hidden',{configurable:true,get:()=>hidden})
+  const pollingApi={get:async url=>{pollCalls.push(url);return structuredClone(current)},
+    post:async url=>{pollCalls.push(url);return structuredClone(current)}}
+  const advance=async ms=>{mock.timers.tick(ms);await settle()}
+  app=createApp(await component('Page'),{api:pollingApi});installUi(app).mount('#app');await settle()
+  assert.equal(pollCalls.length,1)
+  assert(document.body.textContent.includes('每 60 秒更新状态'))
+  await advance(59000);assert.equal(pollCalls.length,1,'unopened restaurant must stay quiet')
+  await advance(1000);assert.equal(pollCalls.at(-1),'plugin/SiqiRestaurant/tick');assert.equal(pollCalls.length,2)
+  current.restaurant.state.session_status='closed'
+  await click('刷新');pollCalls=[]
+  await advance(59000);assert.equal(pollCalls.length,0,'closed restaurant must stay quiet')
+  await advance(1000);assert.equal(pollCalls.length,1)
+  // A manual action/read switches the interval immediately instead of waiting out the old idle timer.
+  current.restaurant.state.session_status='open'
+  await click('刷新');pollCalls=[]
+  assert(document.body.textContent.includes('每 2 秒更新状态'))
+  await advance(2000);assert.equal(pollCalls.length,1)
+  current.restaurant.state.session_status='ready'
+  current.kitchen[0].status='cooking';current.kitchen[0].ready_at=Date.now()/1000+10
+  await click('刷新');pollCalls=[]
+  await advance(2000);assert.equal(pollCalls.length,1,'pre-opening cooking needs timely ticks')
+  current.kitchen[0].status='ready'
+  await advance(2000);pollCalls=[]
+  await advance(59000);assert.equal(pollCalls.length,0,'finished cooking returns to idle polling')
+  await advance(1000);assert.equal(pollCalls.length,1)
+  current.cleaning={'1':Date.now()/1000+10}
+  await click('刷新');pollCalls=[]
+  await advance(2000);assert.equal(pollCalls.length,1,'cleaning countdown needs timely ticks')
+  current.cleaning={};current.automation={enabled:false,active:true,visit_enabled:true}
+  await click('刷新');pollCalls=[]
+  await advance(60000);assert.deepEqual(pollCalls,['plugin/SiqiRestaurant/state'],'visit-only automation is read-only')
+  hidden=true;document.dispatchEvent(new Event('visibilitychange'));pollCalls=[]
+  await advance(120000);assert.equal(pollCalls.length,0,'hidden page must stop polling')
+  hidden=false;document.dispatchEvent(new Event('visibilitychange'));await settle()
+  assert.deepEqual(pollCalls,['plugin/SiqiRestaurant/state'],'returning to the page refreshes immediately')
+  app.unmount();app=null;pollCalls=[]
+  await advance(120000);assert.equal(pollCalls.length,0,'unmounted page must release timers')
+  mock.timers.reset()
+  console.log('PASS: idle/closed 60s polling; active/cooking/cleaning 2s polling; transitions; hidden/resume/unmount; visit-only read-only polling')
   console.log('PASS: compiled Page/Config mounting; namespaced API; purchase budget confirmation/cancel; site visit confirmation; masked cookie settings')
-} finally {app?.unmount();dom.window.close();rmSync(output,{recursive:true,force:true})}
+} finally {app?.unmount();mock.timers.reset();dom.window.close();rmSync(output,{recursive:true,force:true})}
