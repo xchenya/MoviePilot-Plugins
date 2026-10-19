@@ -94,7 +94,12 @@
     </template>
     <template v-if="activeTab === 'visits'">
       <h3>下馆子 <small>今日 {{ data.visits?.count || 0 }} / {{ data.visits?.limit || 3 }}</small></h3>
-      <div class="sr-actions sr-wrap"><input v-model.trim="targetName" maxlength="64" placeholder="输入餐馆主人用户名" aria-label="餐馆主人用户名"><button :disabled="blocked || !targetName" @click="lookup">查询</button><button :disabled="blocked" @click="recommend">随机推荐</button><button class="sr-primary" :disabled="blocked || !targetName" @click="visit(targetName)">前往用餐</button></div>
+      <section class="sr-card">
+        <div class="sr-card-title"><h3>自动下馆子 · {{ view.automation?.visit_enabled?'已开启':'已关闭' }}</h3><button @click="emit('switch','config')">设置名单与通知</button></div>
+        <p>{{ view.automation?.visits?.message || '可指定最多 3 人；全部留空时每天随机到访 3 人。' }}</p>
+        <p v-for="(attempt,name) in view.automation?.visits?.attempts || {}" :key="name" class="sr-muted">{{ attempt.username }} · {{ attempt.message }}</p>
+      </section>
+      <div class="sr-actions sr-wrap"><input v-model.trim="targetName" maxlength="64" placeholder="输入餐馆主人用户名" aria-label="餐馆主人用户名"><button :disabled="busy || !targetName" @click="lookup">查询</button><button :disabled="busy" @click="recommend">随机推荐</button><button class="sr-primary" :disabled="blocked || !targetName" @click="visit(targetName)">前往用餐</button></div>
       <div class="sr-grid"><article v-for="item in recommendations" :key="item.username" class="sr-card"><h3>{{ item.username }}</h3><p>{{ item.message || '可查询餐馆详情后前往' }}</p><button :disabled="blocked || item.can_visit===false" @click="visit(item.username)">前往用餐</button></article></div>
       <h3 class="sr-section-head">今日到访</h3><p v-for="(record,i) in data.visits?.records || []" :key="i">{{ record.target_username }}</p>
     </template>
@@ -121,10 +126,10 @@ const targetName = ref(''), recommendations = ref([]), logDays = ref(0), activeT
 const now = ref(Date.now()/1000), confirmation = ref(null)
 let clockOffset=0, timer=null, clock=null, alive=false, confirmResolver=null
 const data = computed(()=>view.value.restaurant || {}), state = computed(()=>data.value.state || {})
-const blocked = computed(()=>busy.value || !!view.value.uncertain || !!view.value.automation?.enabled || !data.value.state)
+const blocked = computed(()=>busy.value || !!view.value.uncertain || !!view.value.automation?.enabled || !!view.value.automation?.active || !data.value.state)
 const tabs = [{id:'kitchen',label:'厨房与餐位'},{id:'supplies',label:'食材与菜品'},{id:'staff',label:'员工'},{id:'visits',label:'下馆子'},{id:'logs',label:'经营日志'}]
 const roles = [{key:'chef',label:'🧑‍🍳 厨师'},{key:'server',label:'💁 服务员'}]
-const actionLabels = {purchase_ingredient:'购买食材',hire_staff:'雇佣员工',update_staff_assignment:'员工调度',start_session:'开始营业',visit_restaurant:'下馆子',serve_customer:'上菜',discard_dish:'丢弃菜品',customer_left:'顾客离席',resolve:'核对解锁',automation:'自动经营'}
+const actionLabels = {purchase_ingredient:'购买食材',hire_staff:'雇佣员工',update_staff_assignment:'员工调度',start_session:'开始营业',visit_restaurant:'下馆子',serve_customer:'上菜',discard_dish:'丢弃菜品',customer_left:'顾客离席',resolve:'核对解锁',automation:'自动经营',auto_visit:'自动下馆子',notification:'通知'}
 const number = n => Number(n || 0).toLocaleString()
 const statusLabel = computed(()=>({ready:'准备营业',open:'营业中',closed:'已闭店'}[state.value.session_status] || '未连接'))
 const stats = computed(()=>[{label:'魔力余额',value:number(data.value.user?.magic)},{label:'受欢迎值',value:number(state.value.popularity)},{label:'今日顾客',value:`${state.value.customers_served || 0} / ${state.value.customers_total || 0}`},{label:'今日净收益',value:number(state.value.net_earnings_today)},{label:'累计净收益',value:number(state.value.net_earnings_total)}])

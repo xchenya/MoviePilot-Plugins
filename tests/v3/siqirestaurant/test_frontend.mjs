@@ -64,7 +64,7 @@ try {
   app.unmount();app=null;document.querySelector('#app').innerHTML=''
   const configCalls=[]
   const configApi={get:async()=>({enabled:true,use_proxy:false,cookie_configured:true,site_configured:true}),
-    post:async(url,payload)=>{configCalls.push(payload);return {success:true,message:'已保存',config:{enabled:true,use_proxy:false,cookie_configured:true,site_configured:true}}}}
+    post:async(url,payload)=>{configCalls.push(payload);return {success:true,message:'已保存',config:{...payload,cookie:undefined,cookie_configured:true,site_configured:true}}}}
   app=createApp(await component('Config'),{api:configApi});app.mount('#app');await settle()
   const password=document.querySelector('input[type=password]');assert.equal(password.value,'')
   await click('保存配置');assert.equal(configCalls.length,1);assert.equal(configCalls[0].cookie,'')
@@ -74,11 +74,30 @@ try {
   const autoBox=[...document.querySelectorAll('label')].find(l=>l.textContent.includes('后台自动经营')).querySelector('input')
   autoBox.checked=true;autoBox.dispatchEvent(new Event('change',{bubbles:true}));await settle()
   await click('保存配置');assert.equal(configCalls.at(-1).auto_enabled,true)
+  assert.equal(configCalls.at(-1).auto_visit,false)
+  assert.equal(configCalls.at(-1).notify,false)
+  assert.equal(document.querySelectorAll('.sr-visit-fields input').length,3)
+  for (const [i,input] of [...document.querySelectorAll('.sr-visit-fields input')].entries()) {
+    input.value=['Alice','Bob','Carol'][i];input.dispatchEvent(new Event('input',{bubbles:true}))
+    input.dispatchEvent(new Event('change',{bubbles:true}))
+  }
+  for(const label of ['自动下馆子','发送运行通知']){
+    const box=[...document.querySelectorAll('label.sr-setting')].find(l=>l.textContent.includes(label)).querySelector('input')
+    box.checked=true;box.dispatchEvent(new Event('change',{bubbles:true}))
+  }
+  await settle();await click('保存配置')
+  assert.deepEqual(configCalls.at(-1).visit_targets,['Alice','Bob','Carol'])
+  assert.equal(configCalls.at(-1).auto_visit,true)
+  assert.equal(configCalls.at(-1).notify,true)
+  assert.equal(document.querySelector('.sr-visit-fields input').value,'Alice')
   app.unmount();app=null;document.querySelector('#app').innerHTML=''
   const autoApi={get:async()=>({...response(),automation:{enabled:true,spent:48,daily_budget:5000,message:'后台正在烹饪'}}),post:async()=>{throw new Error('unexpected page write')}}
   app=createApp(await component('Page'),{api:autoApi});app.mount('#app');await settle()
   assert(document.body.textContent.includes('后台正在烹饪'))
   assert([...document.querySelectorAll('button')].find(b=>b.textContent==='开始今日经营').disabled)
   assert(document.querySelector('input[type="checkbox"]').disabled)
+  await click('下馆子')
+  assert(![...document.querySelectorAll('button')].find(b=>b.textContent==='随机推荐').disabled)
+  assert(document.body.textContent.includes('设置名单与通知'))
   console.log('PASS: compiled Page/Config mounting; namespaced API; purchase budget confirmation/cancel; site visit confirmation; masked cookie settings')
 } finally {app?.unmount();dom.window.close();rmSync(output,{recursive:true,force:true})}

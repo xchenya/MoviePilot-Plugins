@@ -36,8 +36,10 @@
 .sr-field>span small{margin-left:5px}
 .sr-config .sr-field input{display:block;width:100%;min-width:0;min-height:42px;padding:8px 12px;background:rgba(128,128,128,.025);font-size:15px;font-variant-numeric:tabular-nums}
 .sr-budget-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.sr-visit-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
 .sr-config .sr-config-help{color:var(--sr-muted);font-size:12px;line-height:1.7;margin:0}
-.sr-budget-fields+.sr-config-help{margin-top:8px}
+.sr-budget-fields+.sr-config-help,.sr-visit-fields+.sr-config-help{margin-top:8px}
+.sr-config-help+.sr-config-help{margin-top:8px}
 .sr-config-details{margin-bottom:12px;border:1px solid var(--sr-border);border-radius:12px}
 .sr-config-details>summary{display:flex;align-items:center;gap:16px;padding:15px 20px;list-style:none;cursor:pointer;border-radius:12px}
 .sr-config-details>summary::-webkit-details-marker{display:none}
@@ -71,3 +73,4 @@
   .sr-config-footer .sr-actions{margin-left:auto}
 }
 @media(prefers-reduced-motion:reduce){.sr-switch>span,.sr-switch>span:before{transition:none}}
+@media(max-width:420px){.sr-visit-fields{grid-template-columns:1fr}}

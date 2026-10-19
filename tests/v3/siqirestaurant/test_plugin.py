@@ -43,12 +43,15 @@ def module(monkeypatch):
     class Base:
         def __init__(self):
             self.storage = {}
+            self.notifications = []
         def get_data(self, key):
             return copy.deepcopy(self.storage.get(key))
         def save_data(self, key, value):
             self.storage[key] = copy.deepcopy(value)
         def update_config(self, value):
             self.config = value
+        def post_message(self, **kwargs):
+            self.notifications.append(kwargs)
     tree = ast.parse((PLUGIN / "__init__.py").read_text())
     tree.body = [n for n in tree.body if not (
         isinstance(n, ast.ImportFrom) and n.module.startswith("app."))]
@@ -56,6 +59,7 @@ def module(monkeypatch):
     monkeypatch.setitem(sys.modules, result.__name__, result)
     site = SimpleNamespace(url="https://si-qi.xyz", cookie="secret=one", ua="fixture-UA")
     result.__dict__.update(_PluginBase=Base, settings=SimpleNamespace(PROXY=None),
+                           NotificationType=SimpleNamespace(Plugin="plugin"),
                            update_plugin_job=Mock(), SiteOper=lambda: SimpleNamespace(get_by_domain=lambda _: site))
     exec(compile(tree, str(PLUGIN / "__init__.py"), "exec"), result.__dict__)
     result.site = site
@@ -479,3 +483,226 @@ def test_transient_read_failure_does_not_write_and_backoff(plugin, module):
     assert plugin._request.call_count==1
     assert not plugin._runtime.get('pending')
     assert plugin._next_auto>time.time()+55
+
+
+class VisitServer:
+    def __init__(self):
+        self.data = snapshot()
+        self.data['state'].update(session_status='closed', customer_plan=[], customers_served=2,
+                                  net_earnings_today=150)
+        self.data['user']['username'] = 'myself'
+        self.data['visits']['records'] = []
+        self.calls = []
+        self.names = ['myself', 'Alice', 'ALICE', 'Bob', 'Carol', 'Dave']
+        self.unavailable = set()
+        self.failures = set()
+        self.omit_write_counts = False
+
+    def __call__(self, action, payload=None, **kwargs):
+        self.calls.append((action, copy.deepcopy(payload)))
+        if action == 'fetch':
+            return copy.deepcopy(self.data)
+        if action == 'list_visitable_restaurants':
+            return dict(success=True, restaurants=[dict(username=n, can_visit=True) for n in self.names])
+        if action == 'inspect_restaurant_target':
+            name = payload['target_username']
+            return dict(success=True, candidate=dict(username=name, can_visit=name not in self.unavailable,
+                                                      message='不可到访' if name in self.unavailable else '可到访'))
+        assert action == 'visit_restaurant'
+        assert payload.get('confirm') == 'yes'
+        name = payload['target_username']
+        if name in self.failures:
+            return dict(success=False, message='今日暂不可到访')
+        visits = self.data['visits']
+        assert name.casefold() != 'myself'
+        assert visits['count'] < 3
+        assert name.casefold() not in {r['target_username'].casefold() for r in visits['records']}
+        visits['count'] += 1
+        visits['records'].append(dict(target_username=name))
+        if self.omit_write_counts:
+            return dict(success=True, message='到访成功')
+        return dict(success=True, message='到访成功', visits=copy.deepcopy(visits))
+
+
+def visit_setup(plugin, module, monkeypatch, **config):
+    clock = [1792378800.0]  # Beijing 11:00, stable same day as fixture
+    monkeypatch.setattr(module.time, 'time', lambda: clock[0])
+    server = VisitServer()
+    plugin._request = server
+    assert plugin.api_save_config(dict(auto_enabled=False, auto_visit=True, start_time='00:00', **config))['success']
+    return clock, server
+
+
+def drive_visits(plugin, clock, turns=10):
+    for _ in range(turns):
+        plugin.run_automation()
+        clock[0] += 61
+
+
+def test_random_three_unique_and_restart(plugin, module, monkeypatch):
+    clock, server = visit_setup(plugin, module, monkeypatch)
+    drive_visits(plugin, clock, 1)
+    restored = module.SiqiRestaurant()
+    restored.storage = copy.deepcopy(plugin.storage)
+    restored.init_plugin(plugin._config)
+    restored._request = server
+    drive_visits(restored, clock)
+    visits = server.data['visits']
+    assert visits['count'] == 3
+    assert len({r['target_username'].casefold() for r in visits['records']}) == 3
+    assert len([a for a,p in server.calls if a=='visit_restaurant']) == 3
+    assert not any(a=='start_session' for a,p in server.calls)
+    assert restored.get_service()
+    assert not restored.notifications
+
+
+def test_custom_order_skip_and_no_random_filler(plugin, module, monkeypatch):
+    clock, server = visit_setup(plugin, module, monkeypatch, visit_targets=['Alice', 'Bob', 'Carol'])
+    server.unavailable.add('Bob')
+    drive_visits(plugin, clock)
+    assert [r['target_username'] for r in server.data['visits']['records']] == ['Alice','Carol']
+    assert not any(a=='list_visitable_restaurants' for a,p in server.calls)
+    assert plugin._runtime['auto_visits']['attempts']['bob']['status']=='skipped'
+
+
+def test_partial_custom_list_does_not_add_random_people(plugin, module, monkeypatch):
+    clock, server = visit_setup(plugin, module, monkeypatch, visit_targets=['', 'Bob', ''])
+    drive_visits(plugin, clock)
+    assert server.data['visits']['count']==1
+    assert not any(a=='list_visitable_restaurants' for a,p in server.calls)
+
+
+def test_manual_visits_count_against_quota(plugin, module, monkeypatch):
+    clock, server = visit_setup(plugin, module, monkeypatch)
+    server.data['visits'].update(count=2, records=[dict(target_username='Alice'),dict(target_username='Carol')])
+    drive_visits(plugin, clock)
+    assert len([a for a,p in server.calls if a=='visit_restaurant'])==1
+    assert server.data['visits']['count']==3
+
+
+def test_success_without_quota_in_response_still_deduplicates(plugin, module, monkeypatch):
+    clock, server = visit_setup(plugin, module, monkeypatch)
+    server.omit_write_counts=True
+    drive_visits(plugin, clock)
+    assert server.data['visits']['count']==3
+
+
+def test_no_random_candidates_backoff(plugin, module, monkeypatch):
+    clock, server = visit_setup(plugin, module, monkeypatch)
+    server.names=['myself']
+    drive_visits(plugin, clock)
+    assert sum(a=='list_visitable_restaurants' for a,p in server.calls)==1
+    assert not any(a=='visit_restaurant' for a,p in server.calls)
+    clock[0]+=1801
+    server.names=['Bob']
+    drive_visits(plugin, clock,1)
+    assert server.data['visits']['count']==1
+
+
+def test_rejected_candidate_does_not_block_following_targets(plugin, module, monkeypatch):
+    clock, server = visit_setup(plugin, module, monkeypatch, visit_targets=['Alice','Bob','Carol'])
+    server.failures={'Alice'}
+    drive_visits(plugin, clock)
+    assert [r['target_username'] for r in server.data['visits']['records']]==['Bob','Carol']
+    assert len([a for a,p in server.calls if a=='visit_restaurant'])==3
+
+
+def test_uncertain_visit_does_not_retry_or_pick_more_on_restart(plugin, module, monkeypatch):
+    clock, server = visit_setup(plugin, module, monkeypatch, notify=True)
+    def request(action,payload=None,**kwargs):
+        response=server(action,payload,**kwargs)
+        if action=='visit_restaurant':
+            raise module.RestaurantError('结果不明')
+        return response
+    plugin._request=request
+    drive_visits(plugin,clock,2)
+    assert server.data['visits']['count']==1
+    assert plugin._runtime['pending']['action']=='visit_restaurant'
+    q=module.SiqiRestaurant();q.storage=copy.deepcopy(plugin.storage);q.init_plugin(plugin._config);q._request=request
+    drive_visits(q,clock)
+    assert server.data['visits']['count']==1
+    assert len(plugin.notifications)==1 and not q.notifications
+    q._request=server
+    assert q.api_resolve({'acknowledged':True})['success']
+    drive_visits(q,clock)
+    assert server.data['visits']['count']==3
+    assert '待核对' in q._runtime['auto_visits']['message']
+
+
+def test_auto_visits_wait_for_service_and_schedule(plugin,module,monkeypatch):
+    clock,server=visit_setup(plugin,module,monkeypatch)
+    server.data['state']['session_status']='open'
+    drive_visits(plugin,clock,2)
+    assert not any(a!='fetch' for a,p in server.calls)
+    server.data['state']['session_status']='closed'
+    plugin.api_save_config({'start_time':'23:59'})
+    drive_visits(plugin,clock,2)
+    assert not any(a=='visit_restaurant' for a,p in server.calls)
+    assert '等待' in plugin._runtime['auto_visits']['message']
+
+
+def test_visit_daily_reset_and_config_preserves_records(plugin,module,monkeypatch):
+    clock,server=visit_setup(plugin,module,monkeypatch,visit_targets=['Alice'])
+    drive_visits(plugin,clock)
+    plugin.api_save_config({'auto_visit':False})
+    assert not plugin.get_service()
+    plugin.api_save_config({'auto_visit':True})
+    drive_visits(plugin,clock)
+    assert server.data['visits']['count']==1
+    clock[0]+=86400
+    server.data['visits'].update(count=0,records=[])
+    drive_visits(plugin,clock)
+    assert server.data['visits']['count']==1
+    assert sum(a=='visit_restaurant' for a,p in server.calls)==2
+
+
+def test_visit_config_validation_and_legacy_defaults(plugin):
+    assert plugin.api_config()['auto_visit'] is False
+    assert plugin.api_config()['notify'] is False
+    for targets in [['a']*4,['Alice','alice'],'Alice',[42],['a\nb']]:
+        assert not plugin.api_save_config({'visit_targets':targets})['success']
+    assert plugin.api_save_config({'visit_targets':[' a ','','b']})['config']['visit_targets']==['a','b']
+    api=FastAPI()
+    for r in plugin.get_api():
+        api.add_api_route(r['path'],r['endpoint'],methods=r['methods'],response_model=r['response_model'])
+    cfg=TestClient(api).get('/config').json()
+    assert cfg['visit_targets']==['a','b'] and 'notify' in cfg
+
+
+def test_notifications_summary_and_exception_isolation(plugin,module,monkeypatch):
+    clock,server=visit_setup(plugin,module,monkeypatch,notify=True)
+    plugin.api_save_config({'auto_enabled':True})
+    drive_visits(plugin,clock)
+    assert len(plugin.notifications)==2
+    assert any('150 魔力' in n['text'] for n in plugin.notifications)
+    assert any('今日下馆子结果' in n['title'] for n in plugin.notifications)
+    q=module.SiqiRestaurant();q.storage=copy.deepcopy(plugin.storage);q.init_plugin(plugin._config);q._request=server
+    drive_visits(q,clock)
+    assert not q.notifications
+    q.post_message=Mock(side_effect=RuntimeError('channel failed'))
+    q._auto_status('blocked','测试异常')
+    q._auto_status('blocked','另一个同类异常')
+    assert q.post_message.call_count==1
+    assert any(e['action']=='notification' for e in q._runtime['events'])
+
+
+def test_unknown_quota_never_visits(plugin,module,monkeypatch):
+    clock,server=visit_setup(plugin,module,monkeypatch)
+    del server.data['visits']['count']
+    drive_visits(plugin,clock,2)
+    assert not any(a=='visit_restaurant' for a,p in server.calls)
+    assert plugin._runtime['automation']['phase']=='blocked'
+
+
+def test_final_service_and_visit_never_share_one_tick(plugin,module,monkeypatch):
+    clock=[time.time()];monkeypatch.setattr(module.time,'time',lambda:clock[0])
+    server=GameServer(clock,count=1);plugin._request=server
+    enable_auto(plugin,auto_visit=True)
+    # VisitServer is deliberately not attached: no visit RPC may happen on the tick serving the final guest.
+    for _ in range(6):
+        plugin.run_automation();clock[0]+=1
+        if server.served:
+            break
+    assert server.served==[1]
+    assert plugin._runtime['automation']['phase']=='running'
+    assert not any(c[0]=='list_visitable_restaurants' for c in server.calls)
