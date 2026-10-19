@@ -80,7 +80,7 @@ class SiqiRestaurant(_PluginBase):
     plugin_name = "思齐餐厅"
     plugin_desc = "思齐餐厅后台自动经营：每日开业、并行烹饪、及时上菜、限额补货及原生管理面板。"
     plugin_icon = "https://si-qi.xyz/favicon.ico"
-    plugin_version = "1.3.2"
+    plugin_version = "1.3.3"
     plugin_author = "xchenya"
     author_url = "https://github.com/xchenya"
     plugin_config_prefix = "siqirestaurant_"
@@ -667,11 +667,43 @@ class SiqiRestaurant(_PluginBase):
         if state.get("session_status") != "closed":
             return
         left = sum(c.get("status") == "left" for c in state.get("customer_plan", []))
-        text = (f"日期：{self._runtime.get('day', '')}\n"
-                f"服务顾客：{state.get('customers_served', 0)} / {state.get('customers_total', 0)}\n"
-                f"流失顾客：{left}\n今日净收益：{state.get('net_earnings_today', 0)} 魔力\n"
-                f"自动补货支出：{self._auto_account().get('spent', 0):g} 魔力")
+        text = f"顾客 {state.get('customers_served', 0)}/{state.get('customers_total', 0)}"
+        if left:
+            text += f" · 流失 {left}"
+        text += (f"\n净收益 {state.get('net_earnings_today', 0)} 魔力"
+                 f" · 补货 {self._auto_account().get('spent', 0):g} 魔力")
         self._notify_once("closed", "今日经营完成", text)
+
+    def _notify_visits(self, visits):
+        info = self._snapshot.get("visits") or {}
+        # Count confirmed visits only; count_floor may include an uncertain write.
+        names = {}
+        for record in info.get("records") or []:
+            name = str(record.get("target_username") or "").strip() if isinstance(record, dict) else ""
+            if name:
+                names.setdefault(name.casefold(), name)
+        problems = []
+        for item in visits["attempts"].values():
+            name = item["username"]
+            if item.get("status") == "success":
+                names.setdefault(name.casefold(), name)
+            elif item.get("status") == "sending":
+                problems.append(f"待核对：{name}")
+            else:
+                reason = " ".join(str(item.get("message") or "请查看插件记录").split())
+                if len(reason) > 40:
+                    reason = reason[:39] + "…"
+                label = "跳过" if item.get("status") == "skipped" else "失败"
+                problems.append(f"{label}：{name}（{reason}）")
+        count = max(int(info.get("count") or 0), len(names))
+        limit = min(3, int(info.get("limit", 3)))
+        lines = [f"已到访 {count}/{limit} 家"]
+        if names:
+            lines.append("、".join(names.values()))
+        lines.extend(problems[:3])
+        if len(problems) > 3:
+            lines.append(f"另有 {len(problems)-3} 项，详情见插件")
+        self._notify_once("visits", "今日下馆子", "\n".join(lines))
 
     def _visit_account(self):
         day = datetime.fromtimestamp(time.time(), ZoneInfo("Asia/Shanghai")).date().isoformat()
@@ -690,9 +722,7 @@ class SiqiRestaurant(_PluginBase):
         visits["last_check"] = time.time()
         self._save()
         if done:
-            items = visits["attempts"]
-            details = "\n".join(f"{item['username']}：{item['message']}" for item in items.values())
-            self._notify_once("visits", "今日下馆子结果", message + ("\n" + details if details else ""))
+            self._notify_visits(visits)
 
     def _auto_visit_step(self):
         if not self._config.get("auto_visit") or self._stopped or self._stop_auto.is_set():
