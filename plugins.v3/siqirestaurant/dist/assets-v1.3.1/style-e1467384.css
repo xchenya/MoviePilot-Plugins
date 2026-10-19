@@ -76,7 +76,7 @@
 .sr-tabs .v-tab { font-size: 12px; min-width: 76px; }
 .sr-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 20px; }
 .sr-toolbar .v-switch { flex: 0 0 auto; }
-.sr-kitchen-grid { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 12px; }
+.sr-kitchen-grid { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 12px; }
 .sr-stove { padding: 14px; display: flex; flex-direction: column; gap: 12px; min-width: 0; border-radius: 12px; border: 1px solid var(--sr-border); background: rgba(var(--v-theme-surface,255,255,255),.72); }
 .sr-stove-cooking { border-color: rgba(245,158,11,.3); }
 .sr-stove-ready { border-color: rgba(34,197,94,.3); }

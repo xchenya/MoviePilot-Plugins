@@ -7,9 +7,9 @@
           <div class="sr-topbar-copy"><h2>思齐餐厅 · 配置</h2><p>管理自动经营、下馆子与运行通知</p></div>
         </div>
         <v-btn-group variant="tonal" density="compact" class="sr-topbar-actions">
-          <v-btn aria-label="返回餐厅" title="返回餐厅" @click="emit('switch','page')"><v-icon icon="mdi-view-dashboard-outline" size="18" /><span>餐厅</span></v-btn>
-          <v-btn aria-label="保存配置" title="保存配置" @click="save" :loading="saving" :disabled="saving || !loaded"><v-icon icon="mdi-content-save-outline" size="18" /><span>保存</span></v-btn>
-          <v-btn aria-label="关闭" title="关闭" @click="emit('close')"><v-icon icon="mdi-close" size="18" /><span>关闭</span></v-btn>
+          <v-btn color="success" aria-label="返回餐厅" title="返回餐厅" @click="emit('switch','page')"><v-icon icon="mdi-view-dashboard-outline" size="18" /><span>餐厅</span></v-btn>
+          <v-btn color="success" aria-label="保存配置" title="保存配置" @click="save" :loading="saving" :disabled="saving || !loaded"><v-icon icon="mdi-content-save-outline" size="18" /><span>保存</span></v-btn>
+          <v-btn color="success" aria-label="关闭" title="关闭" @click="emit('close')"><v-icon icon="mdi-close" size="18" /><span>关闭</span></v-btn>
         </v-btn-group>
       </header>
       <v-alert v-if="message" :type="messageType" variant="tonal" density="compact" closable role="status" @click:close="message=''">{{ message }}</v-alert>
@@ -33,7 +33,7 @@
         <p class="sr-hint">错过开业时间会补开；关闭页面后继续运行。采购预算每日重置，保存设置与重启不会清零。</p>
       </section>
       <section class="sr-card sr-config-card">
-        <div class="sr-card-title"><h3><v-icon icon="mdi-account-group-outline" color="pink" size="18" />下馆子名单</h3><v-chip size="x-small" variant="tonal" color="pink">{{ targets.some(t=>t.trim())?'指定用户':'随机 3 人' }}</v-chip></div>
+        <div class="sr-card-title"><h3><v-icon icon="mdi-account-group-outline" color="#ec4899" size="18" />下馆子名单</h3><v-chip size="x-small" variant="tonal" color="#ec4899">{{ targets.some(t=>t.trim())?'指定用户':'随机 3 人' }}</v-chip></div>
         <div class="sr-form-grid sr-visit-fields">
           <v-text-field v-for="(_,i) in targets" :key="i" v-model.trim="targets[i]" :label="`用户名 ${i+1}（选填）`" :aria-label="`下馆子用户名 ${i+1}`" maxlength="64" placeholder="留空可随机" prepend-inner-icon="mdi-account-outline" />
         </div>
@@ -42,7 +42,7 @@
       </section>
       <v-expansion-panels class="sr-expansions" variant="accordion" multiple>
         <v-expansion-panel elevation="0">
-          <v-expansion-panel-title><div class="sr-expansion-heading"><v-icon icon="mdi-cookie-outline" size="18" color="orange" /><strong>连接与凭据</strong><div class="sr-connection-status"><v-chip size="x-small" :color="config.site_configured?'success':'default'">{{ !loaded?'读取中':config.site_configured?'站点已关联':'站点未关联' }}</v-chip><v-chip size="x-small" :color="config.cookie_configured?'success':'warning'">{{ !loaded?'读取中':config.cookie_configured?'Cookie 已配置':'Cookie 未配置' }}</v-chip></div></div></v-expansion-panel-title>
+          <v-expansion-panel-title><div class="sr-expansion-heading"><v-icon icon="mdi-cookie-outline" size="18" color="#f59e0b" /><strong>连接与凭据</strong><div class="sr-connection-status"><v-chip size="x-small" :color="config.site_configured?'success':'default'">{{ !loaded?'读取中':config.site_configured?'站点已关联':'站点未关联' }}</v-chip><v-chip size="x-small" :color="config.cookie_configured?'success':'warning'">{{ !loaded?'读取中':config.cookie_configured?'Cookie 已配置':'Cookie 未配置' }}</v-chip></div></div></v-expansion-panel-title>
           <v-expansion-panel-text>
             <div class="sr-stack">
               <p class="sr-hint">优先使用 MP 站点管理中的思齐 Cookie 和 User-Agent；未关联时，可先在 MP 添加思齐站点。</p>
@@ -73,15 +73,15 @@ const emit=defineEmits(['switch','close','config-updated'])
 const config=reactive({enabled:false,use_proxy:false,cookie_configured:false,site_configured:false,auto_enabled:false,start_time:"08:00",auto_purchase:true,daily_budget:5000,magic_reserve:10000,auto_visit:false,visit_targets:[],notify:false})
 const fieldDefaults = { VTextField: { density: 'compact', variant: 'outlined', hideDetails: 'auto', color: 'success' }, VBtn: { size: 'small', variant: 'tonal', color: 'success' } }
 const switchGroups = [
-  { title: '基础设置', icon: 'mdi-toggle-switch-outline', color: 'green', items: [
-    { key: 'enabled', label: '启用插件', desc: '开启餐厅管理与后台服务', icon: 'mdi-power-plug', color: 'green', accent: '34,197,94' },
-    { key: 'notify', label: '发送运行通知', desc: '通过 MP 通知渠道推送结果与异常', icon: 'mdi-bell-outline', color: 'blue', accent: '59,130,246' },
-    { key: 'use_proxy', label: '使用系统代理', desc: '使用 MP 已配置的代理连接站点', icon: 'mdi-lan-connect', color: 'purple', accent: '139,92,246' }
+  { title: '基础设置', icon: 'mdi-toggle-switch-outline', color: '#22c55e', items: [
+    { key: 'enabled', label: '启用插件', desc: '开启餐厅管理与后台服务', icon: 'mdi-power-plug', color: '#22c55e', accent: '34,197,94' },
+    { key: 'notify', label: '发送运行通知', desc: '通过 MP 通知渠道推送结果与异常', icon: 'mdi-bell-outline', color: '#3b82f6', accent: '59,130,246' },
+    { key: 'use_proxy', label: '使用系统代理', desc: '使用 MP 已配置的代理连接站点', icon: 'mdi-lan-connect', color: '#8b5cf6', accent: '139,92,246' }
   ] },
-  { title: '自动化策略', icon: 'mdi-robot-outline', color: 'orange', items: [
-    { key: 'auto_enabled', label: '后台自动经营', desc: '每日开业、并行烹饪与及时上菜', icon: 'mdi-chef-hat', color: 'orange', accent: '245,158,11' },
-    { key: 'auto_purchase', label: '自动补足食材', desc: '按实际订单补货，遵守预算上限', icon: 'mdi-basket-outline', color: 'green', accent: '34,197,94' },
-    { key: 'auto_visit', label: '自动下馆子', desc: '经营结束后到访，每日最多 3 人', icon: 'mdi-silverware-fork-knife', color: 'pink', accent: '236,72,153' }
+  { title: '自动化策略', icon: 'mdi-robot-outline', color: '#f59e0b', items: [
+    { key: 'auto_enabled', label: '后台自动经营', desc: '每日开业、并行烹饪与及时上菜', icon: 'mdi-chef-hat', color: '#f59e0b', accent: '245,158,11' },
+    { key: 'auto_purchase', label: '自动补足食材', desc: '按实际订单补货，遵守预算上限', icon: 'mdi-basket-outline', color: '#22c55e', accent: '34,197,94' },
+    { key: 'auto_visit', label: '自动下馆子', desc: '经营结束后到访，每日最多 3 人', icon: 'mdi-silverware-fork-knife', color: '#ec4899', accent: '236,72,153' }
   ] }
 ]
 const targets=ref(['','',''])
