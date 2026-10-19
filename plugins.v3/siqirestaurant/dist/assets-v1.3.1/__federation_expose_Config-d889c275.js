@@ -37,15 +37,15 @@ const emit=__emit;
 const config=reactive({enabled:false,use_proxy:false,cookie_configured:false,site_configured:false,auto_enabled:false,start_time:"08:00",auto_purchase:true,daily_budget:5000,magic_reserve:10000,auto_visit:false,visit_targets:[],notify:false});
 const fieldDefaults = { VTextField: { density: 'compact', variant: 'outlined', hideDetails: 'auto', color: 'success' }, VBtn: { size: 'small', variant: 'tonal', color: 'success' } };
 const switchGroups = [
-  { title: '基础设置', icon: 'mdi-toggle-switch-outline', color: 'green', items: [
-    { key: 'enabled', label: '启用插件', desc: '开启餐厅管理与后台服务', icon: 'mdi-power-plug', color: 'green', accent: '34,197,94' },
-    { key: 'notify', label: '发送运行通知', desc: '通过 MP 通知渠道推送结果与异常', icon: 'mdi-bell-outline', color: 'blue', accent: '59,130,246' },
-    { key: 'use_proxy', label: '使用系统代理', desc: '使用 MP 已配置的代理连接站点', icon: 'mdi-lan-connect', color: 'purple', accent: '139,92,246' }
+  { title: '基础设置', icon: 'mdi-toggle-switch-outline', color: '#22c55e', items: [
+    { key: 'enabled', label: '启用插件', desc: '开启餐厅管理与后台服务', icon: 'mdi-power-plug', color: '#22c55e', accent: '34,197,94' },
+    { key: 'notify', label: '发送运行通知', desc: '通过 MP 通知渠道推送结果与异常', icon: 'mdi-bell-outline', color: '#3b82f6', accent: '59,130,246' },
+    { key: 'use_proxy', label: '使用系统代理', desc: '使用 MP 已配置的代理连接站点', icon: 'mdi-lan-connect', color: '#8b5cf6', accent: '139,92,246' }
   ] },
-  { title: '自动化策略', icon: 'mdi-robot-outline', color: 'orange', items: [
-    { key: 'auto_enabled', label: '后台自动经营', desc: '每日开业、并行烹饪与及时上菜', icon: 'mdi-chef-hat', color: 'orange', accent: '245,158,11' },
-    { key: 'auto_purchase', label: '自动补足食材', desc: '按实际订单补货，遵守预算上限', icon: 'mdi-basket-outline', color: 'green', accent: '34,197,94' },
-    { key: 'auto_visit', label: '自动下馆子', desc: '经营结束后到访，每日最多 3 人', icon: 'mdi-silverware-fork-knife', color: 'pink', accent: '236,72,153' }
+  { title: '自动化策略', icon: 'mdi-robot-outline', color: '#f59e0b', items: [
+    { key: 'auto_enabled', label: '后台自动经营', desc: '每日开业、并行烹饪与及时上菜', icon: 'mdi-chef-hat', color: '#f59e0b', accent: '245,158,11' },
+    { key: 'auto_purchase', label: '自动补足食材', desc: '按实际订单补货，遵守预算上限', icon: 'mdi-basket-outline', color: '#22c55e', accent: '34,197,94' },
+    { key: 'auto_visit', label: '自动下馆子', desc: '经营结束后到访，每日最多 3 人', icon: 'mdi-silverware-fork-knife', color: '#ec4899', accent: '236,72,153' }
   ] }
 ];
 const targets=ref(['','','']);
@@ -92,6 +92,7 @@ return (_ctx, _cache) => {
           }, {
             default: _withCtx(() => [
               _createVNode(_component_v_btn, {
+                color: "success",
                 "aria-label": "返回餐厅",
                 title: "返回餐厅",
                 onClick: _cache[0] || (_cache[0] = $event => (emit('switch','page')))
@@ -106,6 +107,7 @@ return (_ctx, _cache) => {
                 _: 1
               }),
               _createVNode(_component_v_btn, {
+                color: "success",
                 "aria-label": "保存配置",
                 title: "保存配置",
                 onClick: save,
@@ -122,6 +124,7 @@ return (_ctx, _cache) => {
                 _: 1
               }, 8, ["loading", "disabled"]),
               _createVNode(_component_v_btn, {
+                color: "success",
                 "aria-label": "关闭",
                 title: "关闭",
                 onClick: _cache[1] || (_cache[1] = $event => (emit('close')))
@@ -271,7 +274,7 @@ return (_ctx, _cache) => {
             _createElementVNode("h3", null, [
               _createVNode(_component_v_icon, {
                 icon: "mdi-account-group-outline",
-                color: "pink",
+                color: "#ec4899",
                 size: "18"
               }),
               _cache[15] || (_cache[15] = _createTextVNode("下馆子名单", -1))
@@ -279,7 +282,7 @@ return (_ctx, _cache) => {
             _createVNode(_component_v_chip, {
               size: "x-small",
               variant: "tonal",
-              color: "pink"
+              color: "#ec4899"
             }, {
               default: _withCtx(() => [
                 _createTextVNode(_toDisplayString(targets.value.some(t=>t.trim())?'指定用户':'随机 3 人'), 1)
@@ -319,7 +322,7 @@ return (_ctx, _cache) => {
                       _createVNode(_component_v_icon, {
                         icon: "mdi-cookie-outline",
                         size: "18",
-                        color: "orange"
+                        color: "#f59e0b"
                       }),
                       _cache[18] || (_cache[18] = _createElementVNode("strong", null, "连接与凭据", -1)),
                       _createElementVNode("div", _hoisted_16, [

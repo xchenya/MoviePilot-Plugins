@@ -233,6 +233,7 @@ return (_ctx, _cache) => {
           }, {
             default: _withCtx(() => [
               _createVNode(_component_v_btn, {
+                color: "success",
                 "aria-label": "刷新",
                 title: "刷新",
                 onClick: refresh,
@@ -249,6 +250,7 @@ return (_ctx, _cache) => {
                 _: 1
               }, 8, ["loading", "disabled"]),
               _createVNode(_component_v_btn, {
+                color: "success",
                 "aria-label": "配置",
                 title: "配置",
                 onClick: _cache[0] || (_cache[0] = $event => (emit('switch','config')))
@@ -263,6 +265,7 @@ return (_ctx, _cache) => {
                 _: 1
               }),
               _createVNode(_component_v_btn, {
+                color: "success",
                 "aria-label": "关闭",
                 title: "关闭",
                 onClick: _cache[1] || (_cache[1] = $event => (emit('close')))
@@ -483,12 +486,12 @@ return (_ctx, _cache) => {
                             _createVNode(_component_v_icon, {
                               icon: "mdi-fire",
                               size: "18",
-                              color: stove.status==='idle'?'grey':'orange'
+                              color: stove.status==='idle'?'#9e9e9e':'#f59e0b'
                             }, null, 8, ["color"]),
                             _createTextVNode("灶台 " + _toDisplayString(stove.index), 1)
                           ]),
                           _createVNode(_component_v_chip, {
-                            color: stove.status==='ready'?'success':stove.status==='idle'?'default':'orange'
+                            color: stove.status==='ready'?'success':stove.status==='idle'?'default':'#f59e0b'
                           }, {
                             default: _withCtx(() => [
                               _createTextVNode(_toDisplayString(stoveStatus(stove)), 1)
@@ -589,7 +592,7 @@ return (_ctx, _cache) => {
                           (stove.status==='cooking')
                             ? (_openBlock(), _createBlock(_component_v_chip, {
                                 key: 2,
-                                color: "orange",
+                                color: "#f59e0b",
                                 "prepend-icon": "mdi-timer-sand"
                               }, {
                                 default: _withCtx(() => [
@@ -699,7 +702,7 @@ return (_ctx, _cache) => {
                     }, [
                       _createElementVNode("h3", null, [
                         _createTextVNode(_toDisplayString(item.name), 1),
-                        _createVNode(_component_v_chip, { color: "orange" }, {
+                        _createVNode(_component_v_chip, { color: "#f59e0b" }, {
                           default: _withCtx(() => [
                             _createTextVNode(_toDisplayString(number(item.price)) + " 魔力 / 份", 1)
                           ]),
@@ -722,7 +725,7 @@ return (_ctx, _cache) => {
                           "aria-label": `${item.name}购买数量`
                         }, null, 8, ["modelValue", "onUpdate:modelValue", "aria-label"]),
                         _createVNode(_component_v_btn, {
-                          color: "orange",
+                          color: "#f59e0b",
                           disabled: blocked.value,
                           onClick: $event => (buy(item))
                         }, {
@@ -850,7 +853,7 @@ return (_ctx, _cache) => {
                       size: "19"
                     }),
                     _cache[40] || (_cache[40] = _createTextVNode("下馆子 ", -1)),
-                    _createVNode(_component_v_chip, { color: "pink" }, {
+                    _createVNode(_component_v_chip, { color: "#ec4899" }, {
                       default: _withCtx(() => [
                         _createTextVNode("今日 " + _toDisplayString(data.value.visits?.count || 0) + " / " + _toDisplayString(data.value.visits?.limit || 3), 1)
                       ]),
@@ -858,7 +861,7 @@ return (_ctx, _cache) => {
                     })
                   ]),
                   _createVNode(_component_v_btn, {
-                    color: "pink",
+                    color: "#ec4899",
                     variant: "text",
                     "prepend-icon": "mdi-tune-variant",
                     onClick: _cache[6] || (_cache[6] = $event => (emit('switch','config')))
@@ -873,7 +876,7 @@ return (_ctx, _cache) => {
                   _createElementVNode("div", _hoisted_49, [
                     _createVNode(_component_v_icon, {
                       icon: "mdi-robot-outline",
-                      color: "pink",
+                      color: "#ec4899",
                       size: "24"
                     }),
                     _createElementVNode("div", null, [
@@ -890,7 +893,7 @@ return (_ctx, _cache) => {
                           }, [
                             _createVNode(_component_v_icon, {
                               icon: "mdi-account-circle-outline",
-                              color: "pink",
+                              color: "#ec4899",
                               size: "22"
                             }),
                             _createElementVNode("div", null, [
@@ -913,7 +916,7 @@ return (_ctx, _cache) => {
                       onKeydown: _cache[8] || (_cache[8] = _withKeys($event => (targetName.value && !busy.value && lookup()), ["enter"]))
                     }, null, 8, ["modelValue"]),
                     _createVNode(_component_v_btn, {
-                      color: "pink",
+                      color: "#ec4899",
                       disabled: busy.value || !targetName.value,
                       onClick: lookup
                     }, {
@@ -923,7 +926,7 @@ return (_ctx, _cache) => {
                       _: 1
                     }, 8, ["disabled"]),
                     _createVNode(_component_v_btn, {
-                      color: "purple",
+                      color: "#8b5cf6",
                       disabled: busy.value,
                       onClick: recommend
                     }, {
@@ -933,7 +936,7 @@ return (_ctx, _cache) => {
                       _: 1
                     }, 8, ["disabled"]),
                     _createVNode(_component_v_btn, {
-                      color: "pink",
+                      color: "#ec4899",
                       disabled: blocked.value || !targetName.value,
                       onClick: _cache[9] || (_cache[9] = $event => (visit(targetName.value)))
                     }, {
@@ -956,7 +959,7 @@ return (_ctx, _cache) => {
                             _createElementVNode("h3", null, _toDisplayString(item.username), 1),
                             _createElementVNode("p", _hoisted_56, _toDisplayString(item.message || '可查询餐馆详情后前往'), 1),
                             _createVNode(_component_v_btn, {
-                              color: "pink",
+                              color: "#ec4899",
                               disabled: blocked.value || item.can_visit===false,
                               onClick: $event => (visit(item.username))
                             }, {
