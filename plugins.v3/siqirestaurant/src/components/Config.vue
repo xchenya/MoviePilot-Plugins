@@ -1,25 +1,86 @@
 <template>
   <section class="sr-app sr-config">
-    <header class="sr-header"><div><span class="sr-eyebrow">SIQI · RESTAURANT</span><h2>餐厅设置</h2></div><button @click="emit('switch','page')">返回餐厅</button></header>
-    <p class="sr-muted">优先使用 MP 站点管理中的思齐 Cookie 和 User-Agent。后台自动经营由 MP 定时任务执行，关闭插件页面后仍会继续。</p>
+    <header class="sr-header sr-config-header">
+      <div>
+        <span class="sr-eyebrow">SIQI · RESTAURANT</span>
+        <h2>餐厅设置</h2>
+        <p>安排每日经营，让餐厅按你的节奏运转。</p>
+      </div>
+      <button @click="emit('switch','page')">返回餐厅</button>
+    </header>
+
     <p v-if="message" role="status" class="sr-notice">{{ message }}</p>
-    <div class="sr-card">
-      <label><input type="checkbox" v-model="config.enabled">启用插件</label>
-      <label><input type="checkbox" v-model="config.use_proxy">使用 MoviePilot 系统代理</label>
-      <hr>
-      <label><input type="checkbox" v-model="config.auto_enabled">后台自动经营（每日开业、烹饪、上菜）</label>
-      <label>每日开业时间（北京时间，错过后补开）<input type="time" v-model="config.start_time"></label>
-      <label><input type="checkbox" v-model="config.auto_purchase">按实际订单自动补足缺少的食材</label>
-      <label>每日采购预算（魔力）<input type="number" min="0" max="1000000" step="1" v-model.number="config.daily_budget"></label>
-      <label>补货后至少保留魔力<input type="number" min="0" max="1000000000" step="1" v-model.number="config.magic_reserve"></label>
-      <p class="sr-muted">托管使用所有已解锁灶台，遵守烹饪和清理计时，优先处理耐心将耗尽的订单。开业前检查预算能否覆盖保守估计的食材缺口。不会自动扩招员工、丢弃成品或下馆子；这些仍可暂停托管后手动操作。</p>
-      <p class="sr-muted">保存并启用后，到达开业时间会立即开始。采购预算按北京时间每日重置，保存设置和重启不会清零。已发送的请求会完成；关闭托管后不会继续下一步。</p>
-      <p>站点配置：{{ config.site_configured?'已找到思齐':'未找到，可先在 MP 添加思齐站点' }} · Cookie：{{ config.cookie_configured?'已配置':'未配置' }}</p>
-      <label>手动 Cookie（选填，留空保留现有配置）<input v-model="cookie" type="password" autocomplete="new-password" placeholder="仅在需要覆盖站点 Cookie 时填写"></label>
-      <label><input v-model="clearCookie" type="checkbox">清除插件内手动 Cookie，改用站点管理</label>
-      <p class="sr-muted">Cookie 只由 MP 后端发往 https://si-qi.xyz；接口不回显凭据。建议不要同时使用网页和插件经营同一餐厅，两端厨房进度相互独立。</p>
-      <div class="sr-actions"><button class="sr-primary" @click="save" :disabled="saving || !loaded">保存配置</button><button @click="emit('close')">关闭</button></div>
+
+    <label class="sr-config-master sr-setting">
+      <span class="sr-setting-copy"><strong>启用插件</strong><small>开启餐厅管理与后台服务</small></span>
+      <span class="sr-switch"><input type="checkbox" v-model="config.enabled"><span aria-hidden="true"></span></span>
+    </label>
+
+    <div class="sr-config-grid">
+      <section class="sr-card sr-config-panel">
+        <div class="sr-config-panel-head"><h3>自动经营</h3><span class="sr-badge">北京时间</span></div>
+        <label class="sr-setting">
+          <span class="sr-setting-copy"><strong>后台自动经营</strong><small>每日开业、烹饪与上菜</small></span>
+          <span class="sr-switch"><input type="checkbox" v-model="config.auto_enabled"><span aria-hidden="true"></span></span>
+        </label>
+        <label class="sr-field">
+          <span>每日开业时间</span>
+          <input type="time" v-model="config.start_time">
+          <small>错过时间会补开，关闭插件页面后仍会继续经营。</small>
+        </label>
+      </section>
+
+      <section class="sr-card sr-config-panel">
+        <div class="sr-config-panel-head"><h3>食材与预算</h3><span class="sr-badge">魔力</span></div>
+        <label class="sr-setting">
+          <span class="sr-setting-copy"><strong>自动补足食材</strong><small>只采购实际订单缺少的食材</small></span>
+          <span class="sr-switch"><input type="checkbox" v-model="config.auto_purchase"><span aria-hidden="true"></span></span>
+        </label>
+        <div class="sr-budget-fields">
+          <label class="sr-field"><span>每日采购预算</span><input type="number" min="0" max="1000000" step="1" v-model.number="config.daily_budget"></label>
+          <label class="sr-field"><span>最低保留魔力</span><input type="number" min="0" max="1000000000" step="1" v-model.number="config.magic_reserve"></label>
+        </div>
+        <p class="sr-config-help">预算每日重置，保存设置与重启不会清零。</p>
+      </section>
     </div>
+
+    <details class="sr-config-details">
+      <summary>
+        <span class="sr-summary-copy"><strong>连接与凭据</strong><small>站点管理、代理与手动 Cookie</small></span>
+        <span class="sr-connection-status">
+          <span class="sr-badge" :class="{'sr-status-ready':loaded && config.site_configured}">{{ !loaded?'读取中':config.site_configured?'站点已关联':'站点未关联' }}</span>
+          <span class="sr-badge" :class="{'sr-status-ready':loaded && config.cookie_configured,'sr-status-warning':loaded && !config.cookie_configured}">{{ !loaded?'读取中':config.cookie_configured?'Cookie 已配置':'Cookie 未配置' }}</span>
+        </span>
+      </summary>
+      <div class="sr-details-body">
+        <p class="sr-config-help">优先使用 MP 站点管理中的思齐 Cookie 和 User-Agent；未关联时，可先在 MP 添加思齐站点。</p>
+        <label class="sr-setting">
+          <span class="sr-setting-copy"><strong>使用 MoviePilot 系统代理</strong><small>通过 MP 中已配置的代理连接站点</small></span>
+          <span class="sr-switch"><input type="checkbox" v-model="config.use_proxy"><span aria-hidden="true"></span></span>
+        </label>
+        <label class="sr-field"><span>手动 Cookie <small>选填</small></span><input v-model="cookie" type="password" autocomplete="new-password" placeholder="仅在需要覆盖站点 Cookie 时填写"><small>留空保留现有配置，已保存的凭据不会回显。</small></label>
+        <label class="sr-clear-cookie"><input v-model="clearCookie" type="checkbox">清除插件内手动 Cookie，改用站点管理</label>
+        <p class="sr-config-help">Cookie 只由 MP 后端发往 https://si-qi.xyz。</p>
+      </div>
+    </details>
+
+    <details class="sr-config-details sr-config-guide">
+      <summary><span class="sr-summary-copy"><strong>托管说明</strong><small>调度方式与操作注意事项</small></span></summary>
+      <div class="sr-details-body">
+        <ul>
+          <li>使用所有已解锁灶台，遵守烹饪和清理计时，优先处理耐心将耗尽的订单。</li>
+          <li>开业前检查预算能否覆盖保守估计的食材缺口；补货后余额不低于最低保留魔力。</li>
+          <li>保存并启用后，到达开业时间会立即开始。关闭托管后，已发送的请求会完成，但不会继续下一步。</li>
+          <li>扩招员工、丢弃成品与下馆子需暂停托管后手动操作。</li>
+          <li>建议不要同时使用网页和插件经营同一餐厅，两端厨房进度相互独立。</li>
+        </ul>
+      </div>
+    </details>
+
+    <footer class="sr-config-footer">
+      <span class="sr-config-help">{{ loaded?'调整完成后保存生效':'正在读取配置…' }}</span>
+      <div class="sr-actions"><button @click="emit('close')">关闭</button><button class="sr-primary" @click="save" :disabled="saving || !loaded">{{ saving?'保存中…':'保存配置' }}</button></div>
+    </footer>
   </section>
 </template>
 <script setup>
