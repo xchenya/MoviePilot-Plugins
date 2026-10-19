@@ -1,117 +1,89 @@
 <template>
-  <section class="sr-app">
-    <header class="sr-header">
-      <div><span class="sr-eyebrow">SIQI · RESTAURANT</span><h2>思齐餐厅 <small>{{ statusLabel }}</small></h2><p>经营你的餐厅，照顾每一位顾客。</p></div>
-      <div class="sr-actions"><button @click="refresh" :disabled="busy">刷新</button><button @click="emit('switch', 'config')">配置</button><button @click="emit('close')">关闭</button></div>
-    </header>
-    <div v-if="message" role="status" class="sr-notice" :class="{ 'sr-error': !ok }">{{ message }}</div>
-    <div v-if="view.uncertain" class="sr-notice sr-error">上次站点操作结果不明，已暂停写入。请先刷新并核对网站。
-      <button @click="resolveUncertain" :disabled="busy">已核对，解除锁定</button>
-    </div>
-    <div class="sr-stats">
-      <article v-for="item in stats" :key="item.label"><span>{{ item.label }}</span><strong>{{ item.value }}</strong></article>
-    </div>
-    <section class="sr-card sr-automation" aria-label="后台自动经营状态">
-      <div class="sr-card-title"><h3>后台自动经营 · {{ view.automation?.enabled?'已开启':'已暂停' }}</h3><button @click="emit('switch','config')">{{ view.automation?.enabled?'暂停 / 调整托管':'设置自动经营' }}</button></div>
-      <p>{{ view.automation?.enabled ? (view.automation.message || '等待后台首次检查') : '可在配置中开启每日自动经营。' }}</p>
-      <p v-if="view.automation?.enabled" class="sr-muted">今日补货预算已占用 {{ number(view.automation.spent) }} / {{ number(view.automation.daily_budget) }} 魔力 · {{ view.automation.last_check ? `最近后台检查 ${new Date(view.automation.last_check*1000).toLocaleTimeString()}` : '尚未检查' }}。关闭本页面后继续运行。</p>
-    </section>
-    <div class="sr-toolbar">
-      <button class="sr-primary" :disabled="blocked || state.session_status !== 'ready' || !state.customers_total" @click="startSession">开始今日经营</button>
-      <label><input type="checkbox" v-model="runStaff" :disabled="blocked || !data.staff?.unlocked">运行已雇员工</label>
-      <span>员工按同编号餐位服务。离开面板或标签页进入后台后暂停执行。</span>
-    </div>
-    <nav class="sr-tabs" aria-label="餐厅功能">
-      <button v-for="tab in tabs" :key="tab.id" :class="{active:activeTab===tab.id}" @click="activeTab=tab.id">{{ tab.label }}</button>
-    </nav>
-    <template v-if="activeTab === 'kitchen'">
-      <div class="sr-section-head"><h3>厨房与餐位</h3><span>排队 {{ state.queued_customers || 0 }} · 剩余 {{ state.customers_remaining ?? '—' }}</span></div>
-      <p class="sr-muted">选择菜品 → 备齐食材与工具 → 开始烹饪 → 上菜。灶台进度保存在 MP 中，刷新页面可继续。</p>
-      <div class="sr-kitchen-grid">
-        <article class="sr-card" v-for="stove in view.kitchen || []" :key="stove.index">
-          <div class="sr-card-title"><h3>灶台 {{ stove.index }}</h3><span class="sr-badge">{{ stoveStatus(stove) }}</span></div>
-          <div class="sr-seat" :class="{occupied:customerAt(stove.index)}">
-            <template v-if="cleaningLeft(stove.index)>0">🧹 餐位清理中 · {{ cleaningLeft(stove.index) }} 秒</template>
-            <template v-else-if="customerAt(stove.index)">
-              <strong>餐位 {{ stove.index }} · {{ dishName(customerAt(stove.index).dish_key) }}</strong>
-              <span>耐心剩余 {{ patience(customerAt(stove.index)) }} 秒</span>
-              <progress :value="patience(customerAt(stove.index))" :max="customerAt(stove.index).patience || 60"></progress>
-            </template>
-            <span v-else>餐位 {{ stove.index }} · 等待顾客</span>
-          </div>
-          <select v-if="stove.status==='idle'" v-model="selected[stove.index]" :disabled="blocked" :aria-label="`灶台 ${stove.index} 菜品`">
-            <option value="">选择菜品</option><option v-for="dish in unlockedDishes" :key="dish.key" :value="dish.key">{{ dish.name }} · {{ dish.cook_time }} 秒</option>
-          </select>
-          <h4 v-else>{{ dishName(stove.dish_key) }}</h4>
-          <p v-if="stove.dish_key" class="sr-muted">{{ recipeText(stove.dish_key) }}</p>
-          <div class="sr-actions sr-wrap">
-            <button v-if="stove.status==='idle'" :disabled="blocked || !selected[stove.index]" @click="act('assign_dish',{station_index:stove.index,dish_key:selected[stove.index]})">选择菜品</button>
-            <template v-if="stove.status==='prepping'">
-              <button :disabled="blocked" @click="act('prepare',{station_index:stove.index})">备齐食材与工具</button>
-              <button class="sr-primary" :disabled="blocked || !prepared(stove)" @click="act('cook',{station_index:stove.index})">开始烹饪</button>
-              <button :disabled="blocked" @click="act('cancel',{station_index:stove.index})">取消</button>
-            </template>
-            <span v-if="stove.status==='cooking'" class="sr-cooking">🔥 烹饪中 · {{ remaining(stove.ready_at) }} 秒</span>
-            <template v-if="stove.status==='ready'">
-              <select v-model="serveTargets[stove.index]" :disabled="blocked" :aria-label="`灶台 ${stove.index} 上菜餐位`">
-                <option value="">选择上菜餐位</option><option v-for="c in matchingCustomers(stove)" :key="c.id" :value="c.id">餐位 {{ c.seat }} · {{ patience(c) }} 秒</option>
-              </select>
-              <button class="sr-primary" :disabled="blocked || !serveTargets[stove.index]" @click="act('serve',{station_index:stove.index,customer_id:serveTargets[stove.index]})">上菜</button>
-              <button :disabled="blocked" @click="askReturn(stove)">归位</button>
-              <button class="sr-danger" :disabled="blocked" @click="askDiscard(stove)">丢弃</button>
-            </template>
-          </div>
-          <div v-if="data.staff?.unlocked" class="sr-staff-actions">
-            <button v-for="role in roles" :key="role.key" :class="{'sr-selected': assigned(stove.index,role.key)}" :disabled="blocked || (!assigned(stove.index,role.key) && !data.staff?.available?.[role.key])" @click="act('update_staff_assignment',{station_index:stove.index,role:role.key,assigned:assigned(stove.index,role.key)?0:1})">{{ role.label }} · {{ assigned(stove.index,role.key)?'已上岗':'分配' }}</button>
-          </div>
-        </article>
+  <section class="sr-app sr-page">
+    <v-defaults-provider :defaults="uiDefaults">
+      <header class="sr-topbar">
+        <div class="sr-topbar-left">
+          <div class="sr-topbar-icon"><v-icon icon="mdi-silverware-fork-knife" size="24" /></div>
+          <div class="sr-topbar-copy"><h2>思齐餐厅 <v-chip :color="state.session_status==='open'?'success':'default'">{{ statusLabel }}</v-chip></h2><p>管理厨房、食材、员工与餐厅互动</p></div>
+        </div>
+        <v-btn-group variant="tonal" density="compact" class="sr-topbar-actions">
+          <v-btn aria-label="刷新" title="刷新" @click="refresh" :loading="busy" :disabled="busy"><v-icon icon="mdi-refresh" size="18" /><span>刷新</span></v-btn>
+          <v-btn aria-label="配置" title="配置" @click="emit('switch','config')"><v-icon icon="mdi-cog-outline" size="18" /><span>配置</span></v-btn>
+          <v-btn aria-label="关闭" title="关闭" @click="emit('close')"><v-icon icon="mdi-close" size="18" /><span>关闭</span></v-btn>
+        </v-btn-group>
+      </header>
+      <v-alert v-if="message" :type="ok?'success':'error'" variant="tonal" density="compact" closable role="status" @click:close="message=''">{{ message }}</v-alert>
+      <v-alert v-if="view.uncertain" type="warning" variant="tonal" density="compact"><div class="sr-alert-row"><span>上次站点操作结果不明，已暂停写入。请先刷新并核对网站。</span><v-btn color="warning" @click="resolveUncertain" :disabled="busy">已核对，解除锁定</v-btn></div></v-alert>
+      <v-progress-linear v-if="busy && !data.state" indeterminate color="success" aria-label="读取餐厅" />
+      <div class="sr-stats">
+        <article v-for="item in stats" :key="item.label" class="sr-stat" :style="{'--sr-accent':item.accent}"><div class="sr-stat-icon"><v-icon :icon="item.icon" size="22" /></div><div><span>{{ item.label }}</span><strong>{{ data.state?item.value:'—' }}</strong></div></article>
       </div>
-      <p v-if="!view.kitchen?.length" class="sr-empty">请先启用插件并刷新餐厅数据。</p>
-    </template>
-    <template v-if="activeTab === 'supplies'">
-      <h3>食材商店与仓库</h3><p class="sr-muted">可用库存已扣除本插件厨房预留。购买前会显示本次魔力支出。</p>
-      <div class="sr-grid">
-        <article class="sr-card" v-for="item in data.config?.ingredients || []" :key="item.key">
-          <h3>{{ item.name }}</h3><p>可用 {{ number(available(item.key)) }} <small>／总计 {{ number(data.inventory?.ingredients?.[item.key]) }}</small></p>
-          <p>{{ number(item.price) }} 魔力 / 份</p>
-          <div class="sr-actions"><input type="number" min="1" max="10000" v-model.number="quantities[item.key]" :aria-label="`${item.name}购买数量`"><button :disabled="blocked" @click="buy(item)">购买</button></div>
-        </article>
-      </div>
-      <h3 class="sr-section-head">菜品手册</h3>
-      <div class="sr-grid"><article v-for="dish in data.config?.dishes || []" :key="dish.key" class="sr-card">
-        <h3>{{ dish.name }}</h3><p>{{ dish.cook_time }} 秒 · 售价 {{ number(dish.sell_price ?? dish.price) }} 魔力</p><p class="sr-muted">{{ recipeText(dish.key) }}</p>
-        <span class="sr-badge">{{ state.unlocked?.dishes?.includes(dish.key)?'已解锁':`需 ${number(dish.unlock_popularity)} 欢迎值` }}</span>
-      </article></div>
-      <h3 class="sr-section-head">烹饪工具</h3><div class="sr-actions sr-wrap"><span v-for="tool in data.config?.tools || []" :key="tool.key" class="sr-badge">{{ tool.name }} · {{ data.inventory?.tools?.[tool.key]?'已解锁':'未解锁' }}</span></div>
-    </template>
-    <template v-if="activeTab === 'staff'">
-      <h3>员工管理</h3><p class="sr-muted">雇佣后在厨房分配到灶台，再开启“运行已雇员工”。每次雇佣 1 人，价格取站点当前报价。</p>
-      <div class="sr-grid"><article class="sr-card" v-for="role in roles" :key="role.key">
-        <h3>{{ role.label }}</h3><p>已雇佣 {{ data.staff?.inventory?.[role.key] || 0 }} / {{ data.staff?.capacity?.[role.key] || 0 }} · 空闲 {{ data.staff?.available?.[role.key] || 0 }}</p>
-        <p>下一位 {{ number(data.staff?.next_prices?.[role.key]) }} 魔力</p><button :disabled="blocked || !data.staff?.next_prices?.[role.key]" @click="hire(role)">雇佣 1 人</button>
-      </article></div>
-      <p v-for="(pkg,i) in data.config?.staff?.packages || []" :key="i">{{ number(pkg.threshold) }} 欢迎值：厨师 +{{ pkg.limits?.chef?.count || 0 }}，服务员 +{{ pkg.limits?.server?.count || 0 }} {{ pkg.unlocked?'✓':'' }}</p>
-    </template>
-    <template v-if="activeTab === 'visits'">
-      <h3>下馆子 <small>今日 {{ data.visits?.count || 0 }} / {{ data.visits?.limit || 3 }}</small></h3>
-      <section class="sr-card">
-        <div class="sr-card-title"><h3>自动下馆子 · {{ view.automation?.visit_enabled?'已开启':'已关闭' }}</h3><button @click="emit('switch','config')">设置名单与通知</button></div>
-        <p>{{ view.automation?.visits?.message || '可指定最多 3 人；全部留空时每天随机到访 3 人。' }}</p>
-        <p v-for="(attempt,name) in view.automation?.visits?.attempts || {}" :key="name" class="sr-muted">{{ attempt.username }} · {{ attempt.message }}</p>
+      <section class="sr-card sr-automation" aria-label="后台自动经营状态">
+        <div class="sr-card-title sr-card-band"><h3><v-icon icon="mdi-robot-outline" size="19" color="success" />后台自动经营 <v-chip :color="view.automation?.enabled?'success':'default'">{{ view.automation?.enabled?'已开启':'已暂停' }}</v-chip></h3><v-btn variant="text" prepend-icon="mdi-tune-variant" @click="emit('switch','config')">{{ view.automation?.enabled?'暂停 / 调整托管':'设置自动经营' }}</v-btn></div>
+        <div class="sr-card-body sr-automation-body">
+          <div><p>{{ view.automation?.enabled ? (view.automation.message || '等待后台首次检查') : '可在配置中开启每日自动经营。' }}</p><p class="sr-hint">{{ view.automation?.last_check ? `最近检查 ${new Date(view.automation.last_check*1000).toLocaleTimeString()}` : '等待后台检查' }} · 关闭页面后继续运行</p></div>
+          <div class="sr-budget-meter"><div><span>今日补货预算</span><strong>{{ number(view.automation?.spent) }} / {{ number(view.automation?.daily_budget) }}</strong></div><v-progress-linear :model-value="Math.min(100,Number(view.automation?.spent||0)/Math.max(1,Number(view.automation?.daily_budget||0))*100)" color="success" height="5" rounded aria-label="今日补货预算使用比例" /></div>
+        </div>
       </section>
-      <div class="sr-actions sr-wrap"><input v-model.trim="targetName" maxlength="64" placeholder="输入餐馆主人用户名" aria-label="餐馆主人用户名"><button :disabled="busy || !targetName" @click="lookup">查询</button><button :disabled="busy" @click="recommend">随机推荐</button><button class="sr-primary" :disabled="blocked || !targetName" @click="visit(targetName)">前往用餐</button></div>
-      <div class="sr-grid"><article v-for="item in recommendations" :key="item.username" class="sr-card"><h3>{{ item.username }}</h3><p>{{ item.message || '可查询餐馆详情后前往' }}</p><button :disabled="blocked || item.can_visit===false" @click="visit(item.username)">前往用餐</button></article></div>
-      <h3 class="sr-section-head">今日到访</h3><p v-for="(record,i) in data.visits?.records || []" :key="i">{{ record.target_username }}</p>
-    </template>
-    <template v-if="activeTab === 'logs'">
-      <div class="sr-section-head"><h3>经营日志</h3><label>最近 <select v-model.number="logDays"><option :value="0">全部</option><option :value="7">7 天</option><option :value="30">30 天</option></select></label></div>
-      <p class="sr-muted">站点返回的 {{ data.logs?.length || 0 }} 条记录；筛选内净收益 {{ number(filteredLogs.reduce((n,r)=>n+Number(r.net_earnings||0),0)) }} 魔力。</p>
-      <div class="sr-table-wrap"><table><thead><tr><th>日期</th><th>顾客完成 / 总数</th><th>欢迎值</th><th>净收益</th><th>流失</th></tr></thead><tbody><tr v-for="log in filteredLogs" :key="log.log_date"><td>{{ log.log_date }}</td><td>{{ log.customers_served }} / {{ log.customers_total }}</td><td>{{ number(log.popularity_change) }}</td><td>{{ number(log.net_earnings) }}</td><td>{{ log.details?.left || 0 }}</td></tr></tbody></table></div>
-      <h3 class="sr-section-head">最近操作</h3><div class="sr-table-wrap"><table><thead><tr><th>时间</th><th>操作</th><th>结果</th></tr></thead><tbody><tr v-for="(event,i) in view.events || []" :key="i"><td>{{ new Date(event.time*1000).toLocaleString() }}</td><td>{{ actionLabels[event.action] || event.action }}</td><td>{{ event.message }}</td></tr></tbody></table></div>
-    </template>
-    <div v-if="confirmation" class="sr-overlay" role="presentation" @click.self="cancelConfirm">
-      <section class="sr-dialog" role="dialog" aria-modal="true" aria-labelledby="sr-confirm-title"><h3 id="sr-confirm-title">{{ confirmation.title }}</h3><p>{{ confirmation.text }}</p><div class="sr-actions"><button @click="cancelConfirm">取消</button><button class="sr-primary" @click="acceptConfirm">确认</button></div></section>
-    </div>
+      <v-tabs v-model="activeTab" color="success" density="compact" show-arrows class="sr-tabs" aria-label="餐厅功能">
+        <v-tab v-for="tab in tabs" :key="tab.id" :value="tab.id" :prepend-icon="tab.icon">{{ tab.label }}</v-tab>
+      </v-tabs>
+      <div v-if="activeTab==='kitchen'" class="sr-stack">
+        <section class="sr-card">
+          <div class="sr-card-title sr-card-band sr-band-brown"><h3><v-icon icon="mdi-stove" size="19" />厨房与餐位</h3><div class="sr-actions"><v-chip>排队 {{ state.queued_customers || 0 }}</v-chip><v-chip>剩余 {{ state.customers_remaining ?? '—' }}</v-chip></div></div>
+          <div class="sr-card-body sr-stack">
+            <div class="sr-toolbar"><v-btn prepend-icon="mdi-storefront-outline" :disabled="blocked || state.session_status!=='ready' || !state.customers_total" @click="startSession">开始今日经营</v-btn><v-switch v-model="runStaff" label="运行已雇员工" color="success" hide-details density="compact" :disabled="blocked || !data.staff?.unlocked" /><span class="sr-hint">{{ view.automation?.active || view.automation?.enabled?'后台托管中，手动操作已暂停':'员工按同编号餐位服务，仅在页面可见时执行' }}</span></div>
+            <div class="sr-kitchen-grid">
+              <article v-for="stove in view.kitchen || []" :key="stove.index" class="sr-stove" :class="`sr-stove-${stove.status}`">
+                <div class="sr-card-title"><h3><v-icon icon="mdi-fire" size="18" :color="stove.status==='idle'?'grey':'orange'" />灶台 {{ stove.index }}</h3><v-chip :color="stove.status==='ready'?'success':stove.status==='idle'?'default':'orange'">{{ stoveStatus(stove) }}</v-chip></div>
+                <div class="sr-seat" :class="{occupied:customerAt(stove.index)}">
+                  <template v-if="cleaningLeft(stove.index)>0"><v-icon icon="mdi-broom" size="20" />餐位清理中 · {{ cleaningLeft(stove.index) }} 秒</template>
+                  <template v-else-if="customerAt(stove.index)"><strong>餐位 {{ stove.index }} · {{ dishName(customerAt(stove.index).dish_key) }}</strong><span>耐心剩余 {{ patience(customerAt(stove.index)) }} 秒</span><v-progress-linear :model-value="Math.min(100,patience(customerAt(stove.index))/(customerAt(stove.index).patience||60)*100)" color="success" height="4" rounded /></template>
+                  <template v-else><v-icon icon="mdi-seat-outline" size="22" /><span>餐位 {{ stove.index }} · 等待顾客</span></template>
+                </div>
+                <v-select v-if="stove.status==='idle'" v-model="selected[stove.index]" :items="dishOptions" label="选择菜品" :aria-label="`灶台 ${stove.index} 菜品`" :disabled="blocked" />
+                <h4 v-else>{{ dishName(stove.dish_key) }}</h4>
+                <p v-if="stove.dish_key" class="sr-hint">{{ recipeText(stove.dish_key) }}</p>
+                <div class="sr-actions sr-wrap">
+                  <v-btn v-if="stove.status==='idle'" :disabled="blocked || !selected[stove.index]" @click="act('assign_dish',{station_index:stove.index,dish_key:selected[stove.index]})">选择菜品</v-btn>
+                  <template v-if="stove.status==='prepping'"><v-btn :disabled="blocked" @click="act('prepare',{station_index:stove.index})">备齐食材与工具</v-btn><v-btn :disabled="blocked || !prepared(stove)" @click="act('cook',{station_index:stove.index})">开始烹饪</v-btn><v-btn color="default" variant="text" :disabled="blocked" @click="act('cancel',{station_index:stove.index})">取消</v-btn></template>
+                  <v-chip v-if="stove.status==='cooking'" color="orange" prepend-icon="mdi-timer-sand">烹饪中 · {{ remaining(stove.ready_at) }} 秒</v-chip>
+                  <template v-if="stove.status==='ready'"><v-select v-model="serveTargets[stove.index]" :items="seatOptions(stove)" label="上菜餐位" class="sr-full-width" :disabled="blocked" :aria-label="`灶台 ${stove.index} 上菜餐位`" /><v-btn :disabled="blocked || !serveTargets[stove.index]" @click="act('serve',{station_index:stove.index,customer_id:serveTargets[stove.index]})">上菜</v-btn><v-btn color="default" :disabled="blocked" @click="askReturn(stove)">归位</v-btn><v-btn color="error" variant="text" :disabled="blocked" @click="askDiscard(stove)">丢弃</v-btn></template>
+                </div>
+                <div v-if="data.staff?.unlocked" class="sr-staff-actions"><v-btn v-for="role in roles" :key="role.key" :prepend-icon="role.icon" :color="assigned(stove.index,role.key)?'success':'default'" size="x-small" :disabled="blocked || (!assigned(stove.index,role.key) && !data.staff?.available?.[role.key])" @click="act('update_staff_assignment',{station_index:stove.index,role:role.key,assigned:assigned(stove.index,role.key)?0:1})">{{ role.label }} · {{ assigned(stove.index,role.key)?'已上岗':'分配' }}</v-btn></div>
+              </article>
+            </div>
+            <div v-if="!view.kitchen?.length" class="sr-empty"><v-icon icon="mdi-storefront-outline" size="32" /><p>请先启用插件并刷新餐厅数据</p></div>
+            <p class="sr-hint">选择菜品 → 备齐食材与工具 → 开始烹饪 → 上菜。刷新页面可继续厨房进度。</p>
+          </div>
+        </section>
+      </div>
+      <div v-if="activeTab==='supplies'" class="sr-stack">
+        <section class="sr-card"><div class="sr-card-title sr-card-band sr-band-orange"><h3><v-icon icon="mdi-basket-outline" size="19" />食材商店与仓库</h3><span class="sr-hint">可用库存已扣除厨房预留</span></div><div class="sr-card-body sr-grid">
+          <article class="sr-item" v-for="item in data.config?.ingredients || []" :key="item.key"><h3>{{ item.name }}<v-chip color="orange">{{ number(item.price) }} 魔力 / 份</v-chip></h3><p class="sr-inventory-value">{{ number(available(item.key)) }}<span> 可用 / {{ number(data.inventory?.ingredients?.[item.key]) }} 总计</span></p><div class="sr-actions"><v-text-field v-model.number="quantities[item.key]" type="number" min="1" max="10000" label="数量" :aria-label="`${item.name}购买数量`" /><v-btn color="orange" :disabled="blocked" @click="buy(item)">购买</v-btn></div></article>
+          <p v-if="!data.config?.ingredients?.length" class="sr-empty">暂无食材数据，请刷新餐厅</p>
+        </div></section>
+        <section class="sr-card"><div class="sr-card-title sr-card-band"><h3><v-icon icon="mdi-book-open-page-variant-outline" size="19" />菜品手册</h3></div><div class="sr-card-body sr-grid"><article v-for="dish in data.config?.dishes || []" :key="dish.key" class="sr-item"><h3>{{ dish.name }}<v-chip :color="state.unlocked?.dishes?.includes(dish.key)?'success':'default'">{{ state.unlocked?.dishes?.includes(dish.key)?'已解锁':`需 ${number(dish.unlock_popularity)} 欢迎值` }}</v-chip></h3><p>{{ dish.cook_time }} 秒 · 售价 {{ number(dish.sell_price ?? dish.price) }} 魔力</p><p class="sr-hint">{{ recipeText(dish.key) }}</p></article></div><div class="sr-tools"><span class="sr-hint">烹饪工具</span><v-chip v-for="tool in data.config?.tools || []" :key="tool.key" :color="data.inventory?.tools?.[tool.key]?'success':'default'">{{ tool.name }} · {{ data.inventory?.tools?.[tool.key]?'已解锁':'未解锁' }}</v-chip></div></section>
+      </div>
+      <section v-if="activeTab==='staff'" class="sr-card"><div class="sr-card-title sr-card-band sr-band-blue"><h3><v-icon icon="mdi-account-group-outline" size="19" />员工管理</h3></div><div class="sr-card-body sr-stack"><p class="sr-hint">雇佣后在厨房分配到灶台，再开启“运行已雇员工”。每次雇佣 1 人，使用站点当前报价。</p><div class="sr-staff-grid"><article v-for="role in roles" :key="role.key" class="sr-item"><h3><v-icon :icon="role.icon" color="info" />{{ role.label }}</h3><p>已雇佣 {{ data.staff?.inventory?.[role.key] || 0 }} / {{ data.staff?.capacity?.[role.key] || 0 }} · 空闲 {{ data.staff?.available?.[role.key] || 0 }}</p><div class="sr-card-title"><strong>下一位 {{ number(data.staff?.next_prices?.[role.key]) }} 魔力</strong><v-btn color="info" :disabled="blocked || !data.staff?.next_prices?.[role.key]" @click="hire(role)">雇佣 1 人</v-btn></div></article></div><p v-for="(pkg,i) in data.config?.staff?.packages || []" :key="i" class="sr-hint">{{ number(pkg.threshold) }} 欢迎值：厨师 +{{ pkg.limits?.chef?.count || 0 }}，服务员 +{{ pkg.limits?.server?.count || 0 }} {{ pkg.unlocked?'· 已解锁':'' }}</p></div></section>
+      <div v-if="activeTab==='visits'" class="sr-stack">
+        <section class="sr-card"><div class="sr-card-title sr-card-band sr-band-pink"><h3><v-icon icon="mdi-silverware-fork-knife" size="19" />下馆子 <v-chip color="pink">今日 {{ data.visits?.count || 0 }} / {{ data.visits?.limit || 3 }}</v-chip></h3><v-btn color="pink" variant="text" prepend-icon="mdi-tune-variant" @click="emit('switch','config')">设置名单与通知</v-btn></div><div class="sr-card-body sr-stack">
+          <div class="sr-visit-status"><v-icon icon="mdi-robot-outline" color="pink" size="24" /><div><h3>自动下馆子 · {{ view.automation?.visit_enabled?'已开启':'已关闭' }}</h3><p class="sr-hint">{{ view.automation?.visits?.message || '可指定最多 3 人；全部留空时每天随机到访 3 人。' }}</p></div></div>
+          <div v-if="Object.keys(view.automation?.visits?.attempts || {}).length" class="sr-visit-results"><div v-for="(attempt,name) in view.automation.visits.attempts" :key="name" class="sr-visit-result"><v-icon icon="mdi-account-circle-outline" color="pink" size="22" /><div><strong>{{ attempt.username }}</strong><p class="sr-hint">{{ attempt.message }}</p></div></div></div>
+          <div class="sr-visit-search"><v-text-field v-model.trim="targetName" maxlength="64" label="餐馆主人用户名" aria-label="餐馆主人用户名" prepend-inner-icon="mdi-account-search-outline" @keydown.enter="targetName && !busy && lookup()" /><v-btn color="pink" :disabled="busy || !targetName" @click="lookup">查询</v-btn><v-btn color="purple" :disabled="busy" @click="recommend">随机推荐</v-btn><v-btn color="pink" :disabled="blocked || !targetName" @click="visit(targetName)">前往用餐</v-btn></div>
+          <p v-if="view.automation?.active || view.automation?.enabled" class="sr-hint">后台托管中，可查询和推荐；手动到访请先在配置中暂停后台任务。</p>
+          <div v-if="recommendations.length" class="sr-grid"><article v-for="item in recommendations" :key="item.username" class="sr-item"><h3>{{ item.username }}</h3><p class="sr-hint">{{ item.message || '可查询餐馆详情后前往' }}</p><v-btn color="pink" :disabled="blocked || item.can_visit===false" @click="visit(item.username)">前往用餐</v-btn></article></div>
+        </div></section>
+        <section class="sr-card"><div class="sr-card-title sr-card-band"><h3><v-icon icon="mdi-map-marker-check-outline" size="19" />今日到访</h3></div><div class="sr-card-body sr-actions sr-wrap"><v-chip v-for="(record,i) in data.visits?.records || []" :key="i" size="small" color="success" prepend-icon="mdi-check-circle-outline">{{ record.target_username }}</v-chip><p v-if="!data.visits?.records?.length" class="sr-hint">今天还没有到访记录</p></div></section>
+      </div>
+      <div v-if="activeTab==='logs'" class="sr-stack">
+        <section class="sr-card"><div class="sr-card-title sr-card-band sr-band-blue"><h3><v-icon icon="mdi-chart-timeline-variant" size="19" />经营日志</h3><v-select v-model="logDays" :items="[{title:'全部记录',value:0},{title:'最近 7 天',value:7},{title:'最近 30 天',value:30}]" aria-label="日志日期范围" class="sr-log-filter" /></div><div class="sr-card-body"><p class="sr-hint">站点返回 {{ data.logs?.length || 0 }} 条记录；筛选内净收益 {{ number(filteredLogs.reduce((n,r)=>n+Number(r.net_earnings||0),0)) }} 魔力。</p></div><v-table density="compact" class="sr-table"><thead><tr><th>日期</th><th>顾客完成 / 总数</th><th>欢迎值</th><th>净收益</th><th>流失</th></tr></thead><tbody><tr v-for="log in filteredLogs" :key="log.log_date"><td>{{ log.log_date }}</td><td>{{ log.customers_served }} / {{ log.customers_total }}</td><td>{{ number(log.popularity_change) }}</td><td>{{ number(log.net_earnings) }}</td><td>{{ log.details?.left || 0 }}</td></tr><tr v-if="!filteredLogs.length"><td colspan="5" class="sr-empty">暂无符合条件的经营记录</td></tr></tbody></v-table></section>
+        <section class="sr-card"><div class="sr-card-title sr-card-band"><h3><v-icon icon="mdi-history" size="19" />最近操作</h3></div><v-table density="compact" class="sr-table"><thead><tr><th>时间</th><th>操作</th><th>结果</th></tr></thead><tbody><tr v-for="(event,i) in view.events || []" :key="i"><td>{{ new Date(event.time*1000).toLocaleString() }}</td><td>{{ actionLabels[event.action] || event.action }}</td><td class="sr-event-message">{{ event.message }}</td></tr><tr v-if="!view.events?.length"><td colspan="3" class="sr-empty">暂无最近操作</td></tr></tbody></v-table></section>
+      </div>
+      <v-dialog :model-value="!!confirmation" max-width="460" @update:model-value="value=>!value && cancelConfirm()" aria-labelledby="sr-confirm-title">
+        <v-card class="sr-confirm-card" rounded="lg"><v-card-title id="sr-confirm-title">{{ confirmation?.title }}</v-card-title><v-card-text>{{ confirmation?.text }}</v-card-text><v-card-actions><v-spacer /><v-btn color="default" variant="text" @click="cancelConfirm">取消</v-btn><v-btn color="success" variant="tonal" @click="acceptConfirm">确认</v-btn></v-card-actions></v-card>
+      </v-dialog>
+    </v-defaults-provider>
   </section>
 </template>
 
@@ -127,12 +99,15 @@ const now = ref(Date.now()/1000), confirmation = ref(null)
 let clockOffset=0, timer=null, clock=null, alive=false, confirmResolver=null
 const data = computed(()=>view.value.restaurant || {}), state = computed(()=>data.value.state || {})
 const blocked = computed(()=>busy.value || !!view.value.uncertain || !!view.value.automation?.enabled || !!view.value.automation?.active || !data.value.state)
-const tabs = [{id:'kitchen',label:'厨房与餐位'},{id:'supplies',label:'食材与菜品'},{id:'staff',label:'员工'},{id:'visits',label:'下馆子'},{id:'logs',label:'经营日志'}]
-const roles = [{key:'chef',label:'🧑‍🍳 厨师'},{key:'server',label:'💁 服务员'}]
+const uiDefaults = { VBtn: { size: 'small', variant: 'tonal', color: 'success' }, VTextField: { density: 'compact', variant: 'outlined', hideDetails: 'auto', color: 'success' }, VSelect: { density: 'compact', variant: 'outlined', hideDetails: 'auto', color: 'success' }, VChip: { size: 'x-small', variant: 'tonal' } }
+const dishOptions = computed(()=>unlockedDishes.value.map(d=>({title:`${d.name} · ${d.cook_time} 秒`,value:d.key})))
+const seatOptions = stove=>matchingCustomers(stove).map(c=>({title:`餐位 ${c.seat} · ${patience(c)} 秒`,value:c.id}))
+const tabs = [{id:'kitchen',label:'厨房与餐位',icon:'mdi-stove'},{id:'supplies',label:'食材与菜品',icon:'mdi-basket-outline'},{id:'staff',label:'员工',icon:'mdi-account-tie-outline'},{id:'visits',label:'下馆子',icon:'mdi-silverware-fork-knife'},{id:'logs',label:'经营日志',icon:'mdi-text-box-outline'}]
+const roles = [{key:'chef',label:'厨师',icon:'mdi-chef-hat'},{key:'server',label:'服务员',icon:'mdi-account-tie-outline'}]
 const actionLabels = {purchase_ingredient:'购买食材',hire_staff:'雇佣员工',update_staff_assignment:'员工调度',start_session:'开始营业',visit_restaurant:'下馆子',serve_customer:'上菜',discard_dish:'丢弃菜品',customer_left:'顾客离席',resolve:'核对解锁',automation:'自动经营',auto_visit:'自动下馆子',notification:'通知'}
 const number = n => Number(n || 0).toLocaleString()
 const statusLabel = computed(()=>({ready:'准备营业',open:'营业中',closed:'已闭店'}[state.value.session_status] || '未连接'))
-const stats = computed(()=>[{label:'魔力余额',value:number(data.value.user?.magic)},{label:'受欢迎值',value:number(state.value.popularity)},{label:'今日顾客',value:`${state.value.customers_served || 0} / ${state.value.customers_total || 0}`},{label:'今日净收益',value:number(state.value.net_earnings_today)},{label:'累计净收益',value:number(state.value.net_earnings_total)}])
+const stats = computed(()=>[{label:'魔力余额',icon:'mdi-auto-fix',accent:'245,158,11',value:number(data.value.user?.magic)},{label:'受欢迎值',icon:'mdi-heart-outline',accent:'236,72,153',value:number(state.value.popularity)},{label:'今日顾客',icon:'mdi-account-group-outline',accent:'34,197,94',value:`${state.value.customers_served || 0} / ${state.value.customers_total || 0}`},{label:'今日净收益',icon:'mdi-cash-plus',accent:'59,130,246',value:number(state.value.net_earnings_today)},{label:'累计净收益',icon:'mdi-chart-line',accent:'139,92,246',value:number(state.value.net_earnings_total)}])
 const unlockedDishes = computed(()=>(data.value.config?.dishes || []).filter(d=>state.value.unlocked?.dishes?.includes(d.key)))
 const filteredLogs = computed(()=>(data.value.logs || []).filter(l=>!logDays.value || Date.parse(`${l.log_date}T00:00:00+08:00`) >= now.value*1000-logDays.value*86400000))
 const dish = key=>(data.value.config?.dishes || []).find(d=>d.key===key)

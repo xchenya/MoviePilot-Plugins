@@ -1,6 +1,6 @@
 // Mount the real compiled Vue components against a synthetic MP API in jsdom.
 import assert from 'node:assert/strict'
-import { createRequire } from 'node:module'
+import { createRequire, registerHooks } from 'node:module'
 import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import path from 'node:path'
@@ -11,15 +11,30 @@ const require = createRequire(path.join(plugin, 'package.json'))
 const { JSDOM } = require('jsdom')
 const { parse, compileScript } = require('@vue/compiler-sfc')
 const dom = new JSDOM('<!doctype html><div id="app"></div>', {url:'https://mp.test/',pretendToBeVisual:true})
-for (const key of ['window','document','Element','SVGElement','HTMLElement','Node','Event']) {
+for (const key of ['window','document','Element','SVGElement','HTMLElement','Node','Event','ShadowRoot','Document']) {
   globalThis[key] = dom.window[key]
 }
+// Mount MoviePilot's real Vuetify controls; Node only skips stylesheet loading.
+registerHooks({ load(url, context, nextLoad) {
+  if (url.endsWith('.css')) return { format: 'module', source: 'export default {}', shortCircuit: true }
+  return nextLoad(url, context)
+} })
+window.matchMedia = query => ({ matches: false, media: query, addEventListener() {}, removeEventListener() {} })
+globalThis.visualViewport = undefined
+globalThis.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} }
+globalThis.requestAnimationFrame = window.requestAnimationFrame.bind(window)
+globalThis.cancelAnimationFrame = window.cancelAnimationFrame.bind(window)
+globalThis.getComputedStyle = window.getComputedStyle.bind(window)
+const { createVuetify } = await import(pathToFileURL(require.resolve('vuetify')).href)
+const components = await import(pathToFileURL(require.resolve('vuetify/components')).href)
+const directives = await import(pathToFileURL(require.resolve('vuetify/directives')).href)
+const installUi = app => app.use(createVuetify({ components, directives }))
 const { createApp, nextTick } = await import(pathToFileURL(require.resolve('vue')).href)
 const output = mkdtempSync(path.join(plugin,'.ui-test-'))
 let app
 const settle = async()=>{for(let i=0;i<5;i++){await new Promise(r=>setTimeout(r,0));await nextTick()}}
 const click = async text=>{
-  const b=[...document.querySelectorAll('button')].find(b=>b.textContent.trim()===text)
+  const b=[...document.querySelectorAll('button')].find(b=>(b.textContent.trim()===text || b.getAttribute('aria-label')===text))
   assert(b,`missing button: ${text}`);assert(!b.disabled,`disabled button: ${text}`)
   b.click();await settle()
 }
@@ -39,7 +54,7 @@ const response=()=>({success:true,message:'完成',restaurant:structuredClone(re
 const calls=[]
 const api={get:async()=>response(),post:async(url,payload)=>{calls.push({url,payload});return response()}}
 try {
-  app=createApp(await component('Page'),{api,pluginId:'SiqiRestaurant_test'});app.mount('#app');await settle()
+  app=createApp(await component('Page'),{api,pluginId:'SiqiRestaurant_test'});installUi(app).mount('#app');await settle()
   assert(document.body.textContent.includes('1,000'))
   assert.equal(document.querySelector('input[type="checkbox"]').checked,false)
   await click('食材与菜品')
@@ -65,14 +80,15 @@ try {
   const configCalls=[]
   const configApi={get:async()=>({enabled:true,use_proxy:false,cookie_configured:true,site_configured:true}),
     post:async(url,payload)=>{configCalls.push(payload);return {success:true,message:'已保存',config:{...payload,cookie:undefined,cookie_configured:true,site_configured:true}}}}
-  app=createApp(await component('Config'),{api:configApi});app.mount('#app');await settle()
+  app=createApp(await component('Config'),{api:configApi});installUi(app).mount('#app');await settle()
+  await click('连接与凭据站点已关联Cookie 已配置')
   const password=document.querySelector('input[type=password]');assert.equal(password.value,'')
   await click('保存配置');assert.equal(configCalls.length,1);assert.equal(configCalls[0].cookie,'')
   assert.equal(configCalls[0].auto_enabled,false)
   assert.equal(configCalls[0].daily_budget,5000)
   assert.equal(configCalls[0].magic_reserve,10000)
-  const autoBox=[...document.querySelectorAll('label')].find(l=>l.textContent.includes('后台自动经营')).querySelector('input')
-  autoBox.checked=true;autoBox.dispatchEvent(new Event('change',{bubbles:true}));await settle()
+  const autoBox=document.querySelector('input[aria-label="后台自动经营"]')
+  autoBox.click();await settle()
   await click('保存配置');assert.equal(configCalls.at(-1).auto_enabled,true)
   assert.equal(configCalls.at(-1).auto_visit,false)
   assert.equal(configCalls.at(-1).notify,false)
@@ -82,8 +98,8 @@ try {
     input.dispatchEvent(new Event('change',{bubbles:true}))
   }
   for(const label of ['自动下馆子','发送运行通知']){
-    const box=[...document.querySelectorAll('label.sr-setting')].find(l=>l.textContent.includes(label)).querySelector('input')
-    box.checked=true;box.dispatchEvent(new Event('change',{bubbles:true}))
+    const box=document.querySelector(`input[aria-label="${label}"]`)
+    box.click()
   }
   await settle();await click('保存配置')
   assert.deepEqual(configCalls.at(-1).visit_targets,['Alice','Bob','Carol'])
@@ -92,7 +108,7 @@ try {
   assert.equal(document.querySelector('.sr-visit-fields input').value,'Alice')
   app.unmount();app=null;document.querySelector('#app').innerHTML=''
   const autoApi={get:async()=>({...response(),automation:{enabled:true,spent:48,daily_budget:5000,message:'后台正在烹饪'}}),post:async()=>{throw new Error('unexpected page write')}}
-  app=createApp(await component('Page'),{api:autoApi});app.mount('#app');await settle()
+  app=createApp(await component('Page'),{api:autoApi});installUi(app).mount('#app');await settle()
   assert(document.body.textContent.includes('后台正在烹饪'))
   assert([...document.querySelectorAll('button')].find(b=>b.textContent==='开始今日经营').disabled)
   assert(document.querySelector('input[type="checkbox"]').disabled)
