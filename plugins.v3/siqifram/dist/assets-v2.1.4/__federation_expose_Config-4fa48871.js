@@ -1,7 +1,7 @@
 import { importShared } from './__federation_fn_import-054b33c3.js';
 import { _ as _export_sfc } from './_plugin-vue_export-helper-c4c0bc37.js';
 
-const Config_vue_vue_type_style_index_0_scoped_942ab4f7_lang = '';
+const Config_vue_vue_type_style_index_0_scoped_ae7ca15f_lang = '';
 
 const {resolveComponent:_resolveComponent,createVNode:_createVNode,createElementVNode:_createElementVNode,withCtx:_withCtx,toDisplayString:_toDisplayString,createTextVNode:_createTextVNode,openBlock:_openBlock,createBlock:_createBlock,createCommentVNode:_createCommentVNode,normalizeClass:_normalizeClass,createElementBlock:_createElementBlock,normalizeProps:_normalizeProps,guardReactiveProps:_guardReactiveProps,withModifiers:_withModifiers} = await importShared('vue');
 
@@ -228,7 +228,7 @@ return (_ctx, _cache) => {
           })
         ]),
         _cache[21] || (_cache[21] = _createElementVNode("div", null, [
-          _createElementVNode("div", { class: "siqi-topbar__title" }, "思齐农场 · 配置 · v2.1.3"),
+          _createElementVNode("div", { class: "siqi-topbar__title" }, "思齐农场 · 配置 · v2.1.4"),
           _createElementVNode("div", { class: "siqi-topbar__sub" }, "管理定时任务、自动化策略与站点 Cookie")
         ], -1))
       ]),
@@ -724,6 +724,6 @@ return (_ctx, _cache) => {
 }
 
 };
-const Config = /*#__PURE__*/_export_sfc(_sfc_main, [['__scopeId',"data-v-942ab4f7"]]);
+const Config = /*#__PURE__*/_export_sfc(_sfc_main, [['__scopeId',"data-v-ae7ca15f"]]);
 
 export { Config as default };

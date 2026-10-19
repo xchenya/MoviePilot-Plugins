@@ -5,13 +5,13 @@ import concurrent.futures
 import json
 import time
 import base64
-import html
 import hashlib
 import re
 import requests
 import threading
 from functools import wraps
-from urllib.parse import urljoin, urlsplit
+from html.parser import HTMLParser
+from urllib.parse import parse_qs, urljoin, urlsplit
 from pydantic import BaseModel, ConfigDict, Field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -33,6 +33,60 @@ except ImportError:
 # 验证码识别重试次数
 _CAPTCHA_RETRY = 3
 STEAL_CROPS = ("萝卜", "西红柿", "玉米", "茄子", "蘑菇", "樱桃")
+
+
+class _AccountHeaderParser(HTMLParser):
+    """只接受 NexusPHP 登录栏中退出链接前的本站用户资料。"""
+
+    def __init__(self, site_url: str):
+        super().__init__()
+        site = urlsplit(site_url or "")
+        self._site_url = site_url or ""
+        self._origin = (site.scheme, site.netloc)
+        self._header_tag = ""
+        self._header_depth = 0
+        self._anchor = None
+        self._candidate = None
+        self.accounts = set()
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if not self._header_depth and attrs.get("id") == "info_block":
+            self._header_tag, self._header_depth = tag, 1
+        elif self._header_depth and tag == self._header_tag:
+            self._header_depth += 1
+        if not self._header_depth or tag != "a":
+            return
+        self._anchor = None
+        try:
+            link = urlsplit(urljoin(self._site_url, attrs.get("href") or ""))
+        except ValueError:
+            return
+        if (link.scheme, link.netloc) != self._origin:
+            return
+        page = link.path.rsplit("/", 1)[-1]
+        if page == "logout.php" and self._candidate:
+            self.accounts.add(self._candidate)
+            self._candidate = None
+        elif page == "userdetails.php":
+            ids = parse_qs(link.query).get("id", [])
+            if len(ids) == 1 and ids[0].isdigit() and int(ids[0]) > 0:
+                self._anchor = (ids[0], [])
+
+    def handle_data(self, data):
+        if self._anchor is not None:
+            self._anchor[1].append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._anchor is not None:
+            user_id, parts = self._anchor
+            name = " ".join("".join(parts).split())
+            self._candidate = (user_id, name) if name else None
+            self._anchor = None
+        if self._header_depth and tag == self._header_tag:
+            self._header_depth -= 1
+            if not self._header_depth:
+                self._anchor = self._candidate = None
 
 
 class FarmConfig(BaseModel):
@@ -130,7 +184,7 @@ class SiqiFram(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/KoWming/MoviePilot-Plugins/main/icons/siqi.png"
     # 插件版本
-    plugin_version = "2.1.3"
+    plugin_version = "2.1.4"
     # 插件作者
     plugin_author = "KoWming（V3 适配：xchenya）"
     # 作者主页
@@ -691,11 +745,14 @@ class SiqiFram(_PluginBase):
             if not response or not response.text:
                 return {}
             text = response.text
-            username_match = re.search(r"<a[^>]+userdetails\.php\?id=\d+[^>]*>\s*<b>([^<]+)</b>", text)
+            account = _AccountHeaderParser(self._get_site_info()[0])
+            account.feed(text)
+            account.close()
+            username = next(iter(account.accounts))[1] if len(account.accounts) == 1 else ""
             steal_match = re.search(r'id=["\']user-steal-gain["\'][^>]*>\s*([^<]+)\s*</span>', text)
             like_match = re.search(r'id=["\']user-farm-like-total["\'][^>]*>\s*([^<]+)\s*</span>', text)
             return {
-                "current_username": html.unescape(username_match.group(1)).strip() if username_match else "",
+                "current_username": username,
                 "user_steal_gain": self._parse_number(steal_match.group(1)) if steal_match else 0,
                 "user_farm_like_total": self._parse_number(like_match.group(1)) if like_match else 0,
             }
@@ -1319,7 +1376,7 @@ class SiqiFram(_PluginBase):
                 if reschedule and self._enabled and not self._stop_event.is_set():
                     update_plugin_job(self._runtime_plugin_id())
             summary = data.get("summary") or {}
-            username = data.get("current_username") or "-"
+            username = data.get("current_username") or "未识别"
             user_bonus = data.get("user_bonus", "-")
             result = "\n".join([
                 "━━━━━━━━━━━━━━",

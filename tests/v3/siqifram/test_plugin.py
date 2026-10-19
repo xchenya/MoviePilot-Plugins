@@ -77,14 +77,76 @@ def response(data, status=200):
     return result
 
 
+def page_response(markup):
+    result = requests.Response()
+    result.status_code = 200
+    result.encoding = "utf-8"
+    result._content = markup.encode("utf-8")
+    return result
+
+
+@pytest.mark.parametrize("markup, expected", [
+    ('<a href="userdetails.php?id=9"><b>DENON</b></a>'
+     '<table id="info_block"><tr><td><table><tr><td>欢迎，'
+     '<a href="userdetails.php?id=37"><span class="VIP">实际用户</span></a>'
+     ' [<a href="logout.php">退出</a>]</td></tr></table></td></tr></table>', "实际用户"),
+    ("<div id=info_block><a class='user' href='/userdetails.php?foo=1&amp;id=37'>"
+     "<b>Alice &amp; Bob</b></a> <a href='/logout.php'>退出</a></div>", "Alice & Bob"),
+    ('<div id="info_block"><a href="//si-qi.xyz/userdetails.php?id=37">SameSite</a>'
+     '<a href="https://si-qi.xyz/logout.php">退出</a>'
+     '<a href="userdetails.php?id=9"><b>DENON</b></a></div>', "SameSite"),
+    ('<a href="userdetails.php?id=9"><b>DENON</b></a>', ""),
+    ('<div id="info_block"><a href="userdetails.php?id=37">NoLogout</a></div>'
+     '<a href="logout.php">退出</a>', ""),
+    ('<div id="info_block"><a href="https://other.example/userdetails.php?id=37">Foreign</a>'
+     '<a href="logout.php">退出</a></div>', ""),
+    ('<div id="info_block"><a href="userdetails.php?id=0">Invalid</a>'
+     '<a href="logout.php">退出</a></div>', ""),
+    ('<div id="info_block"><a href="userdetails.php?id=37">AccountA</a>'
+     '<a href="logout.php">退出</a></div>'
+     '<div id="info_block"><a href="userdetails.php?id=38">AccountB</a>'
+     '<a href="logout.php">退出</a></div>', ""),
+])
+def test_page_username_comes_only_from_authenticated_header(plugin, monkeypatch, markup, expected):
+    markup += '<span id="user-steal-gain">1,234.5</span><span id="user-farm-like-total">8</span>'
+    monkeypatch.setattr(requests, "get", Mock(return_value=page_response(markup)))
+    assert plugin._get_page_meta() == {"current_username": expected,
+                                      "user_steal_gain": 1234.5, "user_farm_like_total": 8}
+    assert requests.get.call_count == 1
+    requests.post.assert_not_called()
+
+
+@pytest.mark.parametrize("api_name, header, expected", [
+    (None, '<div id="info_block"><a href="userdetails.php?id=37"><span>实际用户</span></a>'
+     '<a href="logout.php">退出</a></div>', "实际用户"),
+    ("ApiAccount", '<div id="info_block"><a href="userdetails.php?id=37">HeaderAccount</a>'
+     '<a href="logout.php">退出</a></div>', "ApiAccount"),
+    (None, "", "未识别"),
+])
+def test_task_notification_and_shared_cache_use_the_resolved_account(plugin, monkeypatch, api_name, header, expected):
+    plugin.init_plugin({"enabled": True, "auto_harvest": False, "auto_plant": False})
+    farm = {"success": True, "seeds": [{"id": 1}], "user_lands": [], "user_bonus": 411162}
+    if api_name is not None:
+        farm["current_username"] = api_name
+    page = '<a href="userdetails.php?id=9"><b>DENON</b></a>' + header
+    monkeypatch.setattr(requests, "get", Mock(side_effect=[response(farm), page_response(page)]))
+    plugin._farm_task()
+    text = plugin.post_message.call_args.kwargs["text"]
+    assert f"👤 用户：{expected}" in text
+    assert "DENON" not in text
+    assert "🪄 魔力值：411162" in text
+    assert plugin._get_data()["current_username"] == ("" if expected == "未识别" else expected)
+    requests.post.assert_not_called()
+
+
 def test_market_and_api_contract(plugin, module):
     entry = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))["SiqiFram"]
-    assert plugin.plugin_version == entry["version"] == "2.1.3"
+    assert plugin.plugin_version == entry["version"] == "2.1.4"
     assert entry["system_version"] == ">=3.0.0"
     assert entry["release"] is True  # Federation packaging requirement.
     assert "KoWming" in plugin.plugin_author
     assert "GNU GENERAL PUBLIC LICENSE" in (PLUGIN / "LICENSE").read_text(encoding="utf-8")
-    assert plugin.get_render_mode() == ("vue", "dist/assets-v2.1.3")
+    assert plugin.get_render_mode() == ("vue", "dist/assets-v2.1.4")
     assert (PLUGIN / plugin.get_render_mode()[1] / "remoteEntry.js").is_file()
     routes = plugin.get_api()
     assert len(routes) == 28

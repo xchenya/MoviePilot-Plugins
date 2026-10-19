@@ -6,7 +6,7 @@
           <v-icon icon="mdi-cog-outline" size="24" />
         </div>
         <div>
-          <div class="siqi-topbar__title">思齐农场 · 配置 · v2.1.3</div>
+          <div class="siqi-topbar__title">思齐农场 · 配置 · v2.1.4</div>
           <div class="siqi-topbar__sub">管理定时任务、自动化策略与站点 Cookie</div>
         </div>
       </div>
