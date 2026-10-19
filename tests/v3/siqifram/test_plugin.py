@@ -141,12 +141,12 @@ def test_task_notification_and_shared_cache_use_the_resolved_account(plugin, mon
 
 def test_market_and_api_contract(plugin, module):
     entry = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))["SiqiFram"]
-    assert plugin.plugin_version == entry["version"] == "2.1.4"
+    assert plugin.plugin_version == entry["version"] == "2.2.0"
     assert entry["system_version"] == ">=3.0.0"
     assert entry["release"] is True  # Federation packaging requirement.
     assert "KoWming" in plugin.plugin_author
     assert "GNU GENERAL PUBLIC LICENSE" in (PLUGIN / "LICENSE").read_text(encoding="utf-8")
-    assert plugin.get_render_mode() == ("vue", "dist/assets-v2.1.4")
+    assert plugin.get_render_mode() == ("vue", "dist/assets-v2.2.0")
     assert (PLUGIN / plugin.get_render_mode()[1] / "remoteEntry.js").is_file()
     routes = plugin.get_api()
     assert len(routes) == 28
@@ -196,16 +196,17 @@ def test_crop_config_defaults_subset_empty_and_clone_isolation(plugin, module):
 def test_separate_steal_save_keeps_planting_seed_and_all_other_settings(plugin):
     plugin.init_plugin({"enabled": True, "seed_id": "120", "auto_plant": True,
                         "cron": "20 */3 * * *", "cookie": "session=custom"})
-    before = {k: v for k, v in plugin._get_config().items() if k not in {"auto_steal", "steal_crops"}}
+    before = {k: v for k, v in plugin._get_config().items() if k not in {"auto_steal", "steal_crops", "steal_cron"}}
     saved = plugin._save_steal_config({"auto_steal": True, "steal_crops": ["玉米"],
-                                      "seed_id": "1", "cron": "bad"})
-    assert saved["config"] == {"auto_steal": True, "steal_crops": ["玉米"]}
+                                      "steal_cron": "*/20 * * * *", "seed_id": "1", "cron": "bad"})
+    assert saved["config"] == {"auto_steal": True, "steal_crops": ["玉米"], "steal_cron": "*/20 * * * *"}
     assert {k: v for k, v in plugin._get_config().items() if k in before} == before
     assert plugin.config["seed_id"] == "120"
     plugin._save_config({"notify": False})
     assert plugin._seed_id == "120" and plugin._auto_steal and plugin._steal_crops == ["玉米"]
     plugin.init_plugin(plugin.config)
     assert plugin._seed_id == "120" and plugin._steal_crops == ["玉米"]
+    assert plugin._steal_cron == "*/20 * * * *"
 
 
 @pytest.mark.parametrize("selected", [[], ["萝卜"], ["玉米", "樱桃"]])
@@ -394,7 +395,7 @@ def test_automatic_steal_only_six_named_crops_from_catalog(plugin, monkeypatch):
               if call.kwargs["data"]["action"] == "steal_vegetable"]
     assert result["success"] and len(writes) == 6
     assert [item["plot_index"] for item in writes] == [0, 1, 2, 3, 4, 5]
-    assert plugin._is_daily_action_done("steal")
+    assert not plugin._is_daily_action_done("steal")
 
 
 def test_subset_filters_maturity_and_leaves_daily_retry_available(plugin, monkeypatch):
@@ -455,6 +456,170 @@ def test_crop_filter_supports_legacy_nested_plots(plugin, monkeypatch):
     writes = [call.kwargs["data"] for call in post.call_args_list
               if call.kwargs["data"]["action"] == "steal_vegetable"]
     assert len(writes) == 1 and writes[0]["land_id"] == 3
+
+
+@pytest.mark.parametrize("quota, expected", [
+    ({}, None), ({"max_steal_count": 2}, None),
+    ({"max_steal_count": 0, "steal_count_today": 0}, 0),
+    ({"max_steal_count": 5, "steal_count_today": 2}, 3),
+    ({"max_steal_count": " 5 ", "steal_count_today": "2"}, 3),
+    ({"max_steal_count": 5, "steal_count_today": 8}, 0),
+    ({"max_steal_count": True, "steal_count_today": 0}, None),
+    ({"max_steal_count": 5, "steal_count_today": -1}, None),
+    ({"max_steal_count": 5, "steal_count_today": "bad"}, None),
+])
+def test_steal_quota_never_guesses_missing_or_invalid_counts(plugin, quota, expected):
+    assert plugin._remaining_steals(quota) == expected
+
+
+@pytest.mark.parametrize("quota", [
+    {"max_steal_count": None}, {"steal_count_today": None},
+    {"max_steal_count": 0, "steal_count_today": 0},
+    {"max_steal_count": 20, "steal_count_today": 20},
+])
+def test_unknown_or_zero_target_quota_sends_no_steal_or_finish(plugin, monkeypatch, quota):
+    victim, post = steal_fixture(plugin, monkeypatch)
+    victim.update(quota)
+    result = plugin._steal_once()
+    assert result["success"] is False
+    assert [c.kwargs["data"]["action"] for c in post.call_args_list] == ["get_victim_farm"]
+    assert not plugin._is_daily_action_done("steal")
+
+
+@pytest.mark.parametrize("availability", [
+    {"can_steal": False}, {"can_steal": "0"},
+    {"max_steal_count": 5, "steal_count_today": 5},
+])
+def test_live_farm_precheck_stops_before_selecting_a_target(plugin, monkeypatch, availability):
+    _, post = steal_fixture(plugin, monkeypatch)
+    plugin.get_farm_data.return_value.update(availability)
+    assert not plugin._steal_once()["success"]
+    post.assert_not_called()
+
+
+def test_automatic_steal_caps_writes_at_remaining_count(plugin, monkeypatch):
+    victim, post = steal_fixture(plugin, monkeypatch)
+    victim["steal_count_today"] = 18
+    result = plugin._steal_once()
+    assert result["stolen_count"] == 2
+    actions = [c.kwargs["data"]["action"] for c in post.call_args_list]
+    assert actions.count("get_victim_farm") == 1
+    assert actions.count("steal_vegetable") == 2
+    assert actions.count("finish_stealing") == 1
+
+
+def test_three_schedules_are_separate_and_steal_settings_remain_isolated(plugin, module):
+    plugin.save_data("next_harvest_at", int(time.time()) + 3600)
+    plugin.init_plugin({"enabled": True, "cron": "0 */4 * * *", "auto_steal": True,
+                        "auto_harvest": False, "auto_plant": False, "notify": False})
+    services = {s["id"]: s for s in plugin.get_service()}
+    assert set(services) == {"siqifram", "siqifram-harvest", "siqifram-steal"}
+    assert str(services["siqifram"]["trigger"]) == "cron[month='*', day='*', day_of_week='*', hour='*/4', minute='0']"
+    assert str(services["siqifram-steal"]["trigger"]) == "cron[month='*', day='*', day_of_week='*', hour='*', minute='*/15']"
+    plugin.get_farm_data = Mock(return_value={"success": True, "user_lands": []})
+    plugin._steal_once = Mock(return_value={"success": False, "message": "没有可偷作物"})
+    for key in ("siqifram", "siqifram-harvest"):
+        services[key]["func"](**services[key]["func_kwargs"])
+    plugin._steal_once.assert_not_called()
+    services["siqifram-steal"]["func"]()
+    plugin._steal_once.assert_called_once_with()
+    plugin._save_steal_config({"steal_cron": "invalid"})
+    assert plugin._steal_cron == "*/15 * * * *" and plugin._cron == "0 */4 * * *"
+    plugin._save_steal_config({"auto_steal": False})
+    assert "siqifram-steal" not in {s["id"] for s in plugin.get_service()}
+    assert plugin._get_status()["last_steal_result"] == "没有可偷作物"
+    plugin.post_message.assert_not_called()
+
+
+@pytest.mark.parametrize("close_on_finish", [False, True])
+def test_each_steal_patrol_obeys_live_quota_even_after_old_daily_marker(plugin, monkeypatch, close_on_finish):
+    plugin.init_plugin({"enabled": True, "auto_steal": True, "steal_crops": ["萝卜"]})
+    plugin.save_data("auto_steal_done_date", plugin._today_key())
+    state = {"used": 0, "closed": False}
+
+    def live_farm():
+        return {"success": True, "can_steal": not state["closed"] and state["used"] < 3,
+                "max_steal_count": 3, "steal_count_today": state["used"],
+                "seeds": [{"id": 91, "name": "萝卜"}]}
+
+    def site_post(url, **kwargs):
+        action = kwargs["data"]["action"]
+        if action == "get_victim_farm":
+            return response({"success": True, "victim_id": 88, "max_steal_count": 3,
+                "steal_count_today": state["used"], "victim_plots": [
+                    {"land_id": 3, "plot_index": 0, "seed_id": 91, "is_ready": 1}]})
+        if action == "steal_vegetable":
+            state["used"] += 1
+        elif action == "finish_stealing":
+            state["closed"] = close_on_finish
+        return response({"success": True, "reward": 2})
+
+    plugin.get_farm_data = Mock(side_effect=live_farm)
+    post = Mock(side_effect=site_post)
+    monkeypatch.setattr(requests, "post", post)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    for _ in range(4):
+        plugin._steal_task()
+    expected = 1 if close_on_finish else 3
+    assert state["used"] == expected
+    assert sum(c.kwargs["data"]["action"] == "get_victim_farm" for c in post.call_args_list) == expected
+    assert plugin.post_message.call_count == expected
+    assert "明天再来" in plugin.get_data("last_steal_result")
+    assert plugin._run_activity == ""
+
+
+def test_failed_finish_is_reported_after_partial_success(plugin, monkeypatch):
+    _, post = steal_fixture(plugin, monkeypatch)
+    original = post.side_effect
+    post.side_effect = lambda url, **kwargs: (response({"success": False, "message": "结束被拒绝"})
+        if kwargs["data"]["action"] == "finish_stealing" else original(url, **kwargs))
+    result = plugin._steal_once()
+    assert not result["success"] and result["stolen_count"] == 6
+    assert "结束被拒绝" in result["message"]
+    assert sum(c.kwargs["data"]["action"] == "finish_stealing" for c in post.call_args_list) == 1
+    post.reset_mock()
+    assert not plugin._steal_plot({"victim_id": 88, "land_id": 3, "plot_index": 0})["success"]
+    post.assert_not_called()
+
+
+def test_uncertain_steal_does_not_retry_or_finish_the_session(plugin, monkeypatch):
+    plugin.init_plugin({"enabled": True, "auto_steal": True})
+    _, post = steal_fixture(plugin, monkeypatch)
+    original = post.side_effect
+
+    def uncertain(url, **kwargs):
+        if kwargs["data"]["action"] == "steal_vegetable":
+            raise requests.ReadTimeout("lost response")
+        return original(url, **kwargs)
+
+    post.side_effect = uncertain
+    plugin._steal_task()
+    assert [c.kwargs["data"]["action"] for c in post.call_args_list] == ["get_victim_farm", "steal_vegetable"]
+    assert "结果不明" in plugin.get_data("last_steal_result")
+    assert plugin._run_activity == ""
+    assert plugin._steal_target == {}
+
+
+def test_maturity_waits_for_busy_lock_but_steal_patrol_skips_it(plugin):
+    plugin.init_plugin({"enabled": True, "auto_steal": True})
+    plugin._farm_task = Mock()
+    plugin._steal_once = Mock()
+    entered = threading.Event()
+    with plugin._run_lock:
+        steal = threading.Thread(target=plugin._steal_task)
+        steal.start()
+        steal.join(2)
+        plugin._steal_once.assert_not_called()
+        assert not steal.is_alive()
+        assert plugin.get_data("last_steal_run") is None
+        harvest = threading.Thread(target=lambda: (entered.set(), plugin._harvest_task()))
+        harvest.start()
+        assert entered.wait(2)
+        plugin._farm_task.assert_not_called()
+        assert harvest.is_alive()
+    harvest.join(2)
+    assert not harvest.is_alive()
+    plugin._farm_task.assert_called_once_with(reschedule=True)
 
 
 def test_old_config_normalization_and_schedule(plugin, module):
@@ -589,7 +754,7 @@ def test_real_fastapi_registration_bodies_and_raw_payloads(plugin, monkeypatch):
         "auto_steal": True, "steal_crops": ["玉米"], "seed_id": "1",
     }).json()
     assert stealing == {"success": True, "message": "偷菜配置已保存",
-                        "config": {"auto_steal": True, "steal_crops": ["玉米"]}}
+                        "config": {"auto_steal": True, "steal_crops": ["玉米"], "steal_cron": "*/15 * * * *"}}
     assert client.get("/config").json()["seed_id"] == "9"
     plugin.get_farm_data = Mock(return_value={"success": True,
         "seeds": [{"id": 91, "name": "萝卜", "unlock_harvest": 0},

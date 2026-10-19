@@ -99,6 +99,7 @@ class FarmConfig(BaseModel):
     auto_harvest: bool = True
     auto_sell: bool = False
     auto_steal: bool = False
+    steal_cron: str = "*/15 * * * *"
     steal_crops: List[str] = Field(default_factory=lambda: list(STEAL_CROPS))
     auto_like: bool = False
     use_proxy: bool = False
@@ -132,6 +133,7 @@ class ConfigResult(BaseModel):
 
 class StealConfig(BaseModel):
     auto_steal: bool = False
+    steal_cron: str = "*/15 * * * *"
     steal_crops: List[str] = Field(default_factory=lambda: list(STEAL_CROPS))
 
 
@@ -158,6 +160,9 @@ class FarmStatus(BaseModel):
     last_run: Optional[str]
     last_result: Optional[str]
     farm_status: Optional[FarmResult]
+    steal_cron: str = "*/15 * * * *"
+    last_steal_run: Optional[str] = None
+    last_steal_result: Optional[str] = None
 
 
 class ImageResult(BaseModel):
@@ -184,7 +189,7 @@ class SiqiFram(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/KoWming/MoviePilot-Plugins/main/icons/siqi.png"
     # 插件版本
-    plugin_version = "2.1.4"
+    plugin_version = "2.2.0"
     # 插件作者
     plugin_author = "KoWming（V3 适配：xchenya）"
     # 作者主页
@@ -238,6 +243,7 @@ class SiqiFram(_PluginBase):
         self._run_activity = ""
         self._stop_event = threading.Event()
         self._steal_crops = list(STEAL_CROPS)
+        self._steal_cron = "*/15 * * * *"
         self._steal_target = {}
 
     @staticmethod
@@ -298,6 +304,7 @@ class SiqiFram(_PluginBase):
                     self._auto_harvest = self._to_bool(config.get("auto_harvest", True))
                     self._auto_sell = self._to_bool(config.get("auto_sell", False))
                     self._auto_steal = self._to_bool(config.get("auto_steal", False))
+                    self._steal_cron = self._normalize_cron(config.get("steal_cron"), "*/15 * * * *")
                     self._auto_like = self._to_bool(config.get("auto_like", False))
                     self._use_proxy = self._to_bool(config.get("use_proxy", False))
                     self._use_ai_captcha = self._to_bool(config.get("use_ai_captcha", False))
@@ -339,7 +346,7 @@ class SiqiFram(_PluginBase):
         return []
 
     def get_service(self) -> List[Dict[str, Any]]:
-        """注册动态成熟任务与低频兜底巡检任务。"""
+        """注册独立的总巡检、成熟收获及偷菜巡检。"""
         if not self._enabled:
             return []
 
@@ -355,9 +362,17 @@ class SiqiFram(_PluginBase):
                 "id": "siqifram-harvest",
                 "name": "思齐农场 - 成熟收获",
                 "trigger": "date",
-                "func": self._farm_task,
-                "func_kwargs": {"reschedule": True},
+                "func": self._harvest_task,
+                "func_kwargs": {},
                 "kwargs": {"run_date": self._next_run_time},
+            })
+        if self._auto_steal and self._steal_crops:
+            services.append({
+                "id": "siqifram-steal",
+                "name": "思齐农场 - 偷菜巡检",
+                "trigger": CronTrigger.from_crontab(self._steal_cron, timezone=settings.TZ),
+                "func": self._steal_task,
+                "func_kwargs": {},
             })
         return services
 
@@ -460,6 +475,7 @@ class SiqiFram(_PluginBase):
             "auto_harvest": self._auto_harvest,
             "auto_sell": self._auto_sell,
             "auto_steal": self._auto_steal,
+            "steal_cron": self._steal_cron,
             "steal_crops": list(self._steal_crops),
             "auto_like": self._auto_like,
             "use_proxy": self._use_proxy,
@@ -477,6 +493,7 @@ class SiqiFram(_PluginBase):
             config.get("steal_crops", self._steal_crops)
         )
         config["cron"] = self._normalize_cron(config.get("cron"))
+        config["steal_cron"] = self._normalize_cron(config.get("steal_cron"), "*/15 * * * *")
         config["harvest_delay_minutes"] = max(0, min(30, self._to_int(
             config.get("harvest_delay_minutes"), 2
         )))
@@ -491,7 +508,8 @@ class SiqiFram(_PluginBase):
         return {"success": True, "message": "配置已保存", "config": self._get_config()}
 
     def _get_steal_config(self) -> Dict[str, Any]:
-        return {"auto_steal": self._auto_steal, "steal_crops": list(self._steal_crops)}
+        return {"auto_steal": self._auto_steal, "steal_cron": self._steal_cron,
+                "steal_crops": list(self._steal_crops)}
 
     def _save_steal_config(self, config: dict = None) -> Dict[str, Any]:
         """偷菜接口只接受自身字段，不覆盖种植种子及其他设置。"""
@@ -538,6 +556,9 @@ class SiqiFram(_PluginBase):
             "last_run": self.get_data("last_run"),
             "last_result": self.get_data("last_result"),
             "farm_status": self.get_data("farm_status"),
+            "steal_cron": self._steal_cron,
+            "last_steal_run": self.get_data("last_steal_run"),
+            "last_steal_result": self.get_data("last_steal_result"),
         }
 
     def _get_next_run_time(self) -> str:
@@ -1087,6 +1108,17 @@ class SiqiFram(_PluginBase):
             self.save_data("farm_status", fresh)
         return {"success": True, "message": f"已尝试出售 {len(logs)} 类库存" if logs else "背包暂无可出售库存", "logs": logs, "farm_status": fresh}
 
+    @staticmethod
+    def _remaining_steals(data: Dict[str, Any]) -> Optional[int]:
+        """只按站点明确返回的每日作物数量计算，缺失或无效时保持未知。"""
+        counts = []
+        for key in ("max_steal_count", "steal_count_today"):
+            value = data.get(key)
+            if isinstance(value, bool) or not re.fullmatch(r"[0-9]+", str(value).strip()):
+                return None
+            counts.append(int(value))
+        return max(0, counts[0] - counts[1])
+
     def _get_steal_target(self, payload: dict = None) -> Dict[str, Any]:
         """使用站点种子目录识别作物，并保存当前目标供手动操作核对。"""
         self._steal_target = {}
@@ -1095,6 +1127,9 @@ class SiqiFram(_PluginBase):
         farm = self.get_farm_data()
         if not farm.get("success"):
             return {"success": False, "message": "无法读取种子目录，已跳过偷菜"}
+        remaining = self._remaining_steals(farm)
+        if (farm.get("can_steal") is not None and not self._to_bool(farm["can_steal"])) or remaining == 0:
+            return {"success": False, "message": "今日已偷过菜，明天再来吧", "remaining_steals": remaining}
         names = {
             str(seed["id"]): str(seed.get("name") or "").strip()
             for seed in farm.get("seeds") or []
@@ -1127,6 +1162,9 @@ class SiqiFram(_PluginBase):
     def _steal_plot(self, payload: dict = None) -> Dict[str, Any]:
         """偷取指定目标农场的指定坑位作物。"""
         payload = payload or {}
+        remaining = self._remaining_steals(self._steal_target)
+        if remaining is None or remaining <= 0:
+            return {"success": False, "message": "剩余可偷数量不足或未知，请重新获取目标"}
         # shortcut: 按本轮目标快照核对作物，站点提供原子种子条件后再消除换种竞态。
         plot = next((
             item for item in self._steal_target.get("victim_plots", [])
@@ -1144,6 +1182,7 @@ class SiqiFram(_PluginBase):
         }))
         if result.get("success"):
             plot["stolen"] = True
+            self._steal_target["steal_count_today"] = int(self._steal_target["steal_count_today"]) + 1
         self._save_latest_if_success(result)
         return result
 
@@ -1160,18 +1199,15 @@ class SiqiFram(_PluginBase):
     def _steal_once(self, payload: dict = None) -> Dict[str, Any]:
         """自动寻找可偷作物，并按今日剩余可偷数量执行偷菜流程。"""
         victim = self._get_steal_target()
+        self._steal_target = {}  # 自动流程的快照不得在失败或超时后被手动重放。
         if not victim.get("success"):
-            if self._is_daily_action_exhausted(victim):
-                self._mark_daily_action_done("steal", victim)
             return victim
         victim_id = victim.get("victim_id")
-        max_count = self._to_int(victim.get("max_steal_count"), 0)
-        stolen_today = self._to_int(victim.get("steal_count_today"), 0)
-        remaining = max_count - stolen_today if max_count > 0 else 1
+        remaining = self._remaining_steals(victim)
+        if remaining is None:
+            return {"success": False, "message": "未能确认今日剩余可偷数量，已跳过偷菜", "victim": victim}
         if remaining <= 0:
-            result = {"success": False, "message": "今日可偷数量已用完", "victim": victim}
-            self._mark_daily_action_done("steal", result)
-            return result
+            return {"success": False, "message": "今日可偷数量已用完", "remaining_steals": 0, "victim": victim}
 
         victim_lands = victim.get("victim_lands") or []
         unlocked_lands = {
@@ -1190,7 +1226,8 @@ class SiqiFram(_PluginBase):
             if self._can_steal_plot(plot):
                 plots.append((land_id, plot.get("plot_index")))
         if not plots:
-            return {"success": False, "message": "未找到所选范围内的成熟作物", "victim": victim}
+            return {"success": False, "message": f"未找到所选范围内的成熟作物，今日剩余可偷 {remaining} 个",
+                    "remaining_steals": remaining, "victim": victim}
 
         logs = []
         success_count = 0
@@ -1210,17 +1247,17 @@ class SiqiFram(_PluginBase):
                 break
 
         if success_count > 0:
-            self._json_response(self._request("finish_stealing", "POST"))
-            self._steal_target = {}
+            finished = self._json_response(self._request("finish_stealing", "POST"))
             fresh = self.get_farm_data()
             if fresh.get("success"):
                 self.save_data("farm_status", fresh)
-            result = {"success": True, "message": f"偷菜完成：成功 {success_count} 个，获得 {total_reward} 魔力", "logs": logs, "last_result": last_result}
-            self._mark_daily_action_done("steal", result)
-            return result
+            message = f"偷菜完成：成功 {success_count} 个，获得 {total_reward} 魔力"
+            if not finished.get("success"):
+                message += f"；结束会话失败：{finished.get('msg') or finished.get('message') or '站点未确认'}"
+            return {"success": bool(finished.get("success")), "message": message, "logs": logs,
+                    "stolen_count": success_count, "last_result": last_result,
+                    "remaining_steals": self._remaining_steals(fresh) if fresh.get("success") else None}
         result = {"success": False, "message": last_result.get("msg") or last_result.get("message") or "偷菜失败", "logs": logs, "victim": victim}
-        if self._is_daily_action_exhausted(result):
-            self._mark_daily_action_done("steal", result)
         return result
 
     def _like_random(self, payload: dict = None) -> Dict[str, Any]:
@@ -1334,6 +1371,41 @@ class SiqiFram(_PluginBase):
         crops = re.sub(r"[，,]\s*", "、", crops.strip())
         return f"{prefix}\n━━━{crops}\n━━━{summary.strip()}"
 
+    def _steal_task(self) -> None:
+        """独立巡检偷菜；每轮重新确认站点剩余数量，不沿用旧版每日成功标记。"""
+        if (not self._enabled or not self._auto_steal or not self._steal_crops
+                or self._stop_event.is_set()):
+            return
+        if not self._run_lock.acquire(blocking=False):
+            logger.debug(f"{self.plugin_name}: 其他农场操作执行中，偷菜等待下轮巡检")
+            return
+        previous_activity = self._run_activity
+        self._run_activity = "偷菜任务执行中"
+        run_time = datetime.now(self._timezone()).strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            self.save_data("last_steal_run", run_time)
+            result = self._steal_once()
+            message = result.get("msg") or result.get("message") or "偷菜检查完成"
+            self.save_data("last_steal_result", message)
+            logger.info(f"{self.plugin_name}: 偷菜巡检 - {message}")
+            if self._notify and result.get("stolen_count", 0) > 0:
+                self.post_message(mtype=NotificationType.SiteMessage, title="【🥷思齐农场】偷菜结果",
+                                  text=f"{message}\n执行时间：{run_time}")
+        except Exception as e:
+            message = f"偷菜巡检失败：{e}"
+            self.save_data("last_steal_result", message)
+            logger.error(f"{self.plugin_name}: {message}")
+            if self._notify:
+                self.post_message(mtype=NotificationType.SiteMessage, title="【🥷思齐农场】偷菜失败", text=message)
+        finally:
+            self._run_activity = previous_activity
+            self._run_lock.release()
+
+    def _harvest_task(self) -> None:
+        # 一次性成熟任务等待当前操作结束，避免被偷菜巡检占锁后永久漏跑。
+        with self._run_lock:
+            self._farm_task(reschedule=True)
+
     def _farm_task(self, reschedule: bool = False) -> None:
         """执行定时自动化任务，完成后按最早成熟时间重排精准任务。"""
         if not self._enabled or self._stop_event.is_set() or not self._run_lock.acquire(blocking=False):
@@ -1354,12 +1426,6 @@ class SiqiFram(_PluginBase):
                 res = self._plant_fill_empty({"seed_id": self._seed_id})
                 plant_message = self._format_plant_task_message(res.get("msg") or res.get("message") or "种植完成")
                 logs.append(f"🌱 种植：{plant_message}")
-            if self._auto_steal:
-                if self._is_daily_action_done("steal"):
-                    logs.append("🥷 偷菜：今日已完成，自动跳过")
-                else:
-                    res = self._steal_once()
-                    logs.append(f"🥷 偷菜：{res.get('msg') or res.get('message') or '偷菜完成'}")
             if self._auto_like:
                 if self._is_daily_action_done("like"):
                     logs.append("👍 点赞：今日已完成，自动跳过")
