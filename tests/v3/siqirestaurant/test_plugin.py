@@ -691,7 +691,9 @@ def test_notifications_summary_and_exception_isolation(plugin,module,monkeypatch
     drive_visits(plugin,clock)
     assert len(plugin.notifications)==2
     assert any('150 魔力' in n['text'] for n in plugin.notifications)
-    assert any('今日下馆子结果' in n['title'] for n in plugin.notifications)
+    assert any('今日下馆子' in n['title'] for n in plugin.notifications)
+    closed = next(n for n in plugin.notifications if '今日经营完成' in n['title'])
+    assert closed['text'] == '顾客 2/2\n净收益 150 魔力 · 补货 0 魔力'
     q=module.SiqiRestaurant();q.storage=copy.deepcopy(plugin.storage);q.init_plugin(plugin._config);q._request=server
     drive_visits(q,clock)
     assert not q.notifications
@@ -700,6 +702,39 @@ def test_notifications_summary_and_exception_isolation(plugin,module,monkeypatch
     q._auto_status('blocked','另一个同类异常')
     assert q.post_message.call_count==1
     assert any(e['action']=='notification' for e in q._runtime['events'])
+
+
+def test_visit_notice_compacts_receipts_but_keeps_page_details(plugin, module, monkeypatch):
+    clock, server = visit_setup(plugin, module, monkeypatch, notify=True, visit_targets=['Alice', 'Bob', 'Carol'])
+    def request(action, payload=None, **kwargs):
+        response = server(action, payload, **kwargs)
+        if action == 'visit_restaurant' and response['success']:
+            response['message'] = f"成功前往 {payload['target_username']} 的餐馆（对方顾客数+1，自己餐厅受欢迎值+5），等待对方开业接待"
+        return response
+    plugin._request = request
+    drive_visits(plugin, clock)
+    assert len(plugin.notifications) == 1
+    assert plugin.notifications[0]['title'] == '【思齐餐厅】今日下馆子'
+    assert plugin.notifications[0]['text'] == '已到访 3/3 家\nAlice、Bob、Carol'
+    assert '等待对方开业接待' in plugin._result()['automation']['visits']['attempts']['alice']['message']
+
+
+def test_visit_notice_partial_list_keeps_failure_reason(plugin, module, monkeypatch):
+    clock, server = visit_setup(plugin, module, monkeypatch, notify=True, visit_targets=['MissingUser', 'Bob'])
+    drive_visits(plugin, clock)
+    assert plugin.notifications[0]['text'] == '已到访 1/3 家\nBob\n跳过：MissingUser（用户不存在）'
+
+
+def test_visit_notice_does_not_count_uncertain_reservation_as_success(plugin):
+    plugin._config['notify'] = True
+    plugin._snapshot['visits'].update(count=1, records=[dict(target_username='Alice')])
+    visits = plugin._visit_account()
+    visits.update(count_floor=3, attempts={
+        'alice': dict(username='ALICE', status='success', message='站点详细回执'),
+        'bob': dict(username='Bob', status='success', message='站点详细回执'),
+        'carol': dict(username='Carol', status='sending', message='结果不明')})
+    plugin._visit_status('次数已满（含预留）', done=True)
+    assert plugin.notifications[0]['text'] == '已到访 2/3 家\nAlice、Bob\n待核对：Carol'
 
 
 def test_unknown_quota_never_visits(plugin,module,monkeypatch):
