@@ -3,18 +3,17 @@
 原作者 bfjy，源码来自 bfjy2024/MoviePilot-Plugins，按原仓库 GPL-3.0
 许可改造。V3 适配由 xchenya 维护；搬砖已获用户宿主日志验证，新调度未经真实联调。
 """
-import json
 import math
 import re
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -24,6 +23,7 @@ from app.sdk.events import Event, eventmanager
 from app.core.config import settings
 from app.db.oper.site import SiteOper
 from app.sdk.logging import logger
+from app.sdk.scheduler import update_plugin_job
 from app.plugins import _PluginBase
 from app.schemas.types import EventType, NotificationType
 
@@ -38,13 +38,43 @@ class StatsResponse(BaseModel):
     data: Dict[str, Any] = Field(default_factory=dict)
 
 
+class CleanBeachConfig(BaseModel):
+    """公开配置只接受设置字段，禁止客户端写入运行缓存。"""
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    enabled: bool = False
+    notify: bool = True
+    auto_brick: bool = False
+    cookie: str = ""
+    schedule_mode: Literal["auto", "cron", "interval"] = "auto"
+    cron: str = "1 */2 * * *"
+    interval_minutes: int = Field(default=121, ge=1)
+    brick_cron: str = ""
+    brick_retry_limit: int = Field(default=1, ge=0, le=10)
+    run_once: bool = False
+
+    @field_validator("cron", "brick_cron")
+    @classmethod
+    def validate_cron(cls, value, info):
+        value = value.strip()
+        if value:
+            CronTrigger.from_crontab(value)
+        elif info.field_name == "cron":
+            raise ValueError("清理 Cron 不能为空")
+        return value
+
+
+class ConfigResponse(ActionResponse):
+    config: Optional[CleanBeachConfig] = None
+
+
 class SiQiCleanBeach(_PluginBase):
     plugin_name = "思齐自动收垃圾"
     plugin_desc = "自动清理沙滩和可选搬砖，支持站点冷却或固定时间；新调度未经真实联调。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/Moviepilot_A.png"
-    plugin_version = "2.4.0"
-    plugin_author = "bfjy（V3 适配：xchenya）"
-    author_url = "https://bfjy2024.github.io/bfjy"
+    plugin_version = "2.5.0"
+    plugin_author = "xchenya"
+    author_url = "https://github.com/xchenya"
     plugin_config_prefix = "siqicleanbeach_"
     plugin_order = 30
     auth_level = 2
@@ -141,9 +171,9 @@ class SiQiCleanBeach(_PluginBase):
             raise
         return True
 
-    def init_plugin(self, config: dict = None):
+    def init_plugin(self, config: dict = None, *, _config_lock_held: bool = False):
         config = config or {}
-        running = self._lock.locked()
+        running = self._lock.locked() and not _config_lock_held
         self.stop_service()
         self._auth_blocked = False
         site_cookie = self.__get_site_cookie()
@@ -245,7 +275,7 @@ class SiQiCleanBeach(_PluginBase):
     def get_api(self) -> List[Dict[str, Any]]:
         return [
             {
-                "path": "/SiQiCleanBeach/run",
+                "path": "/run",
                 "endpoint": self.run_once_api,
                 "methods": ["POST"],
                 "auth": "bear",
@@ -254,14 +284,23 @@ class SiQiCleanBeach(_PluginBase):
                 "response_model": ActionResponse
             },
             {
-                "path": "/SiQiCleanBeach/stats",
+                "path": "/stats",
                 "endpoint": self.get_stats_api,
                 "methods": ["GET"],
                 "auth": "bear",
                 "summary": "获取收垃圾统计数据",
                 "description": "获取思齐收垃圾的统计数据。",
                 "response_model": StatsResponse
-            }
+            },
+            {"path": "/config", "endpoint": self.get_config_api, "methods": ["GET"],
+             "auth": "bear", "summary": "获取思齐清理设置", "response_model": Dict[str, Any]},
+            {"path": "/config", "endpoint": self.save_config_api, "methods": ["POST"],
+             "auth": "bear", "summary": "保存思齐清理设置", "response_model": ConfigResponse},
+            # 旧版已包含插件名前缀；保留已有地址，Vue 使用上方相对路径。
+            {"path": "/SiQiCleanBeach/run", "endpoint": self.run_once_api, "methods": ["POST"],
+             "auth": "bear", "summary": "兼容旧版立即运行地址", "response_model": ActionResponse},
+            {"path": "/SiQiCleanBeach/stats", "endpoint": self.get_stats_api, "methods": ["GET"],
+             "auth": "bear", "summary": "兼容旧版统计地址", "response_model": StatsResponse},
         ]
 
     def get_service(self) -> List[Dict[str, Any]]:
@@ -302,334 +341,14 @@ class SiQiCleanBeach(_PluginBase):
                 logger.warning(f"Cron配置无效：{e}")
                 return []
 
-    def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        site_cookie = self.__get_site_cookie()
-        cookie_value = self._cookie or site_cookie or ""
-        return [
-            {
-                "component": "VForm",
-                "content": [
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {"model": "enabled", "label": "启用插件"}
-                                    }
-                                ]
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {"model": "notify", "label": "发送通知"}
-                                    }
-                                ]
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {
-                                            "model": "run_once",
-                                            "label": "立即运行一次",
-                                            "hint": "保存配置后执行，并自动关闭"
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VSelect",
-                                        "props": {
-                                            "model": "schedule_mode",
-                                            "label": "定时模式",
-                                            "items": [
-                                                {"title": "按站点冷却（推荐）", "value": "auto"},
-                                                {"title": "固定时间（Cron）", "value": "cron"},
-                                                {"title": "旧版固定间隔（兼容）", "value": "interval"},
-                                            ],
-                                            "hint": "自动模式按沙滩两小时冷却、搬砖每日零点独立定时，到期后约15秒执行；等待期间不访问站点。"
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VCronField",
-                                        "props": {
-                                            "model": "cron",
-                                            "label": "Cron表达式",
-                                            "placeholder": "5位 Cron 表达式",
-                                            "hint": "固定时间模式生效，例如 5 0,2,4,6,8,10,12,14,16,18,20,22 * * *；使用宿主时区"
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "interval_minutes",
-                                            "label": "旧版执行间隔（分钟）",
-                                            "type": "number",
-                                            "min": 1,
-                                            "hint": "间隔模式下生效，例如 121",
-                                            "value": 121
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                                {"component": "VSwitch", "props": {"model": "auto_brick", "label": "自动搬砖（默认关闭）"}}
-                            ]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                                {"component": "VTextField", "props": {"model": "brick_cron", "label": "搬砖独立 Cron（可选）", "clearable": True, "placeholder": "0 10,16 * * *", "hint": "留空沿用原调度；填写后搬砖独立执行，按 MoviePilot 时区。示例：每天10点、16点。每日上限仍为50块。"}}
-                            ]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                                {"component": "VTextField", "props": {"model": "brick_retry_limit", "label": "搬砖失败重试次数", "type": "number", "min": 0, "max": 10, "hint": "控制失败后的整轮重试，默认1次，0关闭；5分钟后开始。认证失败或写入结果不确定时不重试写入。"}}
-                            ]}
-                        ]
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [
-                                    {
-                                        "component": "VTextarea",
-                                        "props": {
-                                            "model": "cookie",
-                                            "label": "思齐 Cookie",
-                                            "rows": 3,
-                                            "placeholder": "填写包含 c_secure_pass 的完整 Cookie",
-                                            "hint": "留空时读取站点管理中的思齐 Cookie"
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    }
-                ]
-            }
-        ], {
-            "enabled": self._enabled,
-            "auto_brick": self._auto_brick,
-            "brick_cron": self._brick_cron,
-            "brick_retry_limit": self._brick_retry_limit,
-            "cookie": cookie_value,
-            "schedule_mode": self._schedule_mode,
-            "cron": self._cron,
-            "interval_minutes": self._interval_minutes,
-            "notify": self._notify,
-            "run_once": False,
-            "stats": self._stats,
-            "inventory": self._inventory
-        }
+    def get_render_mode(self) -> Tuple[str, str]:
+        return "vue", f"dist/assets-v{self.plugin_version}"
+
+    def get_form(self) -> Tuple[None, Dict[str, Any]]:
+        return None, self.get_config_api()
 
     def get_page(self) -> List[dict]:
-        inventory = self._inventory
-        stats = self._stats
-        
-        last_update = stats.get("last_update", "")
-        if last_update:
-            try:
-                last_update = datetime.fromtimestamp(last_update).strftime("%Y-%m-%d %H:%M:%S")
-            except:
-                last_update = str(last_update)
-
-        filtered_inventory = inventory
-        
-        total_items = len(filtered_inventory)
-        total_count = sum(item.get("count", 0) for item in filtered_inventory.values())
-        has_items = {k: v for k, v in filtered_inventory.items() if v.get("count", 0) > 0}
-        has_items_count = len(has_items)
-
-        sorted_items = sorted(
-            has_items.items(),
-            key=lambda x: x[1].get("count", 0),
-            reverse=True
-        )
-
-        history = stats.get("history", [])[-5:]
-
-        if self._schedule_mode == "auto":
-            schedule_info = "按站点冷却"
-        elif self._schedule_mode == "interval":
-            schedule_info = f"每{self._interval_minutes}分钟"
-        else:
-            schedule_info = f"Cron: {self._cron}"
-
-        last_result = stats.get("last_result", "-")
-        if "clean_result" in stats and "brick_result" in stats:
-            last_result = f"清理：{stats['clean_result']}；搬砖：{stats['brick_result']}"
-
-        return [
-            {
-                "component": "VCard",
-                "props": {"variant": "tonal", "class": "mb-4"},
-                "content": [
-                    {
-                        "component": "VCardTitle",
-                        "text": "🏖️ 思齐收垃圾数据面板"
-                    },
-                    {
-                        "component": "VCardText",
-                        "content": [
-                            {
-                                "component": "VRow",
-                                "props": {"class": "mb-4"},
-                                "content": [
-                                    self.__stat_card("📦", "物品总数", f"{total_count:,}", "个", "primary"),
-                                    self.__stat_card("📊", "物品种类", f"{total_items}", "种", "info"),
-                                    self.__stat_card("✅", "有物品", f"{has_items_count}", "种", "success"),
-                                    self.__stat_card("🕐", "库存刷新", last_update or "-", "", "warning"),
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        "component": "VCardText",
-                        "content": [
-                            {
-                                "component": "VRow",
-                                "content": [
-                                    self.__info_col("⏰ 定时模式", schedule_info),
-                                    self.__info_col("🏖️ 沙滩下次执行时间", self.__due_text("beach_due_at", compact=True)),
-                                    self.__info_col("🧱 搬砖下次执行时间", self.__due_text("brick_due_at", compact=True) if self._auto_brick else "未开启"),
-                                    self.__info_col("⏳ 沙滩时间来源", stats.get("beach_due_source", "等待首次同步")),
-                                    self.__info_col("📝 最后结果", last_result),
-                                    self.__info_col("🗑️ 清理结果", stats.get("clean_result", "-")),
-                                    self.__info_col("🧱 搬砖结果", self.__brick_today_result()),
-                                    self.__info_col("🧱 本次 / 今日 / 库存", f"{stats.get('bricks_moved', 0)} / {stats.get('daily_bricks') if stats.get('daily_bricks') is not None else '未知'} / {inventory.get('砖块', {}).get('count', '未知')}"),
-                                    self.__info_col("📦 库存状态", "本次已刷新" if stats.get("inventory_refreshed") else "缓存，非本次刷新"),
-                                    self.__info_col("🔔 通知", "开启" if self._notify else "关闭"),
-                                    self.__info_col("🍪 Cookie", "已配置" if self._cookie else "未配置"),
-                                ]
-                            }
-                        ]
-                    }
-                ]
-            },
-            {
-                "component": "VCard",
-                "props": {"variant": "tonal", "class": "mb-4"},
-                "content": [
-                    {
-                        "component": "VCardTitle",
-                        "text": "🎯 物品清单"
-                    },
-                    {
-                        "component": "VCardText",
-                        "content": [
-                            {
-                                "component": "VRow",
-                                "content": [
-                                    {
-                                        "component": "VCol",
-                                        "props": {"cols": 12},
-                                        "content": [
-                                            {
-                                                "component": "div",
-                                                "props": {
-                                                    "style": "display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 16px;"
-                                                },
-                                                "content": self.__inventory_items(sorted_items) if sorted_items else [
-                                                    {
-                                                        "component": "div",
-                                                        "props": {"class": "text-center text-medium-emphasis pa-4", "style": "grid-column: 1 / -1; color: #999;"},
-                                                        "text": "🏝️ 暂无物品数据"
-                                                    }
-                                                ]
-                                            }
-                                        ]
-                                    }
-                                ]
-                            }
-                        ]
-                    }
-                ]
-            },
-            {
-                "component": "VCard",
-                "props": {"variant": "tonal"},
-                "content": [
-                    {
-                        "component": "VCardTitle",
-                        "text": "📋 执行记录"
-                    },
-                    {
-                        "component": "VCardText",
-                        "content": [
-                            {
-                                "component": "VTable",
-                                "props": {"hover": True, "dense": True},
-                                "content": [
-                                    {
-                                        "component": "thead",
-                                        "content": [
-                                            {
-                                                "component": "tr",
-                                                "content": [
-                                                    {"component": "th", "text": "时间"},
-                                                    {"component": "th", "text": "结果"},
-                                                    {"component": "th", "text": "物品总数"},
-                                                    {"component": "th", "text": "状态"},
-                                                ]
-                                            }
-                                        ]
-                                    },
-                                    {
-                                        "component": "tbody",
-                                        "content": self.__history_rows(history) if history else [
-                                            {
-                                                "component": "tr",
-                                                "content": [
-                                                    {
-                                                        "component": "td",
-                                                        "props": {"colspan": 4, "class": "text-center text-medium-emphasis"},
-                                                        "text": "暂无执行记录"
-                                                    }
-                                                ]
-                                            }
-                                        ]
-                                    }
-                                ]
-                            }
-                        ]
-                    }
-                ]
-            }
-        ]
+        return []
 
     def stop_service(self):
         # 已发出的请求不能撤回；阻断当前任务后续请求。
@@ -732,170 +451,6 @@ class SiQiCleanBeach(_PluginBase):
         if self._stats.get("daily_bricks") == 50 and self.__valid_due(reset_at) and now < reset_at:
             return "今日已达上限（成功时间未知）"
         return "今日暂无成功搬砖记录"
-
-    def __inventory_items(self, sorted_items: list) -> List[Dict[str, Any]]:
-        """生成物品卡片网格 - 优化文字颜色对比度"""
-        items = []
-        for name, data in sorted_items:
-            icon = self.ITEM_ICONS.get(name, "📦")
-            color = self.ITEM_COLORS.get(name, "#3498db")
-            count = data.get("count", 0)
-            
-            # 根据颜色亮度决定文字颜色
-            # 对于亮色背景使用深色文字，暗色背景使用亮色文字
-            dark_colors = ["#2c3e50", "#7f8c8d", "#8e44ad", "#d4a574"]
-            text_color = "#ffffff" if color in dark_colors else "#2c3e50"
-            
-            items.append({
-                "component": "div",
-                "props": {
-                    "style": f"""
-                        background: linear-gradient(145deg, {color}25, {color}08);
-                        border-radius: 16px;
-                        padding: 20px 16px;
-                        text-align: center;
-                        border: 1px solid {color}30;
-                        box-shadow: 0 2px 8px rgba(0,0,0,0.08);
-                        transition: transform 0.2s, box-shadow 0.2s;
-                    """
-                },
-                "content": [
-                    {
-                        "component": "div",
-                        "props": {"style": f"font-size: 40px; margin-bottom: 6px; display: block;"},
-                        "text": icon
-                    },
-                    {
-                        "component": "div",
-                        "props": {"style": f"font-size: 14px; font-weight: 600; color: {text_color}; margin-bottom: 4px; letter-spacing: 0.3px;"},
-                        "text": name
-                    },
-                    {
-                        "component": "div",
-                        "props": {"style": f"font-size: 24px; font-weight: bold; color: {color}; text-shadow: 0 1px 4px rgba(0,0,0,0.1);"},
-                        "text": f"{count:,}"
-                    },
-                    {
-                        "component": "div",
-                        "props": {
-                            "style": f"width: 100%; height: 4px; background: {color}20; border-radius: 4px; margin-top: 10px; overflow: hidden;"
-                        },
-                        "content": [
-                            {
-                                "component": "div",
-                                "props": {
-                                    "style": f"width: {min(100, count / 10)}%; height: 100%; background: linear-gradient(90deg, {color}, {color}80); border-radius: 4px;"
-                                }
-                            }
-                        ]
-                    }
-                ]
-            })
-        return items
-
-    @staticmethod
-    def __stat_card(icon: str, label: str, value: str, suffix: str, color: str) -> Dict[str, Any]:
-        return {
-            "component": "VCol",
-            "props": {"cols": 6, "md": 3},
-            "content": [
-                {
-                    "component": "VCard",
-                    "props": {
-                        "color": color,
-                        "variant": "tonal",
-                        "class": "pa-3"
-                    },
-                    "content": [
-                        {
-                            "component": "div",
-                            "props": {"class": "d-flex align-center"},
-                            "content": [
-                                {
-                                    "component": "div",
-                                    "props": {"class": "text-h4 mr-2"},
-                                    "text": icon
-                                },
-                                {
-                                    "component": "div",
-                                    "content": [
-                                        {
-                                            "component": "div",
-                                            "props": {"class": "text-caption text-medium-emphasis"},
-                                            "text": label
-                                        },
-                                        {
-                                            "component": "div",
-                                            "props": {"class": "text-h6 font-weight-bold"},
-                                            "text": f"{value}{suffix}"
-                                        }
-                                    ]
-                                }
-                            ]
-                        }
-                    ]
-                }
-            ]
-        }
-
-    @staticmethod
-    def __info_col(label: str, value: Any) -> Dict[str, Any]:
-        return {
-            "component": "VCol",
-            "props": {"cols": 6, "md": 3},
-            "content": [
-                {
-                    "component": "div",
-                    "props": {"class": "text-caption text-medium-emphasis"},
-                    "text": label
-                },
-                {
-                    "component": "div",
-                    "props": {"class": "text-h6"},
-                    "text": str(value or "-")
-                }
-            ]
-        }
-
-    def __history_rows(self, history: list) -> List[Dict[str, Any]]:
-        rows = []
-        for record in reversed(history):
-            time_str = record.get("time", "")
-            if isinstance(time_str, (int, float)):
-                try:
-                    time_str = datetime.fromtimestamp(time_str).strftime("%Y-%m-%d %H:%M:%S")
-                except:
-                    time_str = str(time_str)
-            
-            status_color = "success" if record.get("status") == "completed" else "warning"
-            status_text = {"completed": "✅ 全部完成", "partial": "⚠️ 部分完成", "auth_failed": "🔐 认证失败", "cancelled": "⏹ 已停止"}.get(record.get("status"), "⚠️ 失败")
-            result_text = record.get("result", "-")
-            total_count = record.get("total_count", 0)
-            
-            rows.append({
-                "component": "tr",
-                "content": [
-                    {"component": "td", "text": time_str},
-                    {"component": "td", "text": result_text},
-                    {"component": "td", "text": f"{total_count:,}" if total_count > 0 else "-"},
-                    {
-                        "component": "td",
-                        "content": [
-                            {
-                                "component": "VChip",
-                                "props": {
-                                    "color": status_color,
-                                    "size": "small",
-                                    "variant": "tonal"
-                                },
-                                "text": status_text
-                            }
-                        ]
-                    }
-                ]
-            })
-        return rows
-
     def run_once_api(self) -> Dict[str, Any]:
         try:
             if not self._queue_manual_run():
@@ -904,12 +459,64 @@ class SiQiCleanBeach(_PluginBase):
             logger.error(f"启动收垃圾任务失败：{exc.__class__.__name__}")
             return {"success": False, "message": "无法启动后台任务，请检查日志"}
         return {"success": True, "message": "任务已启动，完成后可查看详情或等待通知"}
+    def get_config_api(self) -> Dict[str, Any]:
+        return {
+            "enabled": self._enabled, "notify": self._notify,
+            "auto_brick": self._auto_brick, "cookie": self._cookie,
+            "schedule_mode": self._schedule_mode, "cron": self._cron,
+            "interval_minutes": self._interval_minutes, "brick_cron": self._brick_cron,
+            "brick_retry_limit": self._brick_retry_limit, "run_once": False,
+        }
+
+    def save_config_api(self, config: CleanBeachConfig) -> Dict[str, Any]:
+        config = CleanBeachConfig.model_validate(config)
+        with self._schedule_lock:
+            if not self._lock.acquire(blocking=False):
+                return {"success": False, "message": "任务执行中，请结束后再保存配置"}
+            try:
+                values = CleanBeachConfig.model_validate({
+                    **self.get_config_api(), **config.model_dump(exclude_unset=True),
+                }).model_dump()
+                run_once = values.pop("run_once")
+                # 运行缓存只来自当前实例，客户端不能清除不确定写入等保护标记。
+                values.update(run_once=False, stats=self._stats, inventory=self._inventory)
+                self.update_config(values)
+                self.init_plugin(values, _config_lock_held=True)
+                update_plugin_job(self.__class__.__name__)
+            except Exception as exc:
+                logger.error(f"保存思齐配置失败：{exc.__class__.__name__}")
+                return {"success": False, "message": "配置保存或定时任务刷新失败，请检查日志并重载插件"}
+            finally:
+                self._lock.release()
+        message = "配置已保存"
+        if run_once:
+            message += f"；{self.run_once_api()['message']}"
+        return {"success": True, "message": message, "config": self.get_config_api()}
+
     def get_stats_api(self) -> Dict[str, Any]:
+        schedule = ("按站点冷却" if self._schedule_mode == "auto" else
+                    f"每{self._interval_minutes}分钟" if self._schedule_mode == "interval" else
+                    f"Cron: {self._cron}")
+        last_result = self._stats.get("last_result", "-")
+        if "clean_result" in self._stats and "brick_result" in self._stats:
+            last_result = f"清理：{self._stats['clean_result']}；搬砖：{self._stats['brick_result']}"
+        reset_at = self._stats.get("brick_day_reset_at")
+        daily_bricks = self._stats.get("daily_bricks") if self.__valid_due(reset_at) and time.time() < reset_at else None
         return {
             "success": True,
             "data": {
-                "stats": self._stats,
-                "inventory": self._inventory
+                "stats": dict(self._stats),
+                "inventory": dict(self._inventory),
+                "display": {
+                    "schedule": schedule,
+                    "beach_next": self.__due_text("beach_due_at", compact=True),
+                    "brick_next": self.__due_text("brick_due_at", compact=True) if self._auto_brick else "未开启",
+                    "brick_today_result": self.__brick_today_result(), "last_result": last_result,
+                    "running": self._lock.locked(), "enabled": self._enabled,
+                    "auto_brick": self._auto_brick, "auth_blocked": self._auth_blocked,
+                    "version": self.plugin_version, "timezone": settings.TZ,
+                    "daily_bricks": daily_bricks,
+                },
             }
         }
 

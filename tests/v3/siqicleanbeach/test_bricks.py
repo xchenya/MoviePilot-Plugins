@@ -16,7 +16,7 @@ import requests
 from bs4 import BeautifulSoup
 from apscheduler.triggers.cron import CronTrigger
 
-from .test_plugin import CODE, _plugin_class
+from .test_plugin import CODE, _config_models, _plugin_class
 
 
 @pytest.fixture(autouse=True)
@@ -48,7 +48,8 @@ def plugin():
               List=List, Optional=Optional, Tuple=Tuple, Event=object,
               logger=Mock(), SiteOper=Mock(), NotificationType=SimpleNamespace(Plugin="plugin"),
               IntervalTrigger=Mock(), CronTrigger=Mock(wraps=CronTrigger), BackgroundScheduler=Mock(side_effect=lambda: Mock()),
-              EventType=SimpleNamespace(PluginAction="action"))
+              EventType=SimpleNamespace(PluginAction="action"), update_plugin_job=Mock(),
+              **_config_models())
     exec(compile(module, str(CODE), "exec"), ns)
     p = ns["SiQiCleanBeach"]()
     p._SiQiCleanBeach__get_site_cookie = Mock(return_value="")
@@ -62,6 +63,7 @@ def plugin():
     p._test_interval = ns["IntervalTrigger"]
     p._test_cron = ns["CronTrigger"]
     p._test_scheduler = ns["BackgroundScheduler"]
+    p._test_update_job = ns["update_plugin_job"]
     return p
 
 
@@ -218,8 +220,9 @@ def test_cached_inventory_not_reported_as_refreshed(plugin, monkeypatch):
     result = plugin.run_clean_task()
     assert not result["data"]["inventory_refreshed"] and plugin._stats["last_update"] == 123
     assert "缓存，非本次刷新" in result["message"]
-    page = json.dumps(plugin.get_page(), ensure_ascii=False)
-    assert "砖块" in page and "缓存，非本次刷新" in page
+    page = plugin.get_stats_api()["data"]
+    assert page["inventory"]["砖块"]["count"] == 9
+    assert page["stats"]["inventory_refreshed"] is False
 
 
 def test_old_config_and_every_save_path(plugin):
@@ -234,7 +237,130 @@ def test_old_config_and_every_save_path(plugin):
     assert plugin.update_config.call_args.args[0]["auto_brick"] is True
     form, defaults = plugin.get_form()
     assert defaults["auto_brick"] is True and "brick_cooldown_minutes" not in defaults
-    assert '"model": "auto_brick"' in json.dumps(form)
+    assert form is None
+
+
+def test_vue_contract_returns_cached_data_and_private_settings_separately(plugin, monkeypatch):
+    monkeypatch.setattr(requests, "get", Mock(side_effect=AssertionError("No site reads")))
+    monkeypatch.setattr(requests, "post", Mock(side_effect=AssertionError("No site writes")))
+    plugin._stats.update(brick_uncertain_reset="server-day", daily_bricks=12)
+    plugin._inventory = {"砖块": {"count": 23}}
+    assert plugin.get_render_mode() == ("vue", "dist/assets-v2.5.0")
+    assert plugin.get_page() == []
+    form, config = plugin.get_form()
+    assert form is None and config == plugin.get_config_api()
+    assert "stats" not in config and "inventory" not in config
+    result = plugin.get_stats_api()["data"]
+    assert result["stats"] is not plugin._stats and result["inventory"] is not plugin._inventory
+    assert result["stats"]["brick_uncertain_reset"] == "server-day"
+    assert result["inventory"]["砖块"]["count"] == 23
+    assert "secret-cookie" not in json.dumps(result)
+    assert result["display"]["timezone"] == "Asia/Shanghai"
+    assert result["display"]["running"] is False
+
+
+def test_config_save_preserves_current_cache_and_rearms_scheduler(plugin):
+    plugin._stats.update(brick_uncertain_reset="server-day", brick_retry_policy=1,
+                         brick_retry_count=1, due_schedule_version=1)
+    plugin._inventory = {"砖块": {"count": 44}}
+    result = plugin.save_config_api({"notify": False, "brick_cron": " 0 10,16 * * * "})
+    assert result["success"] and result["config"]["brick_cron"] == "0 10,16 * * *"
+    assert result["config"]["enabled"] is True and result["config"]["auto_brick"] is True
+    assert result["config"]["notify"] is False
+    saved = plugin.update_config.call_args.args[0]
+    assert saved["stats"]["brick_uncertain_reset"] == "server-day"
+    assert saved["inventory"] == {"砖块": {"count": 44}}
+    assert "stats" not in result["config"] and "inventory" not in result["config"]
+    assert not plugin._stop_event.is_set() and not plugin._lock.locked()
+    plugin._test_update_job.assert_called_once_with("SiQiCleanBeach")
+
+
+def test_config_save_rejects_running_task_without_cancelling_it(plugin):
+    plugin._lock.acquire()
+    before = copy.deepcopy(plugin.get_config_api())
+    try:
+        assert plugin.save_config_api({"enabled": False})["success"] is False
+        assert plugin.get_config_api() == before and not plugin._stop_event.is_set()
+        plugin.update_config.assert_not_called()
+        plugin._test_update_job.assert_not_called()
+    finally:
+        plugin._lock.release()
+
+
+def test_config_persistence_error_does_not_apply_settings_or_leave_lock(plugin):
+    plugin.update_config.side_effect = RuntimeError("database unavailable")
+    before = copy.deepcopy(plugin.get_config_api())
+    assert plugin.save_config_api({"enabled": False})["success"] is False
+    assert plugin.get_config_api() == before and not plugin._lock.locked()
+    plugin._test_update_job.assert_not_called()
+
+
+def test_invalid_legacy_cron_can_be_read_and_partial_save_fails_without_mutation(plugin):
+    plugin._cron = "invalid legacy cron"
+    assert plugin.get_config_api()["cron"] == "invalid legacy cron"
+    assert plugin.save_config_api({"notify": False})["success"] is False
+    assert plugin._notify is True and not plugin._lock.locked()
+    plugin.update_config.assert_not_called()
+    assert plugin.save_config_api({"cron": "0 */2 * * *"})["success"] is True
+
+
+def test_save_run_once_preserves_uncertain_protection_and_handles_start_failure(plugin):
+    plugin._stats["brick_uncertain_reset"] = "server-day"
+    plugin._queue_manual_run = Mock(side_effect=RuntimeError("thread unavailable"))
+    result = plugin.save_config_api({"run_once": True})
+    assert result["success"] is True and "无法启动后台任务" in result["message"]
+    assert result["config"]["run_once"] is False
+    assert plugin.update_config.call_args.args[0]["stats"]["brick_uncertain_reset"] == "server-day"
+    assert plugin.update_config.call_args.args[0]["run_once"] is False
+    assert not plugin._stop_event.is_set() and not plugin._lock.locked()
+
+
+def test_config_routes_validate_strict_settings_and_bind_to_active_instance(plugin):
+    from fastapi import FastAPI
+    from pydantic import ValidationError
+    from starlette.routing import Match
+
+    app = FastAPI()
+    routes = plugin.get_api()
+    assert all(route["auth"] == "bear" for route in routes)
+    for instance_id in ("SiQiCleanBeach", "SiQiCleanBeach_work"):
+        for route in routes:
+            app.add_api_route(f"/plugin/{instance_id}{route['path']}", route["endpoint"],
+                              methods=route["methods"], response_model=route["response_model"])
+    path = "/plugin/SiQiCleanBeach_work/config"
+    def endpoint(path, method):
+        scope = {"type": "http", "path": path, "method": method, "root_path": ""}
+        return next(route.endpoint for route in app.routes if route.matches(scope)[0] == Match.FULL)
+    config = endpoint(path, "GET")()
+    assert config["auto_brick"] is True and "stats" not in config
+    model = _config_models()["CleanBeachConfig"]
+    for payload in ({"stats": {"brick_uncertain_reset": None}}, {"inventory": {}},
+                    {"enabled": "false"}, {"interval_minutes": True}, {"interval_minutes": 0},
+                    {"brick_retry_limit": 11}, {"brick_retry_limit": 1.5},
+                    {"schedule_mode": "unknown"}, {"brick_cron": "bad cron"}, {"cron": ""}):
+        with pytest.raises(ValidationError):
+            model.model_validate(payload)
+    plugin.update_config.assert_not_called()
+    saved = endpoint(path, "POST")({"notify": False})
+    assert saved["success"] is True and saved["config"]["notify"] is False
+    plugin._queue_manual_run = Mock(return_value=True)
+    for prefix in ("/plugin/SiQiCleanBeach", "/plugin/SiQiCleanBeach_work"):
+        assert endpoint(prefix + "/stats", "GET")()["success"] is True
+        assert endpoint(prefix + "/SiQiCleanBeach/stats", "GET")()["success"] is True
+        assert endpoint(prefix + "/run", "POST")()["success"] is True
+        assert endpoint(prefix + "/SiQiCleanBeach/run", "POST")()["success"] is True
+    assert plugin._queue_manual_run.call_count == 4
+    schema = app.openapi()["components"]["schemas"]["CleanBeachConfig"]
+    assert schema["additionalProperties"] is False
+
+
+def test_ui_hides_yesterdays_brick_count_without_changing_server_cache(plugin, monkeypatch):
+    monkeypatch.setattr(time, "time", lambda: 1000)
+    plugin._stats.update(daily_bricks=50, brick_day_reset_at=1001)
+    assert plugin.get_stats_api()["data"]["display"]["daily_bricks"] == 50
+    monkeypatch.setattr(time, "time", lambda: 1001)
+    assert plugin.get_stats_api()["data"]["display"]["daily_bricks"] is None
+    assert plugin._stats["daily_bricks"] == 50
 
 
 def test_default_disabled_preserves_clean_task(plugin, monkeypatch):

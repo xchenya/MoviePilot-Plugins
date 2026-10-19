@@ -83,9 +83,8 @@ def test_success_at_ten_is_preserved_after_cleaning_and_sixteen_limit_skip(plugi
     plugin.run_clean_task(scheduled=True)
     assert plugin._stats["brick_success"] == success
     assert "10:00 搬砖成功" in plugin._SiQiCleanBeach__brick_today_result()
-    cols = plugin.get_page()[0]["content"][2]["content"][0]["content"]
-    info = {col["content"][0]["text"]: col["content"][1]["text"] for col in cols}
-    assert "10:00 搬砖成功" in info["🧱 搬砖结果"] and "等待" not in info["🧱 搬砖结果"]
+    info = plugin.get_stats_api()["data"]["display"]
+    assert "10:00 搬砖成功" in info["brick_today_result"] and "等待" not in info["brick_today_result"]
     clock[0] = stamp(16)
     plugin._stats["beach_due_at"] = stamp(18)
     post = posts(monkeypatch, response(today_state(clock[0], 50)))
@@ -196,7 +195,7 @@ def test_fields_retry_deadline_and_success_survive_all_save_paths(plugin, monkey
     assert plugin._stats["brick_due_at"] == stamp(10, 5) and plugin._stats["brick_retry_count"] == 1
     form, defaults = plugin.get_form()
     assert defaults["brick_cron"] == "0 10,16 * * *" and defaults["brick_retry_limit"] == 2
-    assert "brick_retry_limit" in str(form)
+    assert form is None
     assert "08:00 搬砖成功" in plugin._SiQiCleanBeach__brick_today_result()
 
 
