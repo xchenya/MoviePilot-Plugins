@@ -35,9 +35,9 @@
       <section class="sr-card sr-config-card">
         <div class="sr-card-title"><h3><v-icon icon="mdi-account-group-outline" color="#ec4899" size="18" />下馆子名单</h3><v-chip size="x-small" variant="tonal" color="#ec4899">{{ targets.some(t=>t.trim())?'指定用户':'随机 3 人' }}</v-chip></div>
         <div class="sr-form-grid sr-visit-fields">
-          <v-text-field v-for="(_,i) in targets" :key="i" v-model.trim="targets[i]" :label="`用户名 ${i+1}（选填）`" :aria-label="`下馆子用户名 ${i+1}`" maxlength="64" placeholder="留空可随机" prepend-inner-icon="mdi-account-outline" />
+          <v-text-field v-for="(_,i) in targets" :key="i" v-model.trim="targets[i]" :label="`用户名 ${i+1}（选填）`" :aria-label="`下馆子用户名 ${i+1}`" maxlength="64" placeholder="填写准确的站点用户名" prepend-inner-icon="mdi-account-outline" />
         </div>
-        <p class="sr-hint">全部留空时，每天随机选择 3 位不同用户；填写后只到访名单中的用户，空位不补人。不可到访的用户会跳过并记录原因。</p>
+        <p class="sr-hint">全部留空时，每天随机选择 3 位不同用户；只填 1–2 人也可以，空位不随机补人。用户名不存在或不可到访时会跳过并记录原因，不影响其余名单。</p>
         <p class="sr-hint">沿用开业时间，可单独开启下馆子。已用次数会扣除，重启不会重复到访；开启后按原站“一键下馆子”规则确认到访，为对方增加顾客。</p>
       </section>
       <v-expansion-panels class="sr-expansions" variant="accordion" multiple>

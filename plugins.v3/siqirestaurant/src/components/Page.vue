@@ -4,7 +4,7 @@
       <header class="sr-topbar">
         <div class="sr-topbar-left">
           <div class="sr-topbar-icon"><v-icon icon="mdi-silverware-fork-knife" size="24" /></div>
-          <div class="sr-topbar-copy"><h2>思齐餐厅 <v-chip :color="state.session_status==='open'?'success':'default'">{{ statusLabel }}</v-chip></h2><p>管理厨房、食材、员工与餐厅互动</p></div>
+          <div class="sr-topbar-copy"><h2>思齐餐厅 <v-chip :color="state.session_status==='open'?'success':'default'">{{ statusLabel }}</v-chip></h2><p>{{ data.state ? (fastPolling ? '营业或烹饪中，每 2 秒更新状态' : '空闲中，每 60 秒更新状态') : '管理厨房、食材、员工与餐厅互动' }}</p></div>
         </div>
         <v-btn-group variant="tonal" density="compact" class="sr-topbar-actions">
           <v-btn color="success" aria-label="刷新" title="刷新" @click="refresh" :loading="busy" :disabled="busy"><v-icon icon="mdi-refresh" size="18" /><span>刷新</span></v-btn>
@@ -98,6 +98,7 @@ const targetName = ref(''), recommendations = ref([]), logDays = ref(0), activeT
 const now = ref(Date.now()/1000), confirmation = ref(null)
 let clockOffset=0, timer=null, clock=null, alive=false, confirmResolver=null
 const data = computed(()=>view.value.restaurant || {}), state = computed(()=>data.value.state || {})
+const fastPolling = computed(()=>state.value.session_status==='open' || (view.value.kitchen || []).some(stove=>stove.status==='cooking') || Object.keys(view.value.cleaning || {}).length>0)
 const blocked = computed(()=>busy.value || !!view.value.uncertain || !!view.value.automation?.enabled || !!view.value.automation?.active || !data.value.state)
 const uiDefaults = { VBtn: { size: 'small', variant: 'tonal', color: 'success' }, VTextField: { density: 'compact', variant: 'outlined', hideDetails: 'auto', color: 'success' }, VSelect: { density: 'compact', variant: 'outlined', hideDetails: 'auto', color: 'success' }, VChip: { size: 'x-small', variant: 'tonal' } }
 const dishOptions = computed(()=>unlockedDishes.value.map(d=>({title:`${d.name} · ${d.cook_time} 秒`,value:d.key})))
@@ -124,7 +125,7 @@ function stoveStatus(s){return {idle:'空闲',prepping:prepared(s)?'已备齐':'
 function assigned(index,role){const a=data.value.staff?.assignments_map || data.value.staff?.assignments || {};const value=(Array.isArray(a)?a.find(x=>Number(x.station_index)===index):a[index])?.[role];return value===true || value===1 || value==='1'}
 function unwrap(result){if(result?.restaurant || typeof result?.success==='boolean')return result;if(result?.data && typeof result.data.success==='boolean')return result.data;throw new Error('插件接口返回格式不正确')}
 function update(result){if(!alive)return;view.value=result;clockOffset=(result.server_now || Date.now()/1000)-Date.now()/1000;now.value=Date.now()/1000+clockOffset;for(const s of result.kitchen||[]){selected[s.index]??='';const matches=matchingCustomers(s);if(!matches.some(c=>String(c.id)===String(serveTargets[s.index])))serveTargets[s.index]=matches.find(c=>Number(c.seat)===s.index)?.id || matches[0]?.id || ''}for(const item of result.restaurant?.config?.ingredients || [])quantities[item.key]??=1;if(result.uncertain || result.automation?.enabled)runStaff.value=false}
-async function request(path,payload,verb='post',quiet=false){if(busy.value)return null;busy.value=true;try{const r=unwrap(await props.api[verb](`plugin/${props.pluginId}${path}`,payload));update(r);if(!quiet || !r.success){message.value=r.message || (r.success?'操作完成':'操作失败');ok.value=r.success}return r}catch(e){if(alive){message.value=e.message || '请求失败，请刷新后核对';ok.value=false;runStaff.value=false}return null}finally{busy.value=false}}
+async function request(path,payload,verb='post',quiet=false){if(busy.value)return null;busy.value=true;try{const r=unwrap(await props.api[verb](`plugin/${props.pluginId}${path}`,payload));update(r);if(!quiet || !r.success){message.value=r.message || (r.success?'操作完成':'操作失败');ok.value=r.success}return r}catch(e){if(alive){message.value=e.message || '请求失败，请刷新后核对';ok.value=false;runStaff.value=false}return null}finally{busy.value=false;schedule()}}
 const act=(action,args={})=>request('/action',{action,args,request_id:(crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`)})
 const refresh=()=>request('/refresh',{})
 function confirm(title,text){return new Promise(resolve=>{confirmation.value={title,text};confirmResolver=resolve})}
@@ -139,8 +140,26 @@ async function recommend(){const r=await act('list_visitable_restaurants');if(r?
 async function lookup(){const r=await act('inspect_restaurant_target',{target_username:targetName.value});if(r?.success)recommendations.value=r.candidate?[r.candidate]:[]}
 async function visit(name){if(!await confirm('前往用餐',`前往 ${name} 的餐馆，将使用今日一次下馆子机会。`))return;let r=await act('visit_restaurant',{target_username:name});if(r?.requires_confirmation && await confirm('站点确认',r.message || '站点要求再次确认前往'))await act('visit_restaurant',{target_username:name,confirm:'yes'})}
 async function resolveUncertain(){if(await confirm('核对后解锁','请确认已经核对网站的余额、库存、员工与顾客状态。解除后不会重发原请求；结果不明的成品将释放本地预留。'))await request('/resolve',{acknowledged:true})}
-async function poll(){if(!alive)return;try{if(!document.hidden && !busy.value && !confirmation.value && data.value.state)await (view.value.automation?.enabled ? request('/state',undefined,'get',true) : request('/tick',{run_staff:runStaff.value},'post',true))}finally{if(alive)timer=setTimeout(poll,2000)}}
-function start(){if(alive)return;alive=true;request('/state',undefined,'get',true);clock=setInterval(()=>{now.value=Date.now()/1000+clockOffset},500);timer=setTimeout(poll,2000)}
-function stop(){alive=false;runStaff.value=false;clearTimeout(timer);clearInterval(clock);cancelConfirm()}
+function clearTimers(){clearTimeout(timer);clearInterval(clock);timer=null;clock=null}
+function schedule(){
+  clearTimers()
+  if(!alive || document.hidden)return
+  timer=setTimeout(poll,fastPolling.value?2000:60000)
+  // Only running kitchen tasks need a local countdown between responses.
+  if(fastPolling.value)clock=setInterval(()=>{now.value=Date.now()/1000+clockOffset},500)
+}
+async function poll(){
+  if(!alive)return
+  if(document.hidden || busy.value || confirmation.value){schedule();return}
+  if(!data.value.state || view.value.automation?.active || view.value.automation?.enabled)await request('/state',undefined,'get',true)
+  else await request('/tick',{run_staff:runStaff.value},'post',true)
+}
+function visibilityChanged(){
+  if(document.hidden){clearTimers();return}
+  if(alive && !busy.value && !confirmation.value)request('/state',undefined,'get',true)
+  else schedule()
+}
+function start(){if(alive)return;alive=true;document.addEventListener('visibilitychange',visibilityChanged);if(!document.hidden)request('/state',undefined,'get',true)}
+function stop(){alive=false;runStaff.value=false;clearTimers();document.removeEventListener('visibilitychange',visibilityChanged);cancelConfirm()}
 onMounted(start);onActivated(start);onDeactivated(stop);onUnmounted(stop)
 </script>

@@ -506,6 +506,8 @@ class VisitServer:
             return dict(success=True, restaurants=[dict(username=n, can_visit=True) for n in self.names])
         if action == 'inspect_restaurant_target':
             name = payload['target_username']
+            if name not in self.names:
+                return dict(success=False, message='用户不存在')
             return dict(success=True, candidate=dict(username=name, can_visit=name not in self.unavailable,
                                                       message='不可到访' if name in self.unavailable else '可到访'))
         assert action == 'visit_restaurant'
@@ -565,10 +567,24 @@ def test_custom_order_skip_and_no_random_filler(plugin, module, monkeypatch):
     assert plugin._runtime['auto_visits']['attempts']['bob']['status']=='skipped'
 
 
-def test_partial_custom_list_does_not_add_random_people(plugin, module, monkeypatch):
-    clock, server = visit_setup(plugin, module, monkeypatch, visit_targets=['', 'Bob', ''])
+@pytest.mark.parametrize('targets,expected', [(['', 'Bob', ''], ['Bob']), (['Alice', 'Bob', ''], ['Alice', 'Bob'])])
+def test_partial_custom_list_does_not_add_random_people(plugin, module, monkeypatch, targets, expected):
+    clock, server = visit_setup(plugin, module, monkeypatch, visit_targets=targets)
     drive_visits(plugin, clock)
-    assert server.data['visits']['count']==1
+    assert [r['target_username'] for r in server.data['visits']['records']] == expected
+    assert server.data['visits']['count']==len(expected)
+    assert not any(a=='list_visitable_restaurants' for a,p in server.calls)
+
+
+def test_missing_username_skipped_without_using_quota_or_blocking_others(plugin, module, monkeypatch):
+    clock, server = visit_setup(plugin, module, monkeypatch, visit_targets=['MissingUser', 'Bob'])
+    drive_visits(plugin, clock)
+    assert server.data['visits']['count'] == 1
+    assert [r['target_username'] for r in server.data['visits']['records']] == ['Bob']
+    assert plugin._runtime['auto_visits']['count_floor'] == 1
+    assert plugin._runtime['auto_visits']['attempts']['missinguser'] == dict(
+        username='MissingUser', status='skipped', message='用户不存在')
+    assert sum(a=='inspect_restaurant_target' and p['target_username']=='MissingUser' for a,p in server.calls)==1
     assert not any(a=='list_visitable_restaurants' for a,p in server.calls)
 
 
