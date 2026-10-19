@@ -11,6 +11,11 @@
     <div class="sr-stats">
       <article v-for="item in stats" :key="item.label"><span>{{ item.label }}</span><strong>{{ item.value }}</strong></article>
     </div>
+    <section class="sr-card sr-automation" aria-label="后台自动经营状态">
+      <div class="sr-card-title"><h3>后台自动经营 · {{ view.automation?.enabled?'已开启':'已暂停' }}</h3><button @click="emit('switch','config')">{{ view.automation?.enabled?'暂停 / 调整托管':'设置自动经营' }}</button></div>
+      <p>{{ view.automation?.enabled ? (view.automation.message || '等待后台首次检查') : '可在配置中开启每日自动经营。' }}</p>
+      <p v-if="view.automation?.enabled" class="sr-muted">今日补货预算已占用 {{ number(view.automation.spent) }} / {{ number(view.automation.daily_budget) }} 魔力 · {{ view.automation.last_check ? `最近后台检查 ${new Date(view.automation.last_check*1000).toLocaleTimeString()}` : '尚未检查' }}。关闭本页面后继续运行。</p>
+    </section>
     <div class="sr-toolbar">
       <button class="sr-primary" :disabled="blocked || state.session_status !== 'ready' || !state.customers_total" @click="startSession">开始今日经营</button>
       <label><input type="checkbox" v-model="runStaff" :disabled="blocked || !data.staff?.unlocked">运行已雇员工</label>
@@ -116,10 +121,10 @@ const targetName = ref(''), recommendations = ref([]), logDays = ref(0), activeT
 const now = ref(Date.now()/1000), confirmation = ref(null)
 let clockOffset=0, timer=null, clock=null, alive=false, confirmResolver=null
 const data = computed(()=>view.value.restaurant || {}), state = computed(()=>data.value.state || {})
-const blocked = computed(()=>busy.value || !!view.value.uncertain || !data.value.state)
+const blocked = computed(()=>busy.value || !!view.value.uncertain || !!view.value.automation?.enabled || !data.value.state)
 const tabs = [{id:'kitchen',label:'厨房与餐位'},{id:'supplies',label:'食材与菜品'},{id:'staff',label:'员工'},{id:'visits',label:'下馆子'},{id:'logs',label:'经营日志'}]
 const roles = [{key:'chef',label:'🧑‍🍳 厨师'},{key:'server',label:'💁 服务员'}]
-const actionLabels = {purchase_ingredient:'购买食材',hire_staff:'雇佣员工',update_staff_assignment:'员工调度',start_session:'开始营业',visit_restaurant:'下馆子',serve_customer:'上菜',discard_dish:'丢弃菜品',customer_left:'顾客离席',resolve:'核对解锁'}
+const actionLabels = {purchase_ingredient:'购买食材',hire_staff:'雇佣员工',update_staff_assignment:'员工调度',start_session:'开始营业',visit_restaurant:'下馆子',serve_customer:'上菜',discard_dish:'丢弃菜品',customer_left:'顾客离席',resolve:'核对解锁',automation:'自动经营'}
 const number = n => Number(n || 0).toLocaleString()
 const statusLabel = computed(()=>({ready:'准备营业',open:'营业中',closed:'已闭店'}[state.value.session_status] || '未连接'))
 const stats = computed(()=>[{label:'魔力余额',value:number(data.value.user?.magic)},{label:'受欢迎值',value:number(state.value.popularity)},{label:'今日顾客',value:`${state.value.customers_served || 0} / ${state.value.customers_total || 0}`},{label:'今日净收益',value:number(state.value.net_earnings_today)},{label:'累计净收益',value:number(state.value.net_earnings_total)}])
@@ -138,7 +143,7 @@ function available(key){return Math.max(0,Number(data.value.inventory?.ingredien
 function stoveStatus(s){return {idle:'空闲',prepping:prepared(s)?'已备齐':'备菜中',cooking:'烹饪中',ready:'待上菜'}[s.status] || s.status}
 function assigned(index,role){const a=data.value.staff?.assignments_map || data.value.staff?.assignments || {};const value=(Array.isArray(a)?a.find(x=>Number(x.station_index)===index):a[index])?.[role];return value===true || value===1 || value==='1'}
 function unwrap(result){if(result?.restaurant || typeof result?.success==='boolean')return result;if(result?.data && typeof result.data.success==='boolean')return result.data;throw new Error('插件接口返回格式不正确')}
-function update(result){if(!alive)return;view.value=result;clockOffset=(result.server_now || Date.now()/1000)-Date.now()/1000;now.value=Date.now()/1000+clockOffset;for(const s of result.kitchen||[]){selected[s.index]??='';const matches=matchingCustomers(s);if(!matches.some(c=>String(c.id)===String(serveTargets[s.index])))serveTargets[s.index]=matches.find(c=>Number(c.seat)===s.index)?.id || matches[0]?.id || ''}for(const item of result.restaurant?.config?.ingredients || [])quantities[item.key]??=1;if(result.uncertain)runStaff.value=false}
+function update(result){if(!alive)return;view.value=result;clockOffset=(result.server_now || Date.now()/1000)-Date.now()/1000;now.value=Date.now()/1000+clockOffset;for(const s of result.kitchen||[]){selected[s.index]??='';const matches=matchingCustomers(s);if(!matches.some(c=>String(c.id)===String(serveTargets[s.index])))serveTargets[s.index]=matches.find(c=>Number(c.seat)===s.index)?.id || matches[0]?.id || ''}for(const item of result.restaurant?.config?.ingredients || [])quantities[item.key]??=1;if(result.uncertain || result.automation?.enabled)runStaff.value=false}
 async function request(path,payload,verb='post',quiet=false){if(busy.value)return null;busy.value=true;try{const r=unwrap(await props.api[verb](`plugin/${props.pluginId}${path}`,payload));update(r);if(!quiet || !r.success){message.value=r.message || (r.success?'操作完成':'操作失败');ok.value=r.success}return r}catch(e){if(alive){message.value=e.message || '请求失败，请刷新后核对';ok.value=false;runStaff.value=false}return null}finally{busy.value=false}}
 const act=(action,args={})=>request('/action',{action,args,request_id:(crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`)})
 const refresh=()=>request('/refresh',{})
@@ -154,7 +159,7 @@ async function recommend(){const r=await act('list_visitable_restaurants');if(r?
 async function lookup(){const r=await act('inspect_restaurant_target',{target_username:targetName.value});if(r?.success)recommendations.value=r.candidate?[r.candidate]:[]}
 async function visit(name){if(!await confirm('前往用餐',`前往 ${name} 的餐馆，将使用今日一次下馆子机会。`))return;let r=await act('visit_restaurant',{target_username:name});if(r?.requires_confirmation && await confirm('站点确认',r.message || '站点要求再次确认前往'))await act('visit_restaurant',{target_username:name,confirm:'yes'})}
 async function resolveUncertain(){if(await confirm('核对后解锁','请确认已经核对网站的余额、库存、员工与顾客状态。解除后不会重发原请求；结果不明的成品将释放本地预留。'))await request('/resolve',{acknowledged:true})}
-async function poll(){if(!alive)return;try{if(!document.hidden && !busy.value && !confirmation.value && data.value.state)await request('/tick',{run_staff:runStaff.value},'post',true)}finally{if(alive)timer=setTimeout(poll,2000)}}
+async function poll(){if(!alive)return;try{if(!document.hidden && !busy.value && !confirmation.value && data.value.state)await (view.value.automation?.enabled ? request('/state',undefined,'get',true) : request('/tick',{run_staff:runStaff.value},'post',true))}finally{if(alive)timer=setTimeout(poll,2000)}}
 function start(){if(alive)return;alive=true;request('/state',undefined,'get',true);clock=setInterval(()=>{now.value=Date.now()/1000+clockOffset},500);timer=setTimeout(poll,2000)}
 function stop(){alive=false;runStaff.value=false;clearTimeout(timer);clearInterval(clock);cancelConfirm()}
 onMounted(start);onActivated(start);onDeactivated(stop);onUnmounted(stop)

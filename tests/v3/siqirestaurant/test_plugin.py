@@ -56,7 +56,7 @@ def module(monkeypatch):
     monkeypatch.setitem(sys.modules, result.__name__, result)
     site = SimpleNamespace(url="https://si-qi.xyz", cookie="secret=one", ua="fixture-UA")
     result.__dict__.update(_PluginBase=Base, settings=SimpleNamespace(PROXY=None),
-                           SiteOper=lambda: SimpleNamespace(get_by_domain=lambda _: site))
+                           update_plugin_job=Mock(), SiteOper=lambda: SimpleNamespace(get_by_domain=lambda _: site))
     exec(compile(tree, str(PLUGIN / "__init__.py"), "exec"), result.__dict__)
     result.site = site
     monkeypatch.setattr(requests, "get", Mock(side_effect=AssertionError("unexpected site GET")))
@@ -290,3 +290,192 @@ def test_simultaneous_duplicate_request_one_write(plugin):
     for thread in threads:
         thread.join()
     assert sum(c.args[0] == "purchase_ingredient" for c in plugin._request.call_args_list) == 1
+
+
+class GameServer:
+    """Independent finite game simulation: queues, ingredient debits, seating and deadlines."""
+    def __init__(self, clock, count=15):
+        self.clock = clock
+        self.data = snapshot()
+        self.data['user']['magic'] = 100000
+        self.data['state'].update(session_status='ready', customers_total=count,
+                                  customer_plan=[], customers_served=0)
+        self.data['state']['unlocked']['stations'] = 4
+        self.data['state']['unlocked']['seats'] = 4
+        self.data['inventory']['ingredients']['egg'] = 4
+        self.queue = list(range(1, count+1))
+        self.cooldown = {}
+        self.calls = []
+        self.served = []
+
+    def seat(self):
+        state = self.data['state']
+        if state['session_status'] != 'open':
+            return
+        occupied = {c['seat'] for c in state['customer_plan'] if c['status'] == 'waiting'}
+        for seat in range(1, 5):
+            if seat not in occupied and self.queue and self.cooldown.get(seat, 0) <= self.clock[0]:
+                state['customer_plan'].append(dict(id=self.queue.pop(0), seat=seat, dish_key='egg',
+                    status='waiting', deadline=self.clock[0]+40, patience=40))
+        if not self.queue and not any(c['status']=='waiting' for c in state['customer_plan']):
+            state['session_status'] = 'closed'
+
+    def __call__(self, action, payload=None, **kwargs):
+        self.calls.append((action, payload, self.clock[0]))
+        self.seat()
+        if action == 'start_session':
+            assert self.data['state']['session_status'] == 'ready'
+            self.data['state']['session_status'] = 'open'
+            self.seat()
+        elif action == 'purchase_ingredient':
+            assert payload['quantity'] > 0
+            self.data['inventory']['ingredients']['egg'] += payload['quantity']
+            self.data['user']['magic'] -= payload['quantity'] * 12
+        elif action == 'serve_customer':
+            c = next(c for c in self.data['state']['customer_plan'] if c['id']==payload['customer_id'])
+            assert c['status'] == 'waiting' and c['deadline'] > self.clock[0]
+            assert c['dish_key'] == payload['dish_key']
+            assert self.data['inventory']['ingredients']['egg'] >= 2
+            self.data['inventory']['ingredients']['egg'] -= 2
+            self.data['user']['magic'] += 80
+            self.data['state']['customers_served'] += 1
+            c['status'] = 'served'
+            self.served.append(c['id'])
+            self.cooldown[c['seat']] = self.clock[0]+10
+            self.seat()
+        elif action == 'customer_left':
+            c = next(c for c in self.data['state']['customer_plan'] if c['id']==payload['customer_id'])
+            assert c['deadline'] <= self.clock[0]
+            c['status'] = 'left'
+            self.cooldown[c['seat']] = self.clock[0]+10
+            self.seat()
+        elif action != 'fetch':
+            raise AssertionError(f'unexpected automation operation: {action}')
+        return copy.deepcopy(self.data)
+
+
+def enable_auto(p, **config):
+    assert p.api_save_config({'auto_enabled':True, 'start_time':'00:00', 'magic_reserve':0, **config})['success']
+
+
+def test_complete_day_without_any_frontend_tick_with_restart(plugin, module, monkeypatch):
+    clock = [time.time()]
+    monkeypatch.setattr(module.time, 'time', lambda: clock[0])
+    server = GameServer(clock)
+    plugin._request = server
+    enable_auto(plugin)
+    for tick in range(200):
+        plugin.run_automation()
+        if tick == 4:
+            q = module.SiqiRestaurant()
+            q.storage = copy.deepcopy(plugin.storage)
+            q.init_plugin(plugin._config)
+            q._request = server
+            plugin = q
+        clock[0] += 1
+    assert server.data['state']['session_status'] == 'closed'
+    assert len(server.served) == len(set(server.served)) == 15
+    assert not any(c[0] == 'customer_left' for c in server.calls)
+    assert sum(c[0] == 'start_session' for c in server.calls) == 1
+    assert plugin._runtime['automation']['spent'] == (30-4)*12
+    assert len([c for c in server.calls if c[0]=='fetch']) < 50
+    assert all(s['status']=='idle' for s in plugin._runtime['kitchen'])
+
+
+def test_preflight_budget_and_reserve_prevent_opening(plugin):
+    plugin.fixture['state']['session_status'] = 'ready'
+    plugin.fixture['inventory']['ingredients']['egg'] = 0
+    enable_auto(plugin, daily_budget=1)
+    plugin.run_automation()
+    assert not any(c.args[0]=='start_session' for c in plugin._request.call_args_list)
+    assert '预算' in plugin._runtime['automation']['message']
+    enable_auto(plugin, daily_budget=5000, magic_reserve=10000)
+    plugin.run_automation()
+    assert '保留魔力' in plugin._runtime['automation']['message']
+    assert not any(c.args[0]=='start_session' for c in plugin._request.call_args_list)
+
+
+def test_unknown_purchase_holds_budget_across_restart_and_config(plugin, module):
+    plugin.fixture['inventory']['ingredients']['egg'] = 0
+    enable_auto(plugin)
+    previous = plugin._request
+    plugin._request = Mock(side_effect=lambda a,*args,**kw: previous(a,*args,**kw) if a=='fetch'
+                           else (_ for _ in ()).throw(module.RestaurantError('写入结果不明')))
+    plugin.run_automation()
+    assert plugin._runtime['pending']['action'] == 'purchase_ingredient'
+    assert plugin._runtime['automation']['spent'] == 24
+    q=module.SiqiRestaurant();q.storage=copy.deepcopy(plugin.storage);q.init_plugin(plugin._config)
+    q._request=plugin._request
+    q.run_automation()
+    enable_auto(q, daily_budget=500)
+    q.run_automation()
+    assert q._runtime['automation']['spent'] == 24
+    assert sum(c.args[0]=='purchase_ingredient' for c in q._request.call_args_list) == 1
+    module.site.cookie = 'rotated=credential'
+    q._context()
+    assert q._runtime['automation']['spent'] == 24
+
+
+def test_scheduler_lifecycle_manual_guard_and_page_readonly(plugin, module):
+    enable_auto(plugin)
+    jobs = plugin.get_service()
+    assert len(jobs)==1 and jobs[0]['trigger'].interval.total_seconds()==1
+    module.update_plugin_job.assert_called_with('SiqiRestaurant')
+    assert not action(plugin,'start_session')['success']
+    plugin.api_tick({'run_staff':True})
+    assert plugin._runtime['kitchen'][0]['status']=='idle'
+    plugin.stop_service()
+    before=plugin._request.call_count
+    plugin.run_automation()
+    assert plugin._request.call_count==before
+    assert plugin.api_save_config({'auto_enabled':False})['success']
+    assert plugin.get_service()==[]
+
+
+def test_cross_stove_service_and_cook_timer(plugin):
+    ready(plugin, index=2)
+    enable_auto(plugin)
+    plugin.run_automation()
+    assert plugin._runtime['kitchen'][1]['status']=='idle'
+    assert any(c.args[:2]==('serve_customer', {'dish_key':'egg','customer_id':1}) for c in plugin._request.call_args_list)
+
+
+def test_auto_no_duplicate_dishes_and_no_early_serving(plugin):
+    enable_auto(plugin)
+    plugin.run_automation()
+    plugin.run_automation()
+    assert [s['status'] for s in plugin._runtime['kitchen']]==['cooking','idle']
+    assert not any(c.args[0]=='serve_customer' for c in plugin._request.call_args_list)
+
+
+def test_autostart_time_and_idle_fetch_throttle(plugin, module, monkeypatch):
+    clock=[1792369800.0]  # before 23:59 Asia/Shanghai
+    monkeypatch.setattr(module.time,'time',lambda:clock[0])
+    plugin.fixture['state']['session_status']='ready'
+    enable_auto(plugin, start_time='23:59')
+    for _ in range(30):
+        plugin.run_automation();clock[0]+=1
+    assert plugin._runtime['automation']['phase']=='waiting'
+    assert sum(c.args[0]=='fetch' for c in plugin._request.call_args_list)<=2
+    assert not any(c.args[0]=='start_session' for c in plugin._request.call_args_list)
+
+
+def test_daily_budget_rollover_and_invalid_config(plugin, module, monkeypatch):
+    enable_auto(plugin)
+    clock=[time.time()];monkeypatch.setattr(module.time,'time',lambda:clock[0])
+    plugin._auto_account()['spent']=100
+    plugin.api_save_config({'daily_budget':200})
+    assert plugin._auto_account()['spent']==100
+    assert not plugin.api_save_config({'daily_budget':-1})['success']
+    assert not plugin.api_save_config({'start_time':'24:00'})['success']
+    clock[0]+=86400
+    assert plugin._auto_account()['spent']==0
+
+
+def test_transient_read_failure_does_not_write_and_backoff(plugin, module):
+    enable_auto(plugin)
+    plugin._request=Mock(side_effect=module.RestaurantError('读取失败'))
+    plugin.run_automation();plugin.run_automation()
+    assert plugin._request.call_count==1
+    assert not plugin._runtime.get('pending')
+    assert plugin._next_auto>time.time()+55

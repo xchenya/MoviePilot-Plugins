@@ -68,5 +68,17 @@ try {
   app=createApp(await component('Config'),{api:configApi});app.mount('#app');await settle()
   const password=document.querySelector('input[type=password]');assert.equal(password.value,'')
   await click('保存配置');assert.equal(configCalls.length,1);assert.equal(configCalls[0].cookie,'')
+  assert.equal(configCalls[0].auto_enabled,false)
+  assert.equal(configCalls[0].daily_budget,5000)
+  assert.equal(configCalls[0].magic_reserve,10000)
+  const autoBox=[...document.querySelectorAll('label')].find(l=>l.textContent.includes('后台自动经营')).querySelector('input')
+  autoBox.checked=true;autoBox.dispatchEvent(new Event('change',{bubbles:true}));await settle()
+  await click('保存配置');assert.equal(configCalls.at(-1).auto_enabled,true)
+  app.unmount();app=null;document.querySelector('#app').innerHTML=''
+  const autoApi={get:async()=>({...response(),automation:{enabled:true,spent:48,daily_budget:5000,message:'后台正在烹饪'}}),post:async()=>{throw new Error('unexpected page write')}}
+  app=createApp(await component('Page'),{api:autoApi});app.mount('#app');await settle()
+  assert(document.body.textContent.includes('后台正在烹饪'))
+  assert([...document.querySelectorAll('button')].find(b=>b.textContent==='开始今日经营').disabled)
+  assert(document.querySelector('input[type="checkbox"]').disabled)
   console.log('PASS: compiled Page/Config mounting; namespaced API; purchase budget confirmation/cancel; site visit confirmation; masked cookie settings')
 } finally {app?.unmount();dom.window.close();rmSync(output,{recursive:true,force:true})}
