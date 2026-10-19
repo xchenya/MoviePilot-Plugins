@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import math
+import re
 import threading
 import time
 from datetime import datetime
@@ -12,10 +13,12 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 import requests
+from apscheduler.triggers.interval import IntervalTrigger
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.sdk.plugin import _PluginBase
 from app.sdk.config import settings
+from app.sdk.scheduler import update_plugin_job
 from app.db.oper.site import SiteOper
 
 
@@ -32,6 +35,7 @@ class RestaurantResult(BaseModel):
     restaurants: list[dict[str, Any]] = Field(default_factory=list)
     candidate: dict[str, Any] | None = None
     events: list[dict[str, Any]] = Field(default_factory=list)
+    automation: dict[str, Any] = Field(default_factory=dict)
 
 
 class PublicConfig(BaseModel):
@@ -39,6 +43,11 @@ class PublicConfig(BaseModel):
     use_proxy: bool = False
     cookie_configured: bool = False
     site_configured: bool = False
+    auto_enabled: bool = False
+    start_time: str = "08:00"
+    auto_purchase: bool = True
+    daily_budget: int = 5000
+    magic_reserve: int = 10000
 
 
 class ConfigResult(BaseModel):
@@ -64,9 +73,9 @@ def serialized(func):
 
 class SiqiRestaurant(_PluginBase):
     plugin_name = "思齐餐厅"
-    plugin_desc = "在 MoviePilot 内经营思齐餐厅，管理厨房、员工、食材、下馆子及经营日志。"
+    plugin_desc = "思齐餐厅后台自动经营：每日开业、并行烹饪、及时上菜、限额补货及原生管理面板。"
     plugin_icon = "https://si-qi.xyz/favicon.ico"
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_author = "xchenya"
     author_url = "https://github.com/xchenya"
     plugin_config_prefix = "siqirestaurant_"
@@ -82,6 +91,8 @@ class SiqiRestaurant(_PluginBase):
         self._runtime = {}
         self._last_fetch = 0
         self._stopped = False
+        self._next_auto = 0
+        self._stop_auto = threading.Event()
 
     def init_plugin(self, config: dict = None):
         with self._lock:
@@ -89,10 +100,23 @@ class SiqiRestaurant(_PluginBase):
             self._config = {"enabled": self._bool(values.get("enabled", False)),
                             "use_proxy": self._bool(values.get("use_proxy", False)),
                             "cookie": str(values.get("cookie") or "").strip()}
+            self._config.update(self._auto_config(values))
             self._runtime = self.get_data("runtime") or {}
             self._snapshot = {}
             self._last_fetch = 0
             self._stopped = False
+            self._stop_auto.clear()
+            self._next_auto = 0
+
+    def _auto_config(self, values):
+        start = str(values.get("start_time", "08:00"))
+        if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", start):
+            raise RestaurantError("开业时间须为 HH:MM（北京时间）")
+        return {"auto_enabled": self._bool(values.get("auto_enabled", False)),
+                "auto_purchase": self._bool(values.get("auto_purchase", True)),
+                "start_time": start,
+                "daily_budget": self._int(values.get("daily_budget", 5000), "每日采购预算", 0, 1000000),
+                "magic_reserve": self._int(values.get("magic_reserve", 10000), "保留魔力", 0, 1000000000)}
 
     @staticmethod
     def _bool(value):
@@ -105,8 +129,11 @@ class SiqiRestaurant(_PluginBase):
         return []
 
     def get_service(self):
-        # 第一阶段不注册无人值守任务；页面关闭后不发起站点操作。
-        return []
+        if not self.get_state() or not self._config.get("auto_enabled"):
+            return []
+        return [{"id": f"{self.__class__.__name__}.automation", "name": "思齐餐厅自动经营",
+                 "trigger": IntervalTrigger(seconds=1), "func": self.run_automation,
+                 "kwargs": {"max_instances": 1, "coalesce": True, "misfire_grace_time": 10}}]
 
     def get_form(self):
         return None, self.api_config()
@@ -119,6 +146,7 @@ class SiqiRestaurant(_PluginBase):
 
     def stop_service(self):
         self._stopped = True
+        self._stop_auto.set()
 
     def get_api(self):
         definitions = [
@@ -138,11 +166,13 @@ class SiqiRestaurant(_PluginBase):
         site = self._siteoper.get_by_domain("si-qi.xyz")
         return {"enabled": self.get_state(), "use_proxy": self._config.get("use_proxy", False),
                 "cookie_configured": bool(self._config.get("cookie") or getattr(site, "cookie", None)),
-                "site_configured": bool(site)}
+                "site_configured": bool(site), **self._auto_config(self._config)}
 
     def api_save_config(self, payload: dict = None) -> dict:
+        payload = payload or {}
+        if payload.get("auto_enabled") is False or payload.get("enabled") is False:
+            self._stop_auto.set()
         with self._lock:
-            payload = payload or {}
             config = dict(self._config)
             for key in ("enabled", "use_proxy"):
                 if key in payload:
@@ -151,11 +181,23 @@ class SiqiRestaurant(_PluginBase):
                 config["cookie"] = ""
             elif str(payload.get("cookie") or "").strip():
                 config["cookie"] = str(payload["cookie"]).strip()
+            try:
+                config.update(self._auto_config({**config, **payload}))
+            except RestaurantError as exc:
+                self._stop_auto.clear()
+                return {"success": False, "message": str(exc), "config": self.api_config()}
             self.update_config(config)
             self._config = config
             self._snapshot = {}
             self._last_fetch = 0
-            return {"success": True, "message": "配置已保存", "config": self.api_config()}
+            self._next_auto = 0
+            self._stop_auto.clear()
+        # 宿主统一管理任务，配置保存后立即生效，停用时移除原任务。
+        try:
+            update_plugin_job(self.__class__.__name__)
+        except Exception:
+            return {"success": False, "message": "配置已保存，但定时任务更新失败，请重启 MP 后检查托管状态", "config": self.api_config()}
+        return {"success": True, "message": "配置已保存", "config": self.api_config()}
 
     def _credentials(self):
         site = self._siteoper.get_by_domain("si-qi.xyz")
@@ -176,8 +218,12 @@ class SiqiRestaurant(_PluginBase):
         cookie, _ = self._credentials()
         context = hashlib.sha256(cookie.encode()).hexdigest()
         if self._runtime.get("context") != context:
+            pending = copy.deepcopy(self._runtime.get("pending"))
+            if pending:
+                pending["stove"] = None  # 新凭据的厨房已隔离，未知请求仍须人工核对。
             self._runtime = {"context": context, "day": "", "kitchen": [], "cleaning": {},
-                             "pending": None, "receipts": {}, "events": []}
+                             "pending": pending, "receipts": self._runtime.get("receipts", {}), "events": [],
+                             "automation": self._runtime.get("automation", {})}
             self._snapshot = {}
             self._last_fetch = 0
             self._save()
@@ -275,6 +321,10 @@ class SiqiRestaurant(_PluginBase):
                 "kitchen": copy.deepcopy(self._runtime.get("kitchen", [])),
                 "cleaning": dict(self._runtime.get("cleaning", {})), "server_now": time.time(),
                 "uncertain": bool(self._runtime.get("pending")),
+                "automation": {**copy.deepcopy(self._runtime.get("automation", {})),
+                               "enabled": bool(self.get_state() and self._config.get("auto_enabled")),
+                               "daily_budget": self._config.get("daily_budget", 5000),
+                               "next_check": self._next_auto},
                 "events": copy.deepcopy(self._runtime.get("events", [])), **extra}
 
     @serialized
@@ -481,6 +531,8 @@ class SiqiRestaurant(_PluginBase):
         payload = payload or {}
         self._ensure_fresh(force=True)
         action = str(payload.get("action") or "")
+        if self._config.get("auto_enabled") and action not in {"list_visitable_restaurants", "inspect_restaurant_target"}:
+            raise RestaurantError("后台正在托管，请先在配置中暂停自动经营，再执行手动操作")
         args = payload.get("args") or {}
         if not isinstance(args, dict):
             raise RestaurantError("操作参数必须为对象")
@@ -505,6 +557,8 @@ class SiqiRestaurant(_PluginBase):
     @serialized
     def api_tick(self, payload: dict = None) -> dict:
         self._ensure_fresh()
+        if self._config.get("auto_enabled"):
+            return self._result()  # 页面仅观察，后台是唯一自动执行者。
         if self._runtime.get("pending"):
             return self._result(False, "存在结果不明的写入，员工服务已暂停")
         state = self._snapshot["state"]
@@ -549,6 +603,211 @@ class SiqiRestaurant(_PluginBase):
         self._save()
         return self._result()
 
+    def _auto_status(self, phase, message):
+        auto = self._runtime.setdefault("automation", {})
+        changed = auto.get("phase") != phase or auto.get("message") != message
+        auto.update(phase=phase, message=message, last_check=time.time())
+        if changed:
+            self._event("automation", message, phase not in {"blocked", "error", "uncertain"})
+        self._save()
+
+    def _auto_account(self):
+        # 预算按北京时间自然日计算，不能由保存配置或重新启用重置。
+        day = datetime.fromtimestamp(time.time(), ZoneInfo("Asia/Shanghai")).date().isoformat()
+        auto = self._runtime.setdefault("automation", {})
+        if auto.get("budget_day") != day:
+            auto.update(budget_day=day, spent=0)
+            self._save()
+        return auto
+
+    def _purchase_cost(self, shortages):
+        prices = {i["key"]: float(i["price"]) for i in self._snapshot["config"].get("ingredients", [])}
+        total = 0
+        for key, quantity in shortages.items():
+            price = prices.get(key, -1)
+            if not math.isfinite(price) or price <= 0:
+                raise RestaurantError("食材价格异常，暂停自动补货")
+            total += price * quantity
+        auto = self._auto_account()
+        if total > 0:
+            if not self._config["auto_purchase"]:
+                raise RestaurantError("食材不足，自动补货未开启")
+            if auto.get("spent", 0) + total > self._config["daily_budget"]:
+                raise RestaurantError("食材缺口超出今日剩余采购预算，请补货或调整预算")
+            if float(self._snapshot.get("user", {}).get("magic", 0)) - total < self._config["magic_reserve"]:
+                raise RestaurantError("补货后余额将低于保留魔力，请补货或调整保留值")
+        return total
+
+    def _preflight(self):
+        """开业前检查所有可能菜单的保守库存上界，不提前扣费或假定未来订单。"""
+        state = self._snapshot["state"]
+        inventory = self._snapshot["inventory"]
+        customers = int(state.get("customers_total") or 0)
+        needs = {}
+        for key in state.get("unlocked", {}).get("dishes", []):
+            dish = self._dish(key)
+            if not inventory.get("tools", {}).get(dish["tool"]):
+                raise RestaurantError("菜单所需工具未解锁，暂不开业")
+            for item in dish["ingredients"]:
+                needs[item["key"]] = max(needs.get(item["key"], 0), int(item["quantity"]) * customers)
+        if not needs:
+            raise RestaurantError("未读取到可用菜单，暂不开业")
+        shortages = {k: n - int(inventory.get("ingredients", {}).get(k, 0))
+                     for k, n in needs.items() if n > int(inventory.get("ingredients", {}).get(k, 0))}
+        self._purchase_cost(shortages)
+
+    def run_automation(self):
+        """宿主每秒唤醒；空闲每分钟查询，营业期每轮至多一次远端写入。"""
+        if (self._stopped or self._stop_auto.is_set() or not self.get_state()
+                or not self._config.get("auto_enabled") or time.time() < self._next_auto):
+            return
+        if not self._lock.acquire(blocking=False):
+            return
+        try:
+            if self._stopped or self._stop_auto.is_set() or not self._config.get("auto_enabled"):
+                return
+            self._ensure_fresh()
+            self._auto_account()
+            if self._runtime.get("pending"):
+                self._auto_status("uncertain", "写入结果不明，等待人工核对解锁；不会重发")
+                self._next_auto = time.time() + 60
+                return
+            self._auto_step()
+        except RestaurantError as exc:
+            self._auto_status("uncertain" if self._runtime.get("pending") else "blocked", str(exc))
+            self._next_auto = time.time() + 60
+        except Exception:
+            # 不将响应、Cookie 或请求对象写入日志。
+            self._auto_status("error", "自动经营遇到异常，60 秒后重新检查；不重试结果不明的写入")
+            self._next_auto = time.time() + 60
+        finally:
+            self._lock.release()
+
+    def _auto_write_result(self, result, description):
+        if not result["success"]:
+            raise RestaurantError(result["message"] or "站点拒绝操作")
+        self._auto_status("running", description)
+
+    def _auto_step(self):
+        if self._stopped or self._stop_auto.is_set():
+            return
+        state = self._snapshot["state"]
+        status = state.get("session_status")
+        if status == "ready":
+            local = datetime.fromtimestamp(time.time(), ZoneInfo("Asia/Shanghai"))
+            if local.strftime("%H:%M") < self._config["start_time"]:
+                self._auto_status("waiting", f"等待北京时间 {self._config['start_time']} 开业")
+                self._next_auto = time.time() + 60
+                return
+            if not state.get("customers_total"):
+                self._auto_status("waiting", "今日暂无顾客，等待下次检查")
+                self._next_auto = time.time() + 60
+                return
+            self._preflight()
+            self._auto_write_result(self._dispatch("start_session", {}), "今日已自动开业")
+            return
+        if status != "open":
+            self._auto_status("closed", "今日已结束；后台会检查新增顾客及下一日营业状态")
+            self._next_auto = time.time() + 60
+            return
+        now = time.time()
+        customers = sorted((c for c in state.get("customer_plan", [])
+                            if c.get("status") == "waiting" and c.get("seat")),
+                           key=lambda c: float(c.get("deadline") or 0))
+        cleaning = self._runtime["cleaning"]
+        # 到期离席也必须通知站点；不提前离席、不伪造服务。
+        for customer in customers:
+            if (float(customer.get("deadline") or 0) <= now
+                    and cleaning.get(str(customer["seat"]), 0) <= now):
+                self._auto_write_result(self._write("customer_left", {"customer_id": customer["id"]},
+                                                    customer=customer), "已处理到期离席顾客")
+                return
+        waiting = [c for c in customers if float(c.get("deadline") or 0) > now]
+        stoves = self._runtime["kitchen"]
+        # 按手动规则跨灶台上菜，最急订单优先；每份真实烹饪成品只提交一次。
+        for customer in waiting:
+            if cleaning.get(str(customer["seat"]), 0) > now:
+                continue
+            stove = next((s for s in stoves if s["status"] == "ready" and s["dish_key"] == customer["dish_key"]), None)
+            if stove:
+                self._auto_write_result(self._dispatch("serve", {"station_index": stove["index"],
+                                                               "customer_id": customer["id"]}),
+                                        f"灶台 {stove['index']} 已完成上菜")
+                return
+        # 已备菜/烹饪/成品都占用一份需求，避免多个灶台重复做同一份订单。
+        covered = {}
+        for stove in stoves:
+            if stove["status"] != "idle":
+                covered[stove["dish_key"]] = covered.get(stove["dish_key"], 0) + 1
+        for customer in waiting:
+            key = customer["dish_key"]
+            if covered.get(key, 0):
+                covered[key] -= 1
+                continue
+            stove = next((s for s in stoves if s["status"] == "idle"), None)
+            if not stove:
+                break
+            self._dish(key)
+            stove.update(dish_key=key, status="prepping")
+        # 无须等待清理结束才能备菜，但上菜严格受 10 秒清理限制。
+        shortages = {}
+        errors = []
+        for stove in stoves:
+            if stove["status"] != "prepping":
+                continue
+            dish = self._dish(stove["dish_key"])
+            usage = self._usage()
+            missing = {i["key"]: int(i["quantity"]) - stove["ingredients"].get(i["key"], 0)
+                       - (int(self._snapshot["inventory"].get("ingredients", {}).get(i["key"], 0)) - usage.get(i["key"], 0))
+                       for i in dish["ingredients"]}
+            missing = {k: n for k, n in missing.items() if n > 0}
+            if missing:
+                # 只补当前实际订单；库存预留由 _prepare 原子更新。
+                for key, n in missing.items():
+                    shortages[key] = max(shortages.get(key, 0), n)
+                continue
+            try:
+                self._prepare(stove)
+                self._cook(stove)
+            except RestaurantError as exc:
+                errors.append(str(exc))
+        self._save()  # 任何后续采购前，先持久化已经启动的烹饪。
+        if shortages:
+            try:
+                self._purchase_cost(shortages)
+                if self._auto_account().get("purchase_retry_at", 0) > time.time():
+                    raise RestaurantError("补货被拒绝，等待 60 秒后重查")
+                key, quantity = next(iter(shortages.items()))
+                quantity = min(quantity, 10000)
+                cost = self._purchase_cost({key: quantity})
+                auto = self._auto_account()
+                # 先占预算再写；崩溃/未知结果保持占用，绝不靠重启突破每日限额。
+                auto["spent"] = auto.get("spent", 0) + cost
+                self._save()
+                if self._stopped or self._stop_auto.is_set():
+                    auto["spent"] -= cost
+                    self._save()
+                    return
+                result = self._dispatch("purchase_ingredient", {"ingredient_key": key, "quantity": quantity, "max_cost": cost})
+                if not result["success"]:
+                    auto["spent"] -= cost
+                    auto["purchase_retry_at"] = time.time() + 60
+                    self._save()
+                self._auto_write_result(result, f"按实际订单补货，今日采购已占用 {auto['spent']:g} 魔力")
+                return
+            except RestaurantError as exc:
+                if self._runtime.get("pending"):
+                    raise
+                errors.append(str(exc))
+        if errors:
+            self._auto_status("blocked", errors[0] + "；已在烹饪的订单继续处理")
+        elif any(s["status"] == "cooking" for s in stoves):
+            self._auto_status("running", "按订单并行烹饪，完成后自动上菜")
+        elif waiting and all(s["status"] == "ready" for s in stoves):
+            self._auto_status("blocked", "成品暂不匹配当前订单，等待匹配顾客；可暂停托管后手动清理")
+        else:
+            self._auto_status("running", "等待烹饪、餐位清理或顾客入座")
+
     @serialized
     def api_resolve(self, payload: dict = None) -> dict:
         if (payload or {}).get("acknowledged") is not True:
@@ -566,5 +825,6 @@ class SiqiRestaurant(_PluginBase):
                 self._runtime.setdefault("receipts", {})[pending["request_id"]] = {
                     "success": False, "message": "不确定请求已核对，不得重放"}
             self._event("resolve", "用户核对后解除锁定；原请求未重发", True)
+            self._next_auto = 0
             self._save()
         return self._result(message="已解除锁定；原请求未重发")

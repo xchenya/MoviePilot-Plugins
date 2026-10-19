@@ -13,7 +13,7 @@ import pytest
 from playwright.sync_api import sync_playwright
 from app.plugins.dian115sign.browser import API, ORIGIN, BrowserRunner, Options
 
-HTML = r'''<!doctype html><html><body><div id="app">Loading</div>
+HTML = r'''<!doctype html><html><head><meta charset="utf-8"></head><body><div id="app">Loading</div>
 <script>
 const app = document.querySelector('#app');
 async function boot() {
@@ -156,7 +156,7 @@ def exercise(chromium, *, diagnose=False, lucky=False, style="direct", gate_stat
             html = (HTML.replace("STYLE", json.dumps(style))
                     .replace("AUTO_SIGN", json.dumps(auto_sign))
                     .replace("CLIENT_ALREADY", json.dumps(client_already)))
-            route.fulfill(status=200, content_type="text/html", body=html)
+            route.fulfill(status=200, content_type="text/html; charset=utf-8", body=html)
 
     def launch(**kwargs):
         kwargs.pop("headless", None)
