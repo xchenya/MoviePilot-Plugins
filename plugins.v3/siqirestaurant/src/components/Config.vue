@@ -42,6 +42,28 @@
         </div>
         <p class="sr-config-help">预算每日重置，保存设置与重启不会清零。</p>
       </section>
+
+      <section class="sr-card sr-config-panel">
+        <div class="sr-config-panel-head"><h3>自动下馆子</h3><span class="sr-badge">每日最多 3 人</span></div>
+        <label class="sr-setting">
+          <span class="sr-setting-copy"><strong>自动下馆子</strong><small>经营结束后，按名单到访其他餐馆</small></span>
+          <span class="sr-switch"><input type="checkbox" v-model="config.auto_visit"><span aria-hidden="true"></span></span>
+        </label>
+        <div class="sr-visit-fields">
+          <label v-for="(_, i) in targets" :key="i" class="sr-field"><span>用户名 {{ i+1 }}</span><input v-model.trim="targets[i]" maxlength="64" :aria-label="`下馆子用户名 ${i+1}`" placeholder="选填"></label>
+        </div>
+        <p class="sr-config-help">全部留空：每天随机选择 3 位不同用户。填写后只到访名单中的用户，空位不补人。不可到访的用户会跳过并记录原因。</p>
+        <p class="sr-config-help">沿用每日开业时间；也可单独开启下馆子。已用次数会扣除，重启不会重复到访。开启即按原站“一键下馆子”规则确认到访，为对方增加顾客。</p>
+      </section>
+
+      <section class="sr-card sr-config-panel">
+        <div class="sr-config-panel-head"><h3>消息通知</h3><span class="sr-badge">MoviePilot</span></div>
+        <label class="sr-setting">
+          <span class="sr-setting-copy"><strong>发送运行通知</strong><small>通过 MP 已配置的通知渠道发送</small></span>
+          <span class="sr-switch"><input type="checkbox" v-model="config.notify"><span aria-hidden="true"></span></span>
+        </label>
+        <p class="sr-config-help">汇总今日经营与下馆子结果，提示预算不足、写入结果不明等异常。同类通知每天最多一次，逐次上菜和补货不会推送。</p>
+      </section>
     </div>
 
     <details class="sr-config-details">
@@ -71,7 +93,7 @@
           <li>使用所有已解锁灶台，遵守烹饪和清理计时，优先处理耐心将耗尽的订单。</li>
           <li>开业前检查预算能否覆盖保守估计的食材缺口；补货后余额不低于最低保留魔力。</li>
           <li>保存并启用后，到达开业时间会立即开始。关闭托管后，已发送的请求会完成，但不会继续下一步。</li>
-          <li>扩招员工、丢弃成品与下馆子需暂停托管后手动操作。</li>
+          <li>扩招员工、丢弃成品与手动下馆子需先关闭两个后台任务开关。</li>
           <li>建议不要同时使用网页和插件经营同一餐厅，两端厨房进度相互独立。</li>
         </ul>
       </div>
@@ -88,8 +110,9 @@ import { onMounted, reactive, ref } from 'vue'
 import '../style.css'
 const props=defineProps({api:Object,pluginId:{type:String,default:'SiqiRestaurant'},initialConfig:Object})
 const emit=defineEmits(['switch','close','config-updated'])
-const config=reactive({enabled:false,use_proxy:false,cookie_configured:false,site_configured:false,auto_enabled:false,start_time:"08:00",auto_purchase:true,daily_budget:5000,magic_reserve:10000})
+const config=reactive({enabled:false,use_proxy:false,cookie_configured:false,site_configured:false,auto_enabled:false,start_time:"08:00",auto_purchase:true,daily_budget:5000,magic_reserve:10000,auto_visit:false,visit_targets:[],notify:false})
+const targets=ref(['','',''])
 const cookie=ref(''),clearCookie=ref(false),message=ref(''),saving=ref(false),loaded=ref(false)
-onMounted(async()=>{try{Object.assign(config,await props.api.get(`plugin/${props.pluginId}/config`));loaded.value=true}catch(e){message.value=e.message || '读取配置失败'}})
-async function save(){saving.value=true;try{const r=await props.api.post(`plugin/${props.pluginId}/config`,{enabled:config.enabled,use_proxy:config.use_proxy,auto_enabled:config.auto_enabled,start_time:config.start_time,auto_purchase:config.auto_purchase,daily_budget:config.daily_budget,magic_reserve:config.magic_reserve,cookie:cookie.value,clear_cookie:clearCookie.value});message.value=r.message;if(r.success){Object.assign(config,r.config);cookie.value='';clearCookie.value=false;emit('config-updated',r.config)}}catch(e){message.value=e.message || '保存失败'}finally{saving.value=false}}
+onMounted(async()=>{try{Object.assign(config,await props.api.get(`plugin/${props.pluginId}/config`));targets.value=[0,1,2].map(i=>config.visit_targets?.[i] || '');loaded.value=true}catch(e){message.value=e.message || '读取配置失败'}})
+async function save(){saving.value=true;try{const r=await props.api.post(`plugin/${props.pluginId}/config`,{enabled:config.enabled,use_proxy:config.use_proxy,auto_enabled:config.auto_enabled,start_time:config.start_time,auto_purchase:config.auto_purchase,daily_budget:config.daily_budget,magic_reserve:config.magic_reserve,auto_visit:config.auto_visit,visit_targets:targets.value,notify:config.notify,cookie:cookie.value,clear_cookie:clearCookie.value});message.value=r.message;if(r.success){Object.assign(config,r.config);targets.value=[0,1,2].map(i=>config.visit_targets?.[i] || '');cookie.value='';clearCookie.value=false;emit('config-updated',r.config)}}catch(e){message.value=e.message || '保存失败'}finally{saving.value=false}}
 </script>
