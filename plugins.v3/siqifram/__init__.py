@@ -189,7 +189,7 @@ class SiqiFram(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/KoWming/MoviePilot-Plugins/main/icons/siqi.png"
     # 插件版本
-    plugin_version = "2.2.0"
+    plugin_version = "2.2.1"
     # 插件作者
     plugin_author = "KoWming（V3 适配：xchenya）"
     # 作者主页
@@ -1217,17 +1217,42 @@ class SiqiFram(_PluginBase):
         }
         plots = []
         candidate_plots = victim.get("victim_plots") or []
+        excluded = {"land_unavailable": 0, "empty": 0, "unrecognized_crop": 0,
+                    "unselected_crop": 0, "not_ready": 0, "already_stolen": 0}
+        checked_plots = 0
         for plot in candidate_plots:
             if not isinstance(plot, dict):
                 continue
+            checked_plots += 1
             land_id = plot.get("land_id")
+            # 按首个不满足的条件计数，避免同一坑位重复计入排除原因。
             if victim_lands and (land_id is None or int(land_id) not in unlocked_lands):
-                continue
-            if self._can_steal_plot(plot):
+                excluded["land_unavailable"] += 1
+            elif self._can_steal_plot(plot):
                 plots.append((land_id, plot.get("plot_index")))
+            elif not plot.get("seed_id"):
+                excluded["empty"] += 1
+            elif not plot.get("steal_crop_name"):
+                excluded["unrecognized_crop"] += 1
+            elif plot.get("steal_crop_name") not in self._steal_crops:
+                excluded["unselected_crop"] += 1
+            elif not self._is_plot_ready(plot):
+                excluded["not_ready"] += 1
+            elif plot.get("stolen"):
+                excluded["already_stolen"] += 1
+        target_name = victim.get("victim_desc_name") or victim.get("victim_name") or "未提供名称"
+        diagnostics = {"target_id": victim_id, "target_name": target_name,
+                       "selected_crops": list(self._steal_crops), "checked_plots": checked_plots,
+                       "matched_plots": len(plots), "excluded": excluded}
+        details = (f"目标：{target_name}（ID：{victim_id}）；检查 {checked_plots} 个坑位，"
+                   f"所选作物：{'、'.join(self._steal_crops)}，匹配 {len(plots)} 个；"
+                   f"排除：土地不可用 {excluded['land_unavailable']}、空地 {excluded['empty']}、"
+                   f"作物无法识别 {excluded['unrecognized_crop']}、作物未选 {excluded['unselected_crop']}、"
+                   f"未成熟 {excluded['not_ready']}、已偷 {excluded['already_stolen']}")
         if not plots:
-            return {"success": False, "message": f"未找到所选范围内的成熟作物，今日剩余可偷 {remaining} 个",
-                    "remaining_steals": remaining, "victim": victim}
+            return {"success": False,
+                    "message": f"本次目标农场未找到所选范围内的成熟作物，今日剩余可偷 {remaining} 个\n{details}",
+                    "remaining_steals": remaining, "diagnostics": diagnostics, "victim": victim}
 
         logs = []
         success_count = 0
@@ -1256,8 +1281,10 @@ class SiqiFram(_PluginBase):
                 message += f"；结束会话失败：{finished.get('msg') or finished.get('message') or '站点未确认'}"
             return {"success": bool(finished.get("success")), "message": message, "logs": logs,
                     "stolen_count": success_count, "last_result": last_result,
+                    "diagnostics": diagnostics,
                     "remaining_steals": self._remaining_steals(fresh) if fresh.get("success") else None}
-        result = {"success": False, "message": last_result.get("msg") or last_result.get("message") or "偷菜失败", "logs": logs, "victim": victim}
+        result = {"success": False, "message": last_result.get("msg") or last_result.get("message") or "偷菜失败",
+                  "logs": logs, "diagnostics": diagnostics, "victim": victim}
         return result
 
     def _like_random(self, payload: dict = None) -> Dict[str, Any]:

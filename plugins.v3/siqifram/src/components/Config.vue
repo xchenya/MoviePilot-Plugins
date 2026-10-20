@@ -6,7 +6,7 @@
           <v-icon icon="mdi-cog-outline" size="24" />
         </div>
         <div>
-          <div class="siqi-topbar__title">思齐农场 · 配置 · v2.2.0</div>
+          <div class="siqi-topbar__title">思齐农场 · 配置 · v2.2.1</div>
           <div class="siqi-topbar__sub">管理定时任务、自动化策略与站点 Cookie</div>
         </div>
       </div>
@@ -151,7 +151,7 @@
           <span class="siqi-card__title d-flex align-center">
             <v-icon icon="mdi-incognito" size="18" color="red" class="mr-1" />偷菜设置
           </span>
-          <v-btn color="red" size="small" variant="tonal" @click="saveStealConfig" :loading="stealSaving" :disabled="!stealLoaded">保存偷菜设置</v-btn>
+          <v-btn color="red" size="small" variant="tonal" @click="saveStealConfig()" :loading="stealSaving" :disabled="!stealLoaded || stealSaving">保存偷菜设置</v-btn>
         </div>
         <v-switch v-model="stealConfig.auto_steal" label="自动偷菜" color="red" hide-details density="compact" />
         <div class="siqi-schedule-card siqi-schedule-card--cron">
@@ -174,6 +174,11 @@
           class="siqi-input"
         />
         <div class="siqi-field-hint">偷菜巡检只检查所选作物，按站点当日剩余次数执行，与总 Cron 和成熟收获任务独立。只影响偷菜，不改变默认种子或种子解锁列表；全部取消则不偷菜。</div>
+        <div class="d-flex align-center flex-wrap ga-2">
+          <v-btn color="red" size="small" variant="tonal" @click="saveStealConfig(true)" :loading="stealSaving" :disabled="!stealLoaded || stealSaving">保存后运行一次偷菜</v-btn>
+          <span class="text-caption text-medium-emphasis">自动偷菜关闭时也可手动运行；仅保存偷菜设置并执行偷菜。</span>
+        </div>
+        <div v-if="stealStatus" class="text-caption" :class="{'text-error': stealStatusType === 'error'}" role="status" aria-live="polite">{{ stealStatus }}</div>
       </div>
     </div>
   </div>
@@ -193,6 +198,8 @@ const saving = ref(false)
 const configLoaded = ref(false)
 const stealLoaded = ref(false)
 const stealSaving = ref(false)
+const stealStatus = ref('')
+const stealStatusType = ref('info')
 const seedLoading = ref(false)
 const seedCached = ref(false)
 const seedError = ref('')
@@ -297,15 +304,33 @@ async function loadStealConfig() {
   }
 }
 
-async function saveStealConfig() {
+async function saveStealConfig(runOnce = false) {
+  if (stealSaving.value) return
   if (!stealLoaded.value) return show('偷菜配置尚未加载成功，请关闭后重新打开', 'error')
   stealSaving.value = true
+  stealStatus.value = '正在保存偷菜设置…'
+  stealStatusType.value = 'info'
+  let saved = false
   try {
     const res = await apiPost('/steal-config', { auto_steal: stealConfig.auto_steal, steal_crops: [...stealConfig.steal_crops], steal_cron: stealConfig.steal_cron })
-    if (res.success && res.config) Object.assign(stealConfig, res.config)
-    show(res.message || (res.success ? '偷菜配置已保存' : '偷菜配置保存失败'), res.success ? 'success' : 'error')
+    saved = !!res.success
+    if (saved && res.config) Object.assign(stealConfig, res.config)
+    stealStatus.value = res.message || (saved ? '偷菜配置已保存' : '偷菜配置保存失败')
+    stealStatusType.value = saved ? 'success' : 'error'
+    if (saved && runOnce === true) {
+      stealStatus.value = '偷菜设置已保存，正在运行一次偷菜…'
+      stealStatusType.value = 'info'
+      const result = await apiPost('/steal')
+      const detail = result.message || result.msg || (result.success ? '偷菜执行完成' : '站点未返回成功结果')
+      stealStatus.value = result.uncertain ? `偷菜设置已保存；执行结果不明：${detail}`
+        : result.success ? `偷菜设置已保存；${detail}` : `偷菜设置已保存，但运行失败：${detail}`
+      stealStatusType.value = result.success && !result.uncertain ? 'success' : 'error'
+    }
+    show(stealStatus.value, stealStatusType.value)
   } catch (e) {
-    show(`偷菜配置保存失败：${e.message}`, 'error')
+    stealStatus.value = saved ? `偷菜设置已保存，但未能确认偷菜执行结果：${e.message}` : `偷菜配置保存失败：${e.message}`
+    stealStatusType.value = 'error'
+    show(stealStatus.value, 'error')
   } finally {
     stealSaving.value = false
   }

@@ -141,12 +141,12 @@ def test_task_notification_and_shared_cache_use_the_resolved_account(plugin, mon
 
 def test_market_and_api_contract(plugin, module):
     entry = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))["SiqiFram"]
-    assert plugin.plugin_version == entry["version"] == "2.2.0"
+    assert plugin.plugin_version == entry["version"] == "2.2.1"
     assert entry["system_version"] == ">=3.0.0"
     assert entry["release"] is True  # Federation packaging requirement.
     assert "KoWming" in plugin.plugin_author
     assert "GNU GENERAL PUBLIC LICENSE" in (PLUGIN / "LICENSE").read_text(encoding="utf-8")
-    assert plugin.get_render_mode() == ("vue", "dist/assets-v2.2.0")
+    assert plugin.get_render_mode() == ("vue", "dist/assets-v2.2.1")
     assert (PLUGIN / plugin.get_render_mode()[1] / "remoteEntry.js").is_file()
     routes = plugin.get_api()
     assert len(routes) == 28
@@ -411,6 +411,111 @@ def test_subset_filters_maturity_and_leaves_daily_retry_available(plugin, monkey
     writes = [call.kwargs["data"] for call in post.call_args_list
               if call.kwargs["data"]["action"] == "steal_vegetable"]
     assert [item["plot_index"] for item in writes] == [5]
+
+
+@pytest.mark.parametrize("mode", ["automatic", "manual"])
+def test_same_eggplant_snapshot_with_one_remaining_works_in_both_modes(plugin, monkeypatch, mode):
+    victim, post = steal_fixture(plugin, monkeypatch)
+    plugin._steal_crops = ["茄子"]
+    victim["steal_count_today"] = 19
+    if mode == "automatic":
+        result = plugin._steal_once()
+        assert result["stolen_count"] == 1
+        assert result["diagnostics"]["matched_plots"] == 1
+    else:
+        plugin._get_steal_target()
+        result = plugin._steal_plot({"victim_id": 88, "land_id": 3, "plot_index": 3})
+    assert result["success"]
+    writes = [call.kwargs["data"] for call in post.call_args_list
+              if call.kwargs["data"]["action"] == "steal_vegetable"]
+    assert writes == [{"action": "steal_vegetable", "victim_id": 88, "land_id": 3, "plot_index": 3}]
+
+
+def test_unmatched_target_reports_exclusive_filter_counts_in_result_and_patrol_log(plugin, monkeypatch, module):
+    plugin.init_plugin({"enabled": True, "auto_steal": True, "notify": False, "steal_crops": ["茄子"]})
+    victim, post = steal_fixture(plugin, monkeypatch)
+    victim.update(victim_name="本次测试目标", steal_count_today=19,
+                  victim_lands=[{"id": 3, "unlocked": 1}, {"id": 4, "unlocked": 0}],
+                  victim_plots=[
+                      {"land_id": 3, "plot_index": 0, "seed_id": None, "stolen": True},
+                      {"land_id": 3, "plot_index": 1, "seed_id": 999, "seed_name": "茄子", "is_ready": 1},
+                      {"land_id": 3, "plot_index": 2, "seed_id": 91, "is_ready": 1},
+                      {"land_id": 3, "plot_index": 3, "seed_id": 27, "is_ready": 0,
+                       "harvest_time": int(time.time()) + 3600},
+                      {"land_id": 3, "plot_index": 4, "seed_id": 27, "is_ready": 1, "stolen": True},
+                      {"land_id": 4, "plot_index": 0, "seed_id": 27, "is_ready": 0, "stolen": True},
+                  ])
+    result = plugin._steal_once()
+    assert not result["success"] and result["remaining_steals"] == 1
+    assert result["diagnostics"] == {
+        "target_id": 88, "target_name": "本次测试目标", "selected_crops": ["茄子"],
+        "checked_plots": 6, "matched_plots": 0,
+        "excluded": {"land_unavailable": 1, "empty": 1, "unrecognized_crop": 1,
+                     "unselected_crop": 1, "not_ready": 1, "already_stolen": 1},
+    }
+    assert "本次目标农场" in result["message"] and "本次测试目标（ID：88）" in result["message"]
+    assert "检查 6 个坑位，所选作物：茄子，匹配 0 个" in result["message"]
+    assert "土地不可用 1、空地 1、作物无法识别 1、作物未选 1、未成熟 1、已偷 1" in result["message"]
+    plugin._steal_task()
+    assert plugin.get_data("last_steal_result") == result["message"]
+    assert sum(result["message"] in call.args[0] for call in module.logger.info.call_args_list) == 1
+    assert [call.kwargs["data"]["action"] for call in post.call_args_list] == ["get_victim_farm"] * 2
+    plugin.post_message.assert_not_called()
+
+
+def test_different_returned_targets_can_have_different_selected_crop_results(plugin, monkeypatch):
+    victim, post = steal_fixture(plugin, monkeypatch)
+    plugin._steal_crops = ["茄子"]
+    first = {**victim, "victim_name": "没有所选作物的目标", "max_steal_count": 1,
+             "victim_plots": [{"land_id": 3, "plot_index": 0, "seed_id": 91, "is_ready": 1}]}
+    second = {**victim, "victim_id": 99, "victim_name": "有成熟茄子的目标", "max_steal_count": 1,
+              "victim_plots": [{"land_id": 3, "plot_index": 0, "seed_id": 27, "is_ready": 1}]}
+    targets = iter([first, second])
+    post.side_effect = lambda url, **kwargs: response(next(targets)
+        if kwargs["data"]["action"] == "get_victim_farm" else {"success": True, "reward": 2})
+    first_result = plugin._steal_once()
+    assert not first_result["success"]
+    assert first_result["diagnostics"]["target_id"] == 88
+    assert first_result["diagnostics"]["excluded"]["unselected_crop"] == 1
+    assert len(post.call_args_list) == 1
+    second_result = plugin._steal_once()
+    assert second_result["success"] and second_result["diagnostics"]["target_id"] == 99
+    writes = [call.kwargs["data"] for call in post.call_args_list
+              if call.kwargs["data"]["action"] == "steal_vegetable"]
+    assert len(writes) == 1 and writes[0]["victim_id"] == 99
+
+
+def test_steal_route_preserves_diagnostics_saved_choices_lock_and_uncertainty(plugin, monkeypatch):
+    victim, post = steal_fixture(plugin, monkeypatch)
+    plugin._steal_crops = ["茄子"]
+    assert plugin._auto_steal is False
+    victim["victim_plots"] = [{"land_id": 3, "plot_index": 0, "seed_id": 91, "is_ready": 1}]
+    route = next(r for r in plugin.get_api() if r["path"] == "/steal")
+    app = FastAPI()
+    app.add_api_route(**{key: value for key, value in route.items() if key != "auth"})
+    client = TestClient(app)
+    result = client.post("/steal", json={"steal_crops": ["萝卜"]}).json()
+    assert not result["success"]
+    assert result["diagnostics"]["selected_crops"] == ["茄子"]
+    assert result["diagnostics"]["excluded"]["unselected_crop"] == 1
+    post.reset_mock()
+    with plugin._run_lock:
+        busy = client.post("/steal", json={}).json()
+    assert not busy["success"] and "稍后重试" in busy["message"]
+    post.assert_not_called()
+    victim["victim_plots"][0]["seed_id"] = 27
+    original = post.side_effect
+
+    def uncertain(url, **kwargs):
+        if kwargs["data"]["action"] == "steal_vegetable":
+            raise requests.ReadTimeout("lost response")
+        return original(url, **kwargs)
+
+    post.side_effect = uncertain
+    result = client.post("/steal", json={}).json()
+    assert not result["success"] and result["uncertain"] is True
+    assert [call.kwargs["data"]["action"] for call in post.call_args_list] == ["get_victim_farm", "steal_vegetable"]
+    assert plugin._steal_target == {} and plugin._run_activity == ""
 
 
 @pytest.mark.parametrize("catalog", [None, {"success": False}, {"success": True, "seeds": []}])

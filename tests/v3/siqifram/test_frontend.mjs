@@ -83,7 +83,7 @@ function configHarness(api, initialConfig = {}) {
   const script = descriptor.scriptSetup.content.split('\n')
     .filter(line => !line.startsWith('import ')).join('\n')
   return new Function('reactive', 'ref', 'onMounted', 'defineProps', 'defineEmits',
-    'setTimeout', 'clearTimeout', script + '\nreturn { config, stealConfig, seedOptions, seedError, seedCached, seedLoading, configLoaded, stealLoaded, loadConfig, loadSeeds, loadStealConfig, saveConfig, saveStealConfig }')(
+    'setTimeout', 'clearTimeout', script + '\nreturn { config, stealConfig, seedOptions, seedError, seedCached, seedLoading, configLoaded, stealLoaded, stealSaving, stealStatus, stealStatusType, loadConfig, loadSeeds, loadStealConfig, saveConfig, saveStealConfig }')(
       value => value, value => ({ value }), () => {},
       () => ({ api, pluginId: 'SiqiFram', initialConfig }), () => () => {},
       () => 0, () => {},
@@ -122,6 +122,7 @@ test('planting seed list keeps all crops and unlock status, separate steal Cron 
   state.stealConfig.steal_crops = []
   await state.saveStealConfig()
   await state.saveConfig()
+  assert.equal(posts.length, 3)
   assert.deepEqual(posts.slice(0, 2), [
     ['plugin/SiqiFram/steal-config', { auto_steal: true, steal_crops: ['玉米', '樱桃'], steal_cron: '*/10 * * * *' }],
     ['plugin/SiqiFram/steal-config', { auto_steal: true, steal_crops: [], steal_cron: '*/10 * * * *' }],
@@ -151,6 +152,97 @@ test('legacy steal configuration defaults to an independent fifteen minute Cron'
   ])
 })
 
+test('save and run waits for saved steal settings, prevents duplicate clicks, and preserves planting settings', async () => {
+  const posts = []
+  let finishSave
+  let finishRun
+  const state = configHarness({
+    get: async () => ({ auto_steal: false, steal_crops: ['茄子'], steal_cron: '*/15 * * * *' }),
+    post: (url, data) => {
+      posts.push([url, structuredClone(data)])
+      return new Promise(resolve => {
+        if (url.endsWith('/steal-config')) finishSave = resolve
+        else finishRun = resolve
+      })
+    },
+  }, { seed_id: '120', cron: '0 */4 * * *', cookie: 'unchanged' })
+  await state.loadStealConfig()
+  const planting = structuredClone(state.config)
+  const running = state.saveStealConfig(true)
+  assert.equal(state.stealSaving.value, true)
+  assert.equal(state.stealStatus.value, '正在保存偷菜设置…')
+  await state.saveStealConfig(true)
+  await state.saveStealConfig()
+  assert.deepEqual(posts, [
+    ['plugin/SiqiFram/steal-config', { auto_steal: false, steal_crops: ['茄子'], steal_cron: '*/15 * * * *' }],
+  ])
+  finishSave({ success: true, config: posts[0][1] })
+  await Promise.resolve()
+  assert.equal(state.stealStatus.value, '偷菜设置已保存，正在运行一次偷菜…')
+  assert.equal(state.stealSaving.value, true)
+  assert.deepEqual(posts.map(([url]) => url), ['plugin/SiqiFram/steal-config', 'plugin/SiqiFram/steal'])
+  assert.equal(posts[1][1], undefined)
+  await state.saveStealConfig(true)
+  await state.saveStealConfig()
+  assert.equal(posts.length, 2)
+  finishRun({ success: true, message: '偷菜完成：成功 2 个，获得 50 魔力' })
+  await running
+  assert.equal(state.stealStatus.value, '偷菜设置已保存；偷菜完成：成功 2 个，获得 50 魔力')
+  assert.equal(state.stealStatusType.value, 'success')
+  assert.equal(state.stealSaving.value, false)
+  assert.equal(state.stealConfig.auto_steal, false)
+  assert.deepEqual(state.config, planting)
+  const source = fs.readFileSync(path.join(plugin, 'src/components/Config.vue'), 'utf8')
+  assert.match(source, /role="status" aria-live="polite">\{\{ stealStatus \}\}/)
+})
+
+test('save and run never executes when saving fails or its outcome is unknown', async () => {
+  for (const response of [{ success: false, message: 'Cron 格式无效' }, new Error('保存连接中断')]) {
+    const posts = []
+    const state = configHarness({
+      get: async () => ({ auto_steal: true, steal_crops: ['萝卜'] }),
+      post: async url => {
+        posts.push(url)
+        if (response instanceof Error) throw response
+        return response
+      },
+    })
+    await state.loadStealConfig()
+    await state.saveStealConfig(true)
+    assert.deepEqual(posts, ['plugin/SiqiFram/steal-config'])
+    assert.match(state.stealStatus.value, response instanceof Error ? /保存连接中断/ : /Cron 格式无效/)
+    assert.equal(state.stealStatusType.value, 'error')
+    assert.equal(state.stealSaving.value, false)
+  }
+})
+
+test('run failures and uncertain outcomes keep the saved state and report the real result without retrying', async () => {
+  const cases = [
+    [{ success: false, message: '未找到所选范围内的成熟作物' }, '偷菜设置已保存，但运行失败：未找到所选范围内的成熟作物'],
+    [{ success: false, uncertain: true, message: '请求超时，结果不明' }, '偷菜设置已保存；执行结果不明：请求超时，结果不明'],
+    [new Error('连接中断'), '偷菜设置已保存，但未能确认偷菜执行结果：连接中断'],
+  ]
+  for (const [result, expected] of cases) {
+    const posts = []
+    const state = configHarness({
+      get: async () => ({ auto_steal: false, steal_crops: ['玉米'] }),
+      post: async (url, data) => {
+        posts.push(url)
+        if (url.endsWith('/steal-config')) return { success: true, config: data }
+        if (result instanceof Error) throw result
+        return result
+      },
+    })
+    await state.loadStealConfig()
+    await state.saveStealConfig(true)
+    assert.deepEqual(posts, ['plugin/SiqiFram/steal-config', 'plugin/SiqiFram/steal'])
+    assert.equal(state.stealStatus.value, expected)
+    assert.equal(state.stealStatusType.value, 'error')
+    assert.equal(state.stealSaving.value, false)
+    assert.deepEqual(state.stealConfig.steal_crops, ['玉米'])
+  }
+})
+
 test('seed read errors stay visible without a fake radish option or default overwrite', async () => {
   const posts = []
   const state = configHarness({
@@ -178,6 +270,7 @@ test('failed configuration reads cannot save frontend fallback defaults', async 
   await Promise.all([state.loadConfig(), state.loadStealConfig()])
   await state.saveConfig()
   await state.saveStealConfig()
+  await state.saveStealConfig(true)
   assert.equal(writes, 0)
   assert.equal(state.config.seed_id, '120')
 })
