@@ -24,13 +24,13 @@
         </div>
       </section>
       <section class="sr-card sr-config-card">
-        <div class="sr-card-title"><h3><v-icon icon="mdi-tune-variant" color="info" size="18" />经营参数</h3><v-chip size="x-small" variant="tonal" color="info">北京时间</v-chip></div>
+        <div class="sr-card-title"><h3><v-icon icon="mdi-tune-variant" color="info" size="18" />经营参数</h3><v-chip size="x-small" variant="tonal" color="info">MP 时区</v-chip></div>
         <div class="sr-form-grid">
-          <v-text-field v-model="config.start_time" label="每日开业时间" type="time" prepend-inner-icon="mdi-clock-outline" />
+          <VCronField v-model="config.cron" label="执行时间（Cron）" density="compact" />
           <v-text-field v-model.number="config.daily_budget" label="每日采购预算（魔力）" type="number" min="0" max="1000000" step="1" prepend-inner-icon="mdi-basket-outline" />
           <v-text-field v-model.number="config.magic_reserve" label="最低保留魔力" type="number" min="0" max="1000000000" step="1" prepend-inner-icon="mdi-shield-check-outline" />
         </div>
-        <p class="sr-hint">错过开业时间会补开；关闭页面后继续运行。采购预算每日重置，保存设置与重启不会清零。</p>
+        <p class="sr-hint">默认每天 08:00；例如 0 8,12,18 * * * 表示每天 08:00、12:00、18:00 检查。未营业则开始经营，已闭店则结束本次任务。采购预算仍按北京时间每日重置。</p>
       </section>
       <section class="sr-card sr-config-card">
         <div class="sr-card-title"><h3><v-icon icon="mdi-account-group-outline" color="#ec4899" size="18" />下馆子名单</h3><v-chip size="x-small" variant="tonal" color="#ec4899">{{ targets.some(t=>t.trim())?'指定用户':'随机 3 人' }}</v-chip></div>
@@ -38,7 +38,7 @@
           <v-text-field v-for="(_,i) in targets" :key="i" v-model.trim="targets[i]" :label="`用户名 ${i+1}（选填）`" :aria-label="`下馆子用户名 ${i+1}`" maxlength="64" placeholder="填写准确的站点用户名" prepend-inner-icon="mdi-account-outline" />
         </div>
         <p class="sr-hint">全部留空时，每天随机选择 3 位不同用户；只填 1–2 人也可以，空位不随机补人。用户名不存在或不可到访时会跳过并记录原因，不影响其余名单。</p>
-        <p class="sr-hint">沿用开业时间，可单独开启下馆子。已用次数会扣除，重启不会重复到访；开启后按原站“一键下馆子”规则确认到访，为对方增加顾客。</p>
+        <p class="sr-hint">沿用 Cron 执行时间，可单独开启下馆子。已用次数会扣除，重启不会重复到访；开启后按原站“一键下馆子”规则确认到访，为对方增加顾客。</p>
       </section>
       <v-expansion-panels class="sr-expansions" variant="accordion" multiple>
         <v-expansion-panel elevation="0">
@@ -61,7 +61,6 @@
           </ul></v-expansion-panel-text>
         </v-expansion-panel>
       </v-expansion-panels>
-      <footer class="sr-config-footer"><span class="sr-hint">调整完成后保存生效</span><v-btn prepend-icon="mdi-content-save-outline" @click="save" :loading="saving" :disabled="saving || !loaded">保存配置</v-btn></footer>
     </v-defaults-provider>
   </section>
 </template>
@@ -70,12 +69,13 @@ import { onMounted, reactive, ref } from 'vue'
 import '../style.css'
 const props=defineProps({api:Object,pluginId:{type:String,default:'SiqiRestaurant'},initialConfig:Object})
 const emit=defineEmits(['switch','close','config-updated'])
-const config=reactive({enabled:false,use_proxy:false,cookie_configured:false,site_configured:false,auto_enabled:false,start_time:"08:00",auto_purchase:true,daily_budget:5000,magic_reserve:10000,auto_visit:false,visit_targets:[],notify:false})
+const config=reactive({enabled:false,use_proxy:false,cookie_configured:false,site_configured:false,auto_enabled:false,cron:"0 8 * * *",run_once:false,auto_purchase:true,daily_budget:5000,magic_reserve:10000,auto_visit:false,visit_targets:[],notify:false})
 const fieldDefaults = { VTextField: { density: 'compact', variant: 'outlined', hideDetails: 'auto', color: 'success' }, VBtn: { size: 'small', variant: 'tonal', color: 'success' } }
 const switchGroups = [
   { title: '基础设置', icon: 'mdi-toggle-switch-outline', color: '#22c55e', items: [
     { key: 'enabled', label: '启用插件', desc: '开启餐厅管理与后台服务', icon: 'mdi-power-plug', color: '#22c55e', accent: '34,197,94' },
     { key: 'notify', label: '发送运行通知', desc: '通过 MP 通知渠道推送结果与异常', icon: 'mdi-bell-outline', color: '#3b82f6', accent: '59,130,246' },
+    { key: 'run_once', label: '保存后运行一次', desc: '保存后检查并经营至闭店，开关自动关闭', icon: 'mdi-play-circle-outline', color: '#f59e0b', accent: '245,158,11' },
     { key: 'use_proxy', label: '使用系统代理', desc: '使用 MP 已配置的代理连接站点', icon: 'mdi-lan-connect', color: '#8b5cf6', accent: '139,92,246' }
   ] },
   { title: '自动化策略', icon: 'mdi-robot-outline', color: '#f59e0b', items: [
@@ -87,5 +87,5 @@ const switchGroups = [
 const targets=ref(['','',''])
 const cookie=ref(''),clearCookie=ref(false),message=ref(''),messageType=ref('info'),saving=ref(false),loaded=ref(false)
 onMounted(async()=>{try{Object.assign(config,await props.api.get(`plugin/${props.pluginId}/config`));targets.value=[0,1,2].map(i=>config.visit_targets?.[i] || '');loaded.value=true}catch(e){message.value=e.message || '读取配置失败';messageType.value='error'}})
-async function save(){saving.value=true;try{const r=await props.api.post(`plugin/${props.pluginId}/config`,{enabled:config.enabled,use_proxy:config.use_proxy,auto_enabled:config.auto_enabled,start_time:config.start_time,auto_purchase:config.auto_purchase,daily_budget:config.daily_budget,magic_reserve:config.magic_reserve,auto_visit:config.auto_visit,visit_targets:targets.value,notify:config.notify,cookie:cookie.value,clear_cookie:clearCookie.value});message.value=r.message;messageType.value=r.success?'success':'error';if(r.success){Object.assign(config,r.config);targets.value=[0,1,2].map(i=>config.visit_targets?.[i] || '');cookie.value='';clearCookie.value=false;emit('config-updated',r.config)}}catch(e){message.value=e.message || '保存失败';messageType.value='error'}finally{saving.value=false}}
+async function save(){saving.value=true;try{const r=await props.api.post(`plugin/${props.pluginId}/config`,{enabled:config.enabled,use_proxy:config.use_proxy,auto_enabled:config.auto_enabled,cron:config.cron,run_once:config.run_once,auto_purchase:config.auto_purchase,daily_budget:config.daily_budget,magic_reserve:config.magic_reserve,auto_visit:config.auto_visit,visit_targets:targets.value,notify:config.notify,cookie:cookie.value,clear_cookie:clearCookie.value});message.value=r.message;messageType.value=r.success?'success':'error';if(r.success){Object.assign(config,r.config);targets.value=[0,1,2].map(i=>config.visit_targets?.[i] || '');cookie.value='';clearCookie.value=false;emit('config-updated',r.config)}}catch(e){message.value=e.message || '保存失败';messageType.value='error'}finally{saving.value=false}}
 </script>

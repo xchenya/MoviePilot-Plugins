@@ -22,7 +22,6 @@ const _hoisted_15 = { class: "sr-expansion-heading" };
 const _hoisted_16 = { class: "sr-connection-status" };
 const _hoisted_17 = { class: "sr-stack" };
 const _hoisted_18 = { class: "sr-expansion-heading" };
-const _hoisted_19 = { class: "sr-config-footer" };
 
 const {onMounted,reactive,ref} = await importShared('vue');
 
@@ -34,12 +33,13 @@ const _sfc_main = {
 
 const props=__props;
 const emit=__emit;
-const config=reactive({enabled:false,use_proxy:false,cookie_configured:false,site_configured:false,auto_enabled:false,start_time:"08:00",auto_purchase:true,daily_budget:5000,magic_reserve:10000,auto_visit:false,visit_targets:[],notify:false});
+const config=reactive({enabled:false,use_proxy:false,cookie_configured:false,site_configured:false,auto_enabled:false,cron:"0 8 * * *",run_once:false,auto_purchase:true,daily_budget:5000,magic_reserve:10000,auto_visit:false,visit_targets:[],notify:false});
 const fieldDefaults = { VTextField: { density: 'compact', variant: 'outlined', hideDetails: 'auto', color: 'success' }, VBtn: { size: 'small', variant: 'tonal', color: 'success' } };
 const switchGroups = [
   { title: '基础设置', icon: 'mdi-toggle-switch-outline', color: '#22c55e', items: [
     { key: 'enabled', label: '启用插件', desc: '开启餐厅管理与后台服务', icon: 'mdi-power-plug', color: '#22c55e', accent: '34,197,94' },
     { key: 'notify', label: '发送运行通知', desc: '通过 MP 通知渠道推送结果与异常', icon: 'mdi-bell-outline', color: '#3b82f6', accent: '59,130,246' },
+    { key: 'run_once', label: '保存后运行一次', desc: '保存后检查并经营至闭店，开关自动关闭', icon: 'mdi-play-circle-outline', color: '#f59e0b', accent: '245,158,11' },
     { key: 'use_proxy', label: '使用系统代理', desc: '使用 MP 已配置的代理连接站点', icon: 'mdi-lan-connect', color: '#8b5cf6', accent: '139,92,246' }
   ] },
   { title: '自动化策略', icon: 'mdi-robot-outline', color: '#f59e0b', items: [
@@ -51,7 +51,7 @@ const switchGroups = [
 const targets=ref(['','','']);
 const cookie=ref(''),clearCookie=ref(false),message=ref(''),messageType=ref('info'),saving=ref(false),loaded=ref(false);
 onMounted(async()=>{try{Object.assign(config,await props.api.get(`plugin/${props.pluginId}/config`));targets.value=[0,1,2].map(i=>config.visit_targets?.[i] || '');loaded.value=true;}catch(e){message.value=e.message || '读取配置失败';messageType.value='error';}});
-async function save(){saving.value=true;try{const r=await props.api.post(`plugin/${props.pluginId}/config`,{enabled:config.enabled,use_proxy:config.use_proxy,auto_enabled:config.auto_enabled,start_time:config.start_time,auto_purchase:config.auto_purchase,daily_budget:config.daily_budget,magic_reserve:config.magic_reserve,auto_visit:config.auto_visit,visit_targets:targets.value,notify:config.notify,cookie:cookie.value,clear_cookie:clearCookie.value});message.value=r.message;messageType.value=r.success?'success':'error';if(r.success){Object.assign(config,r.config);targets.value=[0,1,2].map(i=>config.visit_targets?.[i] || '');cookie.value='';clearCookie.value=false;emit('config-updated',r.config);}}catch(e){message.value=e.message || '保存失败';messageType.value='error';}finally{saving.value=false;}}
+async function save(){saving.value=true;try{const r=await props.api.post(`plugin/${props.pluginId}/config`,{enabled:config.enabled,use_proxy:config.use_proxy,auto_enabled:config.auto_enabled,cron:config.cron,run_once:config.run_once,auto_purchase:config.auto_purchase,daily_budget:config.daily_budget,magic_reserve:config.magic_reserve,auto_visit:config.auto_visit,visit_targets:targets.value,notify:config.notify,cookie:cookie.value,clear_cookie:clearCookie.value});message.value=r.message;messageType.value=r.success?'success':'error';if(r.success){Object.assign(config,r.config);targets.value=[0,1,2].map(i=>config.visit_targets?.[i] || '');cookie.value='';clearCookie.value=false;emit('config-updated',r.config);}}catch(e){message.value=e.message || '保存失败';messageType.value='error';}finally{saving.value=false;}}
 
 return (_ctx, _cache) => {
   const _component_v_icon = _resolveComponent("v-icon");
@@ -61,6 +61,7 @@ return (_ctx, _cache) => {
   const _component_v_progress_linear = _resolveComponent("v-progress-linear");
   const _component_v_switch = _resolveComponent("v-switch");
   const _component_v_chip = _resolveComponent("v-chip");
+  const _component_VCronField = _resolveComponent("VCronField");
   const _component_v_text_field = _resolveComponent("v-text-field");
   const _component_v_expansion_panel_title = _resolveComponent("v-expansion-panel-title");
   const _component_v_checkbox = _resolveComponent("v-checkbox");
@@ -231,18 +232,17 @@ return (_ctx, _cache) => {
               color: "info"
             }, {
               default: _withCtx(() => [...(_cache[13] || (_cache[13] = [
-                _createTextVNode("北京时间", -1)
+                _createTextVNode("MP 时区", -1)
               ]))]),
               _: 1
             })
           ]),
           _createElementVNode("div", _hoisted_11, [
-            _createVNode(_component_v_text_field, {
-              modelValue: config.start_time,
-              "onUpdate:modelValue": _cache[3] || (_cache[3] = $event => ((config.start_time) = $event)),
-              label: "每日开业时间",
-              type: "time",
-              "prepend-inner-icon": "mdi-clock-outline"
+            _createVNode(_component_VCronField, {
+              modelValue: config.cron,
+              "onUpdate:modelValue": _cache[3] || (_cache[3] = $event => ((config.cron) = $event)),
+              label: "执行时间（Cron）",
+              density: "compact"
             }, null, 8, ["modelValue"]),
             _createVNode(_component_v_text_field, {
               modelValue: config.daily_budget,
@@ -267,7 +267,7 @@ return (_ctx, _cache) => {
               "prepend-inner-icon": "mdi-shield-check-outline"
             }, null, 8, ["modelValue"])
           ]),
-          _cache[14] || (_cache[14] = _createElementVNode("p", { class: "sr-hint" }, "错过开业时间会补开；关闭页面后继续运行。采购预算每日重置，保存设置与重启不会清零。", -1))
+          _cache[14] || (_cache[14] = _createElementVNode("p", { class: "sr-hint" }, "默认每天 08:00；例如 0 8,12,18 * * * 表示每天 08:00、12:00、18:00 检查。未营业则开始经营，已闭店则结束本次任务。采购预算仍按北京时间每日重置。", -1))
         ]),
         _createElementVNode("section", _hoisted_12, [
           _createElementVNode("div", _hoisted_13, [
@@ -306,7 +306,7 @@ return (_ctx, _cache) => {
             }), 128))
           ]),
           _cache[16] || (_cache[16] = _createElementVNode("p", { class: "sr-hint" }, "全部留空时，每天随机选择 3 位不同用户；只填 1–2 人也可以，空位不随机补人。用户名不存在或不可到访时会跳过并记录原因，不影响其余名单。", -1)),
-          _cache[17] || (_cache[17] = _createElementVNode("p", { class: "sr-hint" }, "沿用开业时间，可单独开启下馆子。已用次数会扣除，重启不会重复到访；开启后按原站“一键下馆子”规则确认到访，为对方增加顾客。", -1))
+          _cache[17] || (_cache[17] = _createElementVNode("p", { class: "sr-hint" }, "沿用 Cron 执行时间，可单独开启下馆子。已用次数会扣除，重启不会重复到访；开启后按原站“一键下馆子”规则确认到访，为对方增加顾客。", -1))
         ]),
         _createVNode(_component_v_expansion_panels, {
           class: "sr-expansions",
@@ -410,21 +410,7 @@ return (_ctx, _cache) => {
             })
           ]),
           _: 1
-        }),
-        _createElementVNode("footer", _hoisted_19, [
-          _cache[23] || (_cache[23] = _createElementVNode("span", { class: "sr-hint" }, "调整完成后保存生效", -1)),
-          _createVNode(_component_v_btn, {
-            "prepend-icon": "mdi-content-save-outline",
-            onClick: save,
-            loading: saving.value,
-            disabled: saving.value || !loaded.value
-          }, {
-            default: _withCtx(() => [...(_cache[22] || (_cache[22] = [
-              _createTextVNode("保存配置", -1)
-            ]))]),
-            _: 1
-          }, 8, ["loading", "disabled"])
-        ])
+        })
       ]),
       _: 1
     })
