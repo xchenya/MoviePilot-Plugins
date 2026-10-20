@@ -58,7 +58,7 @@ def module(monkeypatch):
     result = ModuleType("siqirestaurant_test")
     monkeypatch.setitem(sys.modules, result.__name__, result)
     site = SimpleNamespace(url="https://si-qi.xyz", cookie="secret=one", ua="fixture-UA")
-    result.__dict__.update(_PluginBase=Base, settings=SimpleNamespace(PROXY=None),
+    result.__dict__.update(_PluginBase=Base, settings=SimpleNamespace(PROXY=None,TZ="Asia/Shanghai"),
                            NotificationType=SimpleNamespace(Plugin="plugin"),
                            update_plugin_job=Mock(), SiteOper=lambda: SimpleNamespace(get_by_domain=lambda _: site))
     exec(compile(tree, str(PLUGIN / "__init__.py"), "exec"), result.__dict__)
@@ -359,7 +359,8 @@ class GameServer:
 
 
 def enable_auto(p, **config):
-    assert p.api_save_config({'auto_enabled':True, 'start_time':'00:00', 'magic_reserve':0, **config})['success']
+    assert p.api_save_config({'auto_enabled':True, 'cron':'0 8 * * *', 'magic_reserve':0, **config})['success']
+    p.start_automation()
 
 
 def test_complete_day_without_any_frontend_tick_with_restart(plugin, module, monkeypatch):
@@ -423,7 +424,7 @@ def test_unknown_purchase_holds_budget_across_restart_and_config(plugin, module)
 def test_scheduler_lifecycle_manual_guard_and_page_readonly(plugin, module):
     enable_auto(plugin)
     jobs = plugin.get_service()
-    assert len(jobs)==1 and jobs[0]['trigger'].interval.total_seconds()==1
+    assert len(jobs)==2 and jobs[1]['trigger'].interval.total_seconds()==1
     module.update_plugin_job.assert_called_with('SiqiRestaurant')
     assert not action(plugin,'start_session')['success']
     plugin.api_tick({'run_staff':True})
@@ -452,16 +453,20 @@ def test_auto_no_duplicate_dishes_and_no_early_serving(plugin):
     assert not any(c.args[0]=='serve_customer' for c in plugin._request.call_args_list)
 
 
-def test_autostart_time_and_idle_fetch_throttle(plugin, module, monkeypatch):
-    clock=[1792369800.0]  # before 23:59 Asia/Shanghai
+def test_cron_idle_does_not_fetch(plugin, module, monkeypatch):
+    clock=[1792369800.0]
     monkeypatch.setattr(module.time,'time',lambda:clock[0])
     plugin.fixture['state']['session_status']='ready'
-    enable_auto(plugin, start_time='23:59')
-    for _ in range(30):
+    assert plugin.api_save_config({'auto_enabled':True, 'cron':'0 8,12,18 * * *', 'magic_reserve':0})['success']
+    before=plugin._request.call_count
+    for _ in range(3600):
         plugin.run_automation();clock[0]+=1
-    assert plugin._runtime['automation']['phase']=='waiting'
-    assert sum(c.args[0]=='fetch' for c in plugin._request.call_args_list)<=2
-    assert not any(c.args[0]=='start_session' for c in plugin._request.call_args_list)
+    assert plugin._request.call_count==before
+    cron=plugin.get_service()[0]['trigger']
+    assert str(cron.timezone)=='Asia/Shanghai'
+    plugin.start_automation()
+    plugin.run_automation()
+    assert any(c.args[0]=='start_session' for c in plugin._request.call_args_list)
 
 
 def test_daily_budget_rollover_and_invalid_config(plugin, module, monkeypatch):
@@ -471,7 +476,7 @@ def test_daily_budget_rollover_and_invalid_config(plugin, module, monkeypatch):
     plugin.api_save_config({'daily_budget':200})
     assert plugin._auto_account()['spent']==100
     assert not plugin.api_save_config({'daily_budget':-1})['success']
-    assert not plugin.api_save_config({'start_time':'24:00'})['success']
+    assert not plugin.api_save_config({'cron':'0 24 * * *'})['success']
     clock[0]+=86400
     assert plugin._auto_account()['spent']==0
 
@@ -531,7 +536,8 @@ def visit_setup(plugin, module, monkeypatch, **config):
     monkeypatch.setattr(module.time, 'time', lambda: clock[0])
     server = VisitServer()
     plugin._request = server
-    assert plugin.api_save_config(dict(auto_enabled=False, auto_visit=True, start_time='00:00', **config))['success']
+    assert plugin.api_save_config(dict(auto_enabled=False, auto_visit=True, cron='0 8 * * *', **config))['success']
+    plugin.start_automation()
     return clock, server
 
 
@@ -611,6 +617,7 @@ def test_no_random_candidates_backoff(plugin, module, monkeypatch):
     assert not any(a=='visit_restaurant' for a,p in server.calls)
     clock[0]+=1801
     server.names=['Bob']
+    plugin.start_automation()
     drive_visits(plugin, clock,1)
     assert server.data['visits']['count']==1
 
@@ -623,26 +630,22 @@ def test_rejected_candidate_does_not_block_following_targets(plugin, module, mon
     assert len([a for a,p in server.calls if a=='visit_restaurant'])==3
 
 
-def test_uncertain_visit_does_not_retry_or_pick_more_on_restart(plugin, module, monkeypatch):
-    clock, server = visit_setup(plugin, module, monkeypatch, notify=True)
+def test_uncertain_visit_recovers_from_records_without_replay(plugin, module, monkeypatch):
+    clock, server = visit_setup(plugin, module, monkeypatch)
     def request(action,payload=None,**kwargs):
         response=server(action,payload,**kwargs)
         if action=='visit_restaurant':
             raise module.RestaurantError('结果不明')
         return response
     plugin._request=request
-    drive_visits(plugin,clock,2)
-    assert server.data['visits']['count']==1
+    drive_visits(plugin,clock,1)
     assert plugin._runtime['pending']['action']=='visit_restaurant'
     q=module.SiqiRestaurant();q.storage=copy.deepcopy(plugin.storage);q.init_plugin(plugin._config);q._request=request
     drive_visits(q,clock)
-    assert server.data['visits']['count']==1
-    assert len(plugin.notifications)==1 and not q.notifications
-    q._request=server
-    assert q.api_resolve({'acknowledged':True})['success']
-    drive_visits(q,clock)
     assert server.data['visits']['count']==3
-    assert '待核对' in q._runtime['auto_visits']['message']
+    targets=[p['target_username'].casefold() for a,p in server.calls if a=='visit_restaurant']
+    assert len(targets)==len(set(targets))==3
+    assert not q._runtime.get('pending')
 
 
 def test_auto_visits_wait_for_service_and_schedule(plugin,module,monkeypatch):
@@ -651,10 +654,12 @@ def test_auto_visits_wait_for_service_and_schedule(plugin,module,monkeypatch):
     drive_visits(plugin,clock,2)
     assert not any(a!='fetch' for a,p in server.calls)
     server.data['state']['session_status']='closed'
-    plugin.api_save_config({'start_time':'23:59'})
+    plugin.api_save_config({'cron':'59 23 * * *'})
     drive_visits(plugin,clock,2)
     assert not any(a=='visit_restaurant' for a,p in server.calls)
-    assert '等待' in plugin._runtime['auto_visits']['message']
+    plugin.start_automation()
+    drive_visits(plugin,clock)
+    assert server.data['visits']['count']==3
 
 
 def test_visit_daily_reset_and_config_preserves_records(plugin,module,monkeypatch):
@@ -667,6 +672,7 @@ def test_visit_daily_reset_and_config_preserves_records(plugin,module,monkeypatc
     assert server.data['visits']['count']==1
     clock[0]+=86400
     server.data['visits'].update(count=0,records=[])
+    plugin.start_automation()
     drive_visits(plugin,clock)
     assert server.data['visits']['count']==1
     assert sum(a=='visit_restaurant' for a,p in server.calls)==2
@@ -757,3 +763,134 @@ def test_final_service_and_visit_never_share_one_tick(plugin,module,monkeypatch)
     assert server.served==[1]
     assert plugin._runtime['automation']['phase']=='running'
     assert not any(c[0]=='list_visitable_restaurants' for c in server.calls)
+
+
+@pytest.mark.parametrize('failed_action', ['purchase_ingredient', 'start_session', 'serve_customer', 'fetch'])
+def test_lost_response_recovers_without_customer_loss(plugin, module, monkeypatch, failed_action):
+    clock = [time.time()]
+    monkeypatch.setattr(module.time, 'time', lambda: clock[0])
+    server = GameServer(clock, count=16)
+    failed = []
+    def request(action, payload=None, **kwargs):
+        result = server(action, payload, **kwargs)
+        if action == failed_action and not failed and (action != 'fetch' or server.data['state']['session_status'] == 'open'):
+            failed.append(action)
+            clock[0] += 8  # Connection/read timeout consumes real customer patience.
+            raise module.RestaurantError('模拟响应丢失')
+        return result
+    plugin._request = request
+    enable_auto(plugin)
+    restarted = False
+    for _ in range(220):
+        plugin.run_automation()
+        if failed and not restarted:
+            restored = module.SiqiRestaurant()
+            restored.storage = copy.deepcopy(plugin.storage)
+            restored.init_plugin(plugin._config)
+            restored._request = request
+            plugin = restored
+            restarted = True
+        clock[0] += 1
+    assert failed == [failed_action]
+    assert len(server.served) == len(set(server.served)) == 16
+    assert not any(a == 'customer_left' for a, _, _ in server.calls)
+    assert sum(a == 'start_session' for a, _, _ in server.calls) == 1
+    assert sum(p['quantity'] for a, p, _ in server.calls if a == 'purchase_ingredient') == 28
+    assert plugin._runtime['automation']['spent'] == 28 * 12
+    assert not plugin._result()['uncertain']
+    assert not plugin._runtime['run']['active']
+    count = len(server.calls)
+    for _ in range(3600):
+        plugin.run_automation(); clock[0] += 1
+    assert len(server.calls) == count, 'closed run must stop reading until the next Cron trigger'
+
+
+def test_unconfirmed_purchase_does_not_stop_existing_orders_or_replay(plugin, module, monkeypatch):
+    clock = [time.time()]
+    monkeypatch.setattr(module.time, 'time', lambda: clock[0])
+    server = GameServer(clock, count=4)
+    purchases = []
+    def request(action, payload=None, **kwargs):
+        if action == 'purchase_ingredient':
+            purchases.append(payload)
+            raise module.RestaurantError('提交结果不明，未收到可验证回执')
+        return server(action, payload, **kwargs)
+    plugin._request = request
+    enable_auto(plugin)
+    for _ in range(25):
+        plugin.run_automation(); clock[0] += 1
+    assert len(server.served) == 2, 'stocked orders must continue while purchase is quarantined'
+    assert len(purchases) == 1
+    assert plugin._runtime['pending_purchase']['action'] == 'purchase_ingredient'
+    assert plugin._result()['uncertain']
+    reserved = plugin._runtime['automation']['spent']
+    plugin.api_save_config({'cron': '0 8,12 * * *'})
+    restored = module.SiqiRestaurant()
+    restored.storage = copy.deepcopy(plugin.storage)
+    restored.init_plugin(plugin._config)
+    restored._request = request
+    restored.run_automation()
+    assert len(purchases) == 1 and restored._runtime['automation']['spent'] == reserved
+    assert restored.api_resolve({'acknowledged': True})['success']
+    assert not restored._result()['uncertain']
+
+
+def test_confirmed_purchase_cannot_unlock_a_different_account_or_day(plugin, module):
+    before = copy.deepcopy(plugin.fixture)
+    pending = {'action': 'purchase_ingredient', 'context': 'different-account',
+               'day': plugin._runtime['day'], 'before': before,
+               'payload': {'ingredient_key': 'egg', 'quantity': 2}}
+    plugin._runtime['pending'] = pending
+    plugin.fixture['inventory']['ingredients']['egg'] += 2
+    plugin.fixture['user']['magic'] -= 24
+    assert plugin.api_refresh()['uncertain']
+    pending = plugin._runtime['pending_purchase']
+    pending['context'] = plugin._runtime['context']
+    pending['day'] = '2000-01-01'
+    assert plugin.api_refresh()['uncertain']
+
+
+def test_run_once_consumed_once_and_resumes_after_restart(plugin, module, monkeypatch):
+    clock = [time.time()]
+    monkeypatch.setattr(module.time, 'time', lambda: clock[0])
+    server = GameServer(clock, count=4)
+    plugin._request = server
+    saved = plugin.api_save_config({'run_once': True, 'magic_reserve': 0})
+    assert saved['success'] and saved['config']['run_once'] is False
+    assert plugin.config['run_once'] is False
+    assert not plugin._config['auto_enabled']
+    assert len(plugin.get_service()) == 1
+    assert not action(plugin, 'start_session')['success'], 'manual writes cannot race a one-shot worker'
+    for _ in range(3):
+        plugin.run_automation(); clock[0] += 1
+    restored = module.SiqiRestaurant()
+    restored.storage = copy.deepcopy(plugin.storage)
+    restored.init_plugin(plugin._config)
+    restored._request = server
+    for _ in range(80):
+        restored.run_automation(); clock[0] += 1
+    assert len(server.served) == 4
+    assert not restored._runtime['run']['active']
+    assert restored.get_service() == []
+    restored.api_save_config({'run_once': True})
+    restored.run_automation()  # closed: read once, do not reopen
+    assert sum(a == 'start_session' for a, _, _ in server.calls) == 1
+    assert not restored._runtime['run']['active']
+
+
+def test_cron_default_migration_multiple_times_and_init_run_once(module):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    plugin = module.SiqiRestaurant()
+    plugin.init_plugin({'enabled': True})
+    assert plugin.api_config()['cron'] == '0 8 * * *'
+    plugin.init_plugin({'enabled': True, 'start_time': '11:35'})
+    assert plugin.api_config()['cron'] == '35 11 * * *'
+    plugin.init_plugin({'enabled': True, 'auto_enabled': True, 'cron': '0 8,12,18 * * *', 'run_once': True})
+    assert plugin.config['run_once'] is False and plugin._runtime['run']['active']
+    trigger = plugin.get_service()[0]['trigger']
+    now = datetime(2026, 10, 20, 7, 0, tzinfo=ZoneInfo('Asia/Shanghai'))
+    first = trigger.get_next_fire_time(None, now)
+    second = trigger.get_next_fire_time(first, first)
+    third = trigger.get_next_fire_time(second, second)
+    assert [d.hour for d in [first, second, third]] == [8, 12, 18]

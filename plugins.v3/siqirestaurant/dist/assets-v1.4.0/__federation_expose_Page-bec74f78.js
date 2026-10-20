@@ -327,7 +327,7 @@ return (_ctx, _cache) => {
             }, {
               default: _withCtx(() => [
                 _createElementVNode("div", _hoisted_6, [
-                  _cache[17] || (_cache[17] = _createElementVNode("span", null, "上次站点操作结果不明，已暂停写入。请先刷新并核对网站。", -1)),
+                  _cache[17] || (_cache[17] = _createElementVNode("span", null, "有操作结果待核对，原请求不会重发；采购异常时，已有食材的订单继续服务。请刷新并核对网站。", -1)),
                   _createVNode(_component_v_btn, {
                     color: "warning",
                     onClick: resolveUncertain,
@@ -384,7 +384,7 @@ return (_ctx, _cache) => {
                 color: view.value.automation?.enabled?'success':'default'
               }, {
                 default: _withCtx(() => [
-                  _createTextVNode(_toDisplayString(view.value.automation?.enabled?'已开启':'已暂停'), 1)
+                  _createTextVNode(_toDisplayString(view.value.automation?.running?'正在运行':view.value.automation?.enabled?'等待定时':'已暂停'), 1)
                 ]),
                 _: 1
               }, 8, ["color"])

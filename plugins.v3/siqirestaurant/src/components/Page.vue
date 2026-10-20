@@ -13,13 +13,13 @@
         </v-btn-group>
       </header>
       <v-alert v-if="message" :type="ok?'success':'error'" variant="tonal" density="compact" closable role="status" @click:close="message=''">{{ message }}</v-alert>
-      <v-alert v-if="view.uncertain" type="warning" variant="tonal" density="compact"><div class="sr-alert-row"><span>上次站点操作结果不明，已暂停写入。请先刷新并核对网站。</span><v-btn color="warning" @click="resolveUncertain" :disabled="busy">已核对，解除锁定</v-btn></div></v-alert>
+      <v-alert v-if="view.uncertain" type="warning" variant="tonal" density="compact"><div class="sr-alert-row"><span>有操作结果待核对，原请求不会重发；采购异常时，已有食材的订单继续服务。请刷新并核对网站。</span><v-btn color="warning" @click="resolveUncertain" :disabled="busy">已核对，解除锁定</v-btn></div></v-alert>
       <v-progress-linear v-if="busy && !data.state" indeterminate color="success" aria-label="读取餐厅" />
       <div class="sr-stats">
         <article v-for="item in stats" :key="item.label" class="sr-stat" :style="{'--sr-accent':item.accent}"><div class="sr-stat-icon"><v-icon :icon="item.icon" size="22" /></div><div><span>{{ item.label }}</span><strong>{{ data.state?item.value:'—' }}</strong></div></article>
       </div>
       <section class="sr-card sr-automation" aria-label="后台自动经营状态">
-        <div class="sr-card-title sr-card-band"><h3><v-icon icon="mdi-robot-outline" size="19" color="success" />后台自动经营 <v-chip :color="view.automation?.enabled?'success':'default'">{{ view.automation?.enabled?'已开启':'已暂停' }}</v-chip></h3><v-btn variant="text" prepend-icon="mdi-tune-variant" @click="emit('switch','config')">{{ view.automation?.enabled?'暂停 / 调整托管':'设置自动经营' }}</v-btn></div>
+        <div class="sr-card-title sr-card-band"><h3><v-icon icon="mdi-robot-outline" size="19" color="success" />后台自动经营 <v-chip :color="view.automation?.enabled?'success':'default'">{{ view.automation?.running?'正在运行':view.automation?.enabled?'等待定时':'已暂停' }}</v-chip></h3><v-btn variant="text" prepend-icon="mdi-tune-variant" @click="emit('switch','config')">{{ view.automation?.enabled?'暂停 / 调整托管':'设置自动经营' }}</v-btn></div>
         <div class="sr-card-body sr-automation-body">
           <div><p>{{ view.automation?.enabled ? (view.automation.message || '等待后台首次检查') : '可在配置中开启每日自动经营。' }}</p><p class="sr-hint">{{ view.automation?.last_check ? `最近检查 ${new Date(view.automation.last_check*1000).toLocaleTimeString()}` : '等待后台检查' }} · 关闭页面后继续运行</p></div>
           <div class="sr-budget-meter"><div><span>今日补货预算</span><strong>{{ number(view.automation?.spent) }} / {{ number(view.automation?.daily_budget) }}</strong></div><v-progress-linear :model-value="Math.min(100,Number(view.automation?.spent||0)/Math.max(1,Number(view.automation?.daily_budget||0))*100)" color="success" height="5" rounded aria-label="今日补货预算使用比例" /></div>

@@ -29,8 +29,12 @@ globalThis.getComputedStyle = window.getComputedStyle.bind(window)
 const { createVuetify } = await import(pathToFileURL(require.resolve('vuetify')).href)
 const components = await import(pathToFileURL(require.resolve('vuetify/components')).href)
 const directives = await import(pathToFileURL(require.resolve('vuetify/directives')).href)
-const installUi = app => app.use(createVuetify({ components, directives }))
-const { createApp, nextTick } = await import(pathToFileURL(require.resolve('vue')).href)
+// MP registers VCronField globally; stub only its host boundary in this isolated mount.
+const installUi = app => app.use(createVuetify({ components, directives })).component('VCronField', {
+  props:['modelValue'], emits:['update:modelValue'],
+  render(){return h('input', {'aria-label':'执行时间（Cron）', value:this.modelValue, onInput:e=>this.$emit('update:modelValue', e.target.value)})}
+})
+const { createApp, nextTick, h } = await import(pathToFileURL(require.resolve('vue')).href)
 const output = mkdtempSync(path.join(plugin,'.ui-test-'))
 let app
 const realTimeout = globalThis.setTimeout
@@ -81,11 +85,21 @@ try {
   app.unmount();app=null;document.querySelector('#app').innerHTML=''
   const configCalls=[]
   const configApi={get:async()=>({enabled:true,use_proxy:false,cookie_configured:true,site_configured:true}),
-    post:async(url,payload)=>{configCalls.push(payload);return {success:true,message:'已保存',config:{...payload,cookie:undefined,cookie_configured:true,site_configured:true}}}}
+    post:async(url,payload)=>{configCalls.push(payload);return {success:true,message:'已保存',config:{...payload,run_once:false,cookie:undefined,cookie_configured:true,site_configured:true}}}}
   app=createApp(await component('Config'),{api:configApi});installUi(app).mount('#app');await settle()
   await click('连接与凭据站点已关联Cookie 已配置')
   const password=document.querySelector('input[type=password]');assert.equal(password.value,'')
   await click('保存配置');assert.equal(configCalls.length,1);assert.equal(configCalls[0].cookie,'')
+  assert.equal(document.querySelectorAll('button[aria-label="保存配置"]').length,1)
+  assert(!document.querySelector('.sr-config-footer button'))
+  assert.equal(configCalls[0].cron,'0 8 * * *')
+  const cronInput=document.querySelector('input[aria-label="执行时间（Cron）"]')
+  cronInput.value='0 8,12,18 * * *';cronInput.dispatchEvent(new Event('input',{bubbles:true}))
+  document.querySelector('input[aria-label="保存后运行一次"]').click();await settle()
+  await click('保存配置')
+  assert.equal(configCalls.at(-1).cron,'0 8,12,18 * * *')
+  assert.equal(configCalls.at(-1).run_once,true)
+  assert.equal(document.querySelector('input[aria-label="保存后运行一次"]').checked,false)
   assert.equal(configCalls[0].auto_enabled,false)
   assert.equal(configCalls[0].daily_budget,5000)
   assert.equal(configCalls[0].magic_reserve,10000)

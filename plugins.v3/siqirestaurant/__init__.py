@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron import CronTrigger
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.sdk.plugin import _PluginBase
@@ -46,7 +47,8 @@ class PublicConfig(BaseModel):
     cookie_configured: bool = False
     site_configured: bool = False
     auto_enabled: bool = False
-    start_time: str = "08:00"
+    cron: str = "0 8 * * *"
+    run_once: bool = False
     auto_purchase: bool = True
     daily_budget: int = 5000
     magic_reserve: int = 10000
@@ -80,7 +82,7 @@ class SiqiRestaurant(_PluginBase):
     plugin_name = "思齐餐厅"
     plugin_desc = "思齐餐厅后台自动经营：每日开业、并行烹饪、及时上菜、限额补货及原生管理面板。"
     plugin_icon = "https://si-qi.xyz/favicon.ico"
-    plugin_version = "1.3.3"
+    plugin_version = "1.4.0"
     plugin_author = "xchenya"
     author_url = "https://github.com/xchenya"
     plugin_config_prefix = "siqirestaurant_"
@@ -112,17 +114,33 @@ class SiqiRestaurant(_PluginBase):
             self._stopped = False
             self._stop_auto.clear()
             self._next_auto = 0
+            # 正在经营的任务跨重启续跑，空闲状态只等 Cron，不再轮询站点。
+            if self._automatic_enabled() and (self._runtime.get("pending") or
+                    any(s.get("status") != "idle" for s in self._runtime.get("kitchen", []))):
+                self.start_automation()
+            if self._bool(values.get("run_once", False)):
+                self.update_config(self._config)
+                self.start_automation(once=True)
 
     def _auto_config(self, values):
-        start = str(values.get("start_time", "08:00"))
-        if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", start):
-            raise RestaurantError("开业时间须为 HH:MM（北京时间）")
+        cron = str(values.get("cron") or "").strip()
+        if not cron:
+            # 旧版单个时间转换为 Cron；新安装默认每天 08:00，时区跟随 MP。
+            start = str(values.get("start_time", "08:00"))
+            if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", start):
+                raise RestaurantError("旧开业时间格式无效，请设置 Cron")
+            hour, minute = map(int, start.split(":"))
+            cron = f"{minute} {hour} * * *"
+        try:
+            CronTrigger.from_crontab(cron, timezone=settings.TZ)
+        except (ValueError, TypeError) as exc:
+            raise RestaurantError("Cron 格式无效，请使用 MP 的五段 Cron 表达式") from exc
         return {"auto_enabled": self._bool(values.get("auto_enabled", False)),
                 "auto_visit": self._bool(values.get("auto_visit", False)),
                 "visit_targets": self._visit_targets(values.get("visit_targets", [])),
                 "notify": self._bool(values.get("notify", False)),
                 "auto_purchase": self._bool(values.get("auto_purchase", True)),
-                "start_time": start,
+                "cron": cron, "run_once": False,
                 "daily_budget": self._int(values.get("daily_budget", 5000), "每日采购预算", 0, 1000000),
                 "magic_reserve": self._int(values.get("magic_reserve", 10000), "保留魔力", 0, 1000000000)}
 
@@ -154,11 +172,32 @@ class SiqiRestaurant(_PluginBase):
         return []
 
     def get_service(self):
-        if not self.get_state() or not self._automatic_enabled():
+        if not self.get_state():
             return []
-        return [{"id": f"{self.__class__.__name__}.automation", "name": "思齐餐厅自动经营",
+        jobs = []
+        if self._automatic_enabled():
+            jobs.append({"id": f"{self.__class__.__name__}.schedule", "name": "思齐餐厅定时检查",
+                         "trigger": CronTrigger.from_crontab(self._config["cron"], timezone=settings.TZ),
+                         "func": self.start_automation,
+                         "kwargs": {"max_instances": 1, "coalesce": True, "misfire_grace_time": 60}})
+        if self._automatic_enabled() or self._runtime.get("run", {}).get("active"):
+            jobs.append({"id": f"{self.__class__.__name__}.automation", "name": "思齐餐厅营业服务",
                  "trigger": IntervalTrigger(seconds=1), "func": self.run_automation,
-                 "kwargs": {"max_instances": 1, "coalesce": True, "misfire_grace_time": 10}}]
+                 "kwargs": {"max_instances": 1, "coalesce": True, "misfire_grace_time": 10}})
+        return jobs
+
+    def start_automation(self, once=False):
+        """Cron / 保存后运行一次仅唤醒工作任务，重复触发不会重开或重复下馆子。"""
+        with self._lock:
+            if self._stopped or not self.get_state() or not (once or self._automatic_enabled()):
+                return
+            run = self._runtime.setdefault("run", {})
+            if run.get("active"):
+                return
+            run.update(active=True, operate=bool(once or self._config.get("auto_enabled")),
+                       visits=bool(self._config.get("auto_visit")), once=bool(once), failures=0)
+            self._next_auto = 0
+            self._save()
 
     def get_form(self):
         return None, self.api_config()
@@ -213,16 +252,29 @@ class SiqiRestaurant(_PluginBase):
                 return {"success": False, "message": str(exc), "config": self.api_config()}
             self.update_config(config)
             self._config = config
+            run_once = self._bool(payload.get("run_once", False))
+            run = self._runtime.setdefault("run", {})
+            if not self.get_state() or (not run.get("once") and not self._automatic_enabled()):
+                run["active"] = False
+            if not run.get("once"):
+                run["operate"] = bool(config.get("auto_enabled"))
+            run["visits"] = bool(config.get("auto_visit"))
             self._snapshot = {}
             self._last_fetch = 0
             self._next_auto = 0
             self._stop_auto.clear()
+            if run_once:
+                self.start_automation(once=True)
+            self._save()
         # 宿主统一管理任务，配置保存后立即生效，停用时移除原任务。
         try:
             update_plugin_job(self.__class__.__name__)
         except Exception:
             return {"success": False, "message": "配置已保存，但定时任务更新失败，请重启 MP 后检查托管状态", "config": self.api_config()}
-        return {"success": True, "message": "配置已保存", "config": self.api_config()}
+        message = "配置已保存"
+        if run_once:
+            message += "；已安排运行一次，开关已自动关闭" if self.get_state() else "；插件未启用，本次未运行"
+        return {"success": True, "message": message, "config": self.api_config()}
 
     def _credentials(self):
         site = self._siteoper.get_by_domain("si-qi.xyz")
@@ -248,6 +300,8 @@ class SiqiRestaurant(_PluginBase):
                 pending["stove"] = None  # 新凭据的厨房已隔离，未知请求仍须人工核对。
             self._runtime = {"context": context, "day": "", "kitchen": [], "cleaning": {},
                              "pending": pending, "receipts": self._runtime.get("receipts", {}), "events": [],
+                             "pending_purchase": self._runtime.get("pending_purchase"),
+                             "run": self._runtime.get("run", {}),
                              "automation": self._runtime.get("automation", {}),
                              "auto_visits": self._runtime.get("auto_visits", {}),
                              "notifications": self._runtime.get("notifications", {})}
@@ -267,7 +321,7 @@ class SiqiRestaurant(_PluginBase):
         cookie, ua = self._credentials()
         headers = {"Cookie": cookie, "User-Agent": ua, "Referer": "https://si-qi.xyz/siqi_restaurant.php",
                    "Accept": "application/json", "Origin": "https://si-qi.xyz"}
-        options = dict(headers=headers, timeout=(10, 25), allow_redirects=False,
+        options = dict(headers=headers, timeout=(3, 5), allow_redirects=False,
                        proxies=settings.PROXY if self._config.get("use_proxy") else None)
         try:
             if action == "fetch":
@@ -287,7 +341,10 @@ class SiqiRestaurant(_PluginBase):
         except (requests.RequestException, ValueError, RestaurantError) as exc:
             if not read:
                 # 不抄录响应内容、请求头或异常 URL，避免泄漏 Cookie。
-                raise RestaurantError("站点写入结果不明，已暂停操作；请刷新并核对后解锁，勿重复提交") from exc
+                reason = (str(exc) if isinstance(exc, RestaurantError) else
+                          "连接超时" if isinstance(exc, requests.Timeout) else
+                          "连接异常" if isinstance(exc, requests.RequestException) else "响应格式异常")
+                raise RestaurantError(f"{reason}，写入结果不明；正在读回核对，原请求不会重发") from exc
             if isinstance(exc, RestaurantError):
                 raise
             raise RestaurantError("读取站点失败，请检查网络、Cookie 和代理") from exc
@@ -320,6 +377,7 @@ class SiqiRestaurant(_PluginBase):
         count = min(50, max(1, int(state.get("unlocked", {}).get("stations") or 1)))
         old = {s["index"]: s for s in self._runtime.get("kitchen", [])}
         self._runtime["kitchen"] = [old.get(i) or self._empty(i) for i in range(1, count + 1)]
+        self._reconcile_pending()
         self._save()
 
     def _ensure_fresh(self, force=False):
@@ -347,10 +405,12 @@ class SiqiRestaurant(_PluginBase):
         return {"success": success, "message": message, "restaurant": copy.deepcopy(self._snapshot),
                 "kitchen": copy.deepcopy(self._runtime.get("kitchen", [])),
                 "cleaning": dict(self._runtime.get("cleaning", {})), "server_now": time.time(),
-                "uncertain": bool(self._runtime.get("pending")),
+                "uncertain": bool(self._runtime.get("pending") or self._runtime.get("pending_purchase")),
                 "automation": {**copy.deepcopy(self._runtime.get("automation", {})),
                                "enabled": bool(self.get_state() and self._config.get("auto_enabled")),
-                               "active": bool(self.get_state() and self._automatic_enabled()),
+                               "active": bool(self.get_state() and (self._automatic_enabled() or
+                                              self._runtime.get("run", {}).get("active"))),
+                               "running": bool(self._runtime.get("run", {}).get("active")),
                                "visit_enabled": bool(self.get_state() and self._config.get("auto_visit")),
                                "visits": copy.deepcopy(self._runtime.get("auto_visits", {})),
                                "daily_budget": self._config.get("daily_budget", 5000),
@@ -441,12 +501,19 @@ class SiqiRestaurant(_PluginBase):
     def _write(self, action, payload, stove=None, customer=None):
         self._runtime["pending"] = {"action": action, "time": time.time(),
                                     "stove": stove["index"] if stove else None,
+                                    "payload": copy.deepcopy(payload),
+                                    "context": self._runtime.get("context"), "day": self._runtime.get("day"),
+                                    "local_day": datetime.fromtimestamp(time.time(), ZoneInfo("Asia/Shanghai")).date().isoformat(),
+                                    "before": copy.deepcopy({k: self._snapshot.get(k, {}) for k in
+                                                             ("state", "inventory", "user", "visits")}),
+                                    "seat": (customer or {}).get("seat"),
                                     "request_id": self._runtime.get("active_request_id")}
         self._save()  # 先记录请求意图；进程中断后也禁止盲目重放。
         try:
             response = self._request(action, payload)
-        except RestaurantError:
-            self._event(action, "结果不明；未重试，等待核对", False)
+        except RestaurantError as exc:
+            self._event(action, str(exc), False)
+            self._last_fetch = 0
             self._save()
             raise
         self._merge(response)
@@ -468,6 +535,73 @@ class SiqiRestaurant(_PluginBase):
         return self._result(response["success"], message,
                             requires_confirmation=bool(response.get("requires_confirmation")))
 
+    def _reconcile_pending(self):
+        """仅依据完整读回快照确认结果；没有证据时保留锁及预算，绝不重放写入。"""
+        state = self._snapshot["state"]
+        for slot in ("pending_purchase", "pending"):
+            pending = self._runtime.get(slot)
+            if not pending:
+                continue
+            before, payload = pending.get("before", {}), pending.get("payload", {})
+            same_session = (bool(pending.get("context")) and pending["context"] == self._runtime.get("context")
+                            and pending.get("day") == self._runtime.get("day"))
+            action = pending["action"]
+            confirmed = False
+            if same_session:
+                if action == "purchase_ingredient":
+                    key, quantity = payload.get("ingredient_key"), payload.get("quantity")
+                    old = before.get("inventory", {}).get("ingredients", {}).get(key)
+                    new = self._snapshot["inventory"].get("ingredients", {}).get(key)
+                    price = next((i.get("price") for i in self._snapshot["config"].get("ingredients", [])
+                                  if i.get("key") == key), None)
+                    old_magic, new_magic = before.get("user", {}).get("magic"), self._snapshot.get("user", {}).get("magic")
+                    values = (old, new, quantity, price, old_magic, new_magic)
+                    try:
+                        if any(isinstance(n, bool) for n in values):
+                            raise ValueError("invalid numeric value")
+                        old, new, quantity, price, old_magic, new_magic = map(float, values)
+                        valid = all(math.isfinite(n) for n in (old, new, quantity, price, old_magic, new_magic))
+                    except (ValueError, TypeError):
+                        valid = False
+                    if valid:
+                        confirmed = (quantity > 0 and new == old + quantity and
+                                     math.isclose(new_magic, old_magic - quantity * price, abs_tol=0.001))
+                elif action == "start_session":
+                    confirmed = (before.get("state", {}).get("session_status") == "ready" and
+                                 state.get("session_status") in {"open", "closed"})
+                elif action in {"serve_customer", "customer_left"}:
+                    customer = next((c for c in state.get("customer_plan", [])
+                                     if str(c.get("id")) == str(payload.get("customer_id"))), {})
+                    confirmed = customer.get("status") == ("served" if action == "serve_customer" else "left")
+                elif action == "visit_restaurant":
+                    target = str(payload.get("target_username") or "").casefold()
+                    today = datetime.fromtimestamp(time.time(), ZoneInfo("Asia/Shanghai")).date().isoformat()
+                    confirmed = pending.get("local_day") == today and bool(target) and any(str(r.get("target_username") or "").casefold() == target
+                                for r in self._snapshot.get("visits", {}).get("records", []))
+                    if confirmed:
+                        item = self._visit_account()["attempts"].get(target)
+                        if item:
+                            item.update(status="success", message="已从站点记录确认到访")
+            if confirmed:
+                self._runtime.setdefault("run", {})["failures"] = 0
+                if pending.get("stove"):
+                    stove = self._stove(pending["stove"])
+                    stove.update(self._empty(stove["index"]))
+                if pending.get("seat") and action in {"serve_customer", "customer_left"}:
+                    # 从读回时再等 10 秒，不冒险提前复用餐位。
+                    self._runtime["cleaning"][str(pending["seat"])] = time.time() + 10
+                if pending.get("request_id"):
+                    self._runtime.setdefault("receipts", {})[pending["request_id"]] = {
+                        "success": True, "message": "已从站点状态确认成功；原请求未重发"}
+                self._runtime[slot] = None
+                self._runtime.pop("active_request_id", None)
+                self._event("reconcile", f"{action} 已读回确认成功，恢复经营；原请求未重发", True)
+            elif slot == "pending" and action == "purchase_ingredient":
+                # 隔离未知采购，禁止再次补货；其他已备食材可继续正常烹饪和上菜。
+                self._runtime["pending_purchase"] = pending
+                self._runtime["pending"] = None
+                self._event("reconcile", "采购仍待核对，已暂停补货；现有食材的订单继续服务", False)
+
     def _dispatch(self, action, args):
         if action in {"list_visitable_restaurants", "inspect_restaurant_target"}:
             payload = {"limit": 6} if action.startswith("list_") else {"target_username": self._username(args)}
@@ -476,6 +610,9 @@ class SiqiRestaurant(_PluginBase):
                                 restaurants=response.get("restaurants") or [], candidate=response.get("candidate"))
         if self._runtime.get("pending"):
             raise RestaurantError("上次写入结果不明；请刷新、核对站点后解锁")
+        if self._runtime.get("pending_purchase") and action not in {
+                "assign_dish", "prepare", "cook", "cancel", "return_stove", "serve"}:
+            raise RestaurantError("采购结果待核对，已停止补货和新营业；现有订单继续服务")
         if action in {"assign_dish", "prepare", "cook", "cancel", "return_stove", "serve", "discard"}:
             stove = self._stove(args.get("station_index"))
             if action == "assign_dish":
@@ -561,7 +698,7 @@ class SiqiRestaurant(_PluginBase):
         payload = payload or {}
         self._ensure_fresh(force=True)
         action = str(payload.get("action") or "")
-        if self._automatic_enabled() and action not in {"list_visitable_restaurants", "inspect_restaurant_target"}:
+        if (self._automatic_enabled() or self._runtime.get("run", {}).get("active")) and action not in {"list_visitable_restaurants", "inspect_restaurant_target"}:
             raise RestaurantError("后台任务已开启，请先在配置中暂停自动经营和自动下馆子，再执行手动操作")
         args = payload.get("args") or {}
         if not isinstance(args, dict):
@@ -587,7 +724,7 @@ class SiqiRestaurant(_PluginBase):
     @serialized
     def api_tick(self, payload: dict = None) -> dict:
         self._ensure_fresh()
-        if self._automatic_enabled():
+        if self._automatic_enabled() or self._runtime.get("run", {}).get("active"):
             return self._result()  # 页面仅观察，后台是唯一自动执行者。
         if self._runtime.get("pending"):
             return self._result(False, "存在结果不明的写入，员工服务已暂停")
@@ -720,6 +857,7 @@ class SiqiRestaurant(_PluginBase):
             self._event("auto_visit", message, True)
         visits["message"] = message
         visits["last_check"] = time.time()
+        visits["done"] = done
         self._save()
         if done:
             self._notify_visits(visits)
@@ -727,11 +865,7 @@ class SiqiRestaurant(_PluginBase):
     def _auto_visit_step(self):
         if not self._config.get("auto_visit") or self._stopped or self._stop_auto.is_set():
             return
-        local = datetime.fromtimestamp(time.time(), ZoneInfo("Asia/Shanghai"))
         visits = self._visit_account()
-        if local.strftime("%H:%M") < self._config["start_time"]:
-            self._visit_status(f"等待北京时间 {self._config['start_time']} 下馆子")
-            return
         if visits.get("retry_at", 0) > time.time():
             return
         info = self._snapshot.get("visits") or {}
@@ -786,7 +920,7 @@ class SiqiRestaurant(_PluginBase):
                     excluded.add(name.casefold())
             if not choices:
                 visits["retry_at"] = time.time() + 1800
-                self._visit_status("暂无可用随机餐馆，30 分钟后重查")
+                self._visit_status("暂无可用随机餐馆，本次结束；下次 Cron 且至少 30 分钟后重查")
                 return
             target = random.choice(choices)
         if self._stopped or self._stop_auto.is_set():
@@ -813,6 +947,8 @@ class SiqiRestaurant(_PluginBase):
         return auto
 
     def _purchase_cost(self, shortages):
+        if shortages and self._runtime.get("pending_purchase"):
+            raise RestaurantError("采购结果待核对，已暂停补货")
         prices = {i["key"]: float(i["price"]) for i in self._snapshot["config"].get("ingredients", [])}
         total = 0
         for key, quantity in shortages.items():
@@ -849,36 +985,62 @@ class SiqiRestaurant(_PluginBase):
         self._purchase_cost(shortages)
 
     def run_automation(self):
-        """宿主每秒唤醒；空闲每分钟查询，营业期每轮至多一次远端写入。"""
+        """Cron / 一次运行唤醒后才访问站点，闭店结束；营业期每轮至多一次写入。"""
         if (self._stopped or self._stop_auto.is_set() or not self.get_state()
-                or not self._automatic_enabled() or time.time() < self._next_auto):
+                or not self._runtime.get("run", {}).get("active") or time.time() < self._next_auto):
             return
         if not self._lock.acquire(blocking=False):
             return
         try:
-            if self._stopped or self._stop_auto.is_set() or not self._automatic_enabled():
+            if self._stopped or self._stop_auto.is_set():
                 return
             self._ensure_fresh()
             self._auto_account()
+            run = self._runtime["run"]
             if self._runtime.get("pending"):
-                self._auto_status("uncertain", "写入结果不明，等待人工核对解锁；不会重发")
-                self._next_auto = time.time() + 60
+                self._auto_status("uncertain", "写入结果待核对，后台继续读回确认；原请求不会重发")
+                self._next_auto = time.time() + (2 if self._snapshot["state"].get("session_status") == "open" else 60)
+                if self._snapshot["state"].get("session_status") == "closed":
+                    run["active"] = False
+                    self._save()
                 return
-            if not self._config.get("auto_enabled"):
-                self._next_auto = time.time() + 60
-            wrote = self._auto_step() if self._config.get("auto_enabled") else False
+            wrote = self._auto_step() if run.get("operate") else False
+            run["live"] = self._snapshot["state"].get("session_status") == "open"
+            self._save()
             # 有顾客或厨房工作时优先经营，不让外出查询占用顾客耐心。
-            if (not wrote and self._snapshot["state"].get("session_status") != "open"
-                    and all(s["status"] == "idle" for s in self._runtime.get("kitchen", []))):
-                self._next_auto = time.time() + 60
-                self._auto_visit_step()
+            status = self._snapshot["state"].get("session_status")
+            if status == "open" and not run.get("operate"):
+                run["active"] = False
+                self._auto_status("waiting", "餐厅仍在营业，下馆子等待下次 Cron 检查")
+                return
+            if not wrote and status != "open":
+                if run.get("visits") and not self._runtime.get("pending_purchase"):
+                    self._next_auto = time.time() + 1
+                    self._auto_visit_step()
+                    run["failures"] = 0
+                    visits = self._visit_account()
+                    if not visits.get("done") and visits.get("retry_at", 0) <= time.time():
+                        return
+                run["active"] = False
+                self._auto_status("closed" if status == "closed" else "waiting",
+                                  "今日已闭店，本次任务结束；等待下次 Cron 检查" if status == "closed" else
+                                  "本次检查完成；等待下次 Cron 检查")
+                self._save()
+            run["failures"] = 0
         except RestaurantError as exc:
+            run = self._runtime.get("run", {})
+            run["failures"] = run.get("failures", 0) + 1
+            live = (run.get("live") or self._snapshot.get("state", {}).get("session_status") == "open" or
+                    (self._runtime.get("pending") or {}).get("action") == "start_session")
             self._auto_status("uncertain" if self._runtime.get("pending") else "blocked", str(exc))
-            self._next_auto = time.time() + 60
+            self._next_auto = time.time() + (min(5, run["failures"] * 2) if live else 60)
+            if not live and run["failures"] >= 3:
+                run["active"] = False
+                self._save()
         except Exception:
             # 不将响应、Cookie 或请求对象写入日志。
-            self._auto_status("error", "自动经营遇到异常，60 秒后重新检查；不重试结果不明的写入")
-            self._next_auto = time.time() + 60
+            self._auto_status("error", "自动经营遇到异常，稍后读回检查；不重试结果不明的写入")
+            self._next_auto = time.time() + (5 if self._snapshot.get("state", {}).get("session_status") == "open" else 60)
         finally:
             self._lock.release()
 
@@ -893,22 +1055,20 @@ class SiqiRestaurant(_PluginBase):
         state = self._snapshot["state"]
         status = state.get("session_status")
         if status == "ready":
-            local = datetime.fromtimestamp(time.time(), ZoneInfo("Asia/Shanghai"))
-            if local.strftime("%H:%M") < self._config["start_time"]:
-                self._auto_status("waiting", f"等待北京时间 {self._config['start_time']} 开业")
-                self._next_auto = time.time() + 60
-                return
             if not state.get("customers_total"):
-                self._auto_status("waiting", "今日暂无顾客，等待下次检查")
-                self._next_auto = time.time() + 60
+                self._auto_status("waiting", "今日暂无顾客，等待下次 Cron 检查")
                 return
             self._preflight()
             self._auto_write_result(self._dispatch("start_session", {}), "今日已自动开业")
             return True
         if status != "open":
-            self._auto_status("closed", "今日已结束；后台会检查新增顾客及下一日营业状态")
+            self._auto_status("closed", "今日已闭店，本次任务结束；等待下次 Cron 检查")
             self._notify_closed()
-            self._next_auto = time.time() + 60
+            if status == "closed":
+                for stove in self._runtime.get("kitchen", []):
+                    stove.update(self._empty(stove["index"]))
+                self._runtime["cleaning"] = {}
+                self._save()
             return
         now = time.time()
         customers = sorted((c for c in state.get("customer_plan", [])
@@ -1013,13 +1173,15 @@ class SiqiRestaurant(_PluginBase):
         if (payload or {}).get("acknowledged") is not True:
             raise RestaurantError("请先核对站点状态并确认解除锁定")
         self._ensure_fresh(force=True)
-        pending = self._runtime.get("pending")
-        if pending:
+        for slot in ("pending", "pending_purchase"):
+            pending = self._runtime.get(slot)
+            if not pending:
+                continue
             # 不确定的成品不再二次提交；只释放该灶台的本地预留。
             if pending.get("stove"):
                 stove = self._stove(pending["stove"])
                 stove.update(self._empty(stove["index"]))
-            self._runtime["pending"] = None
+            self._runtime[slot] = None
             self._runtime.pop("active_request_id", None)
             if pending.get("request_id"):
                 self._runtime.setdefault("receipts", {})[pending["request_id"]] = {
