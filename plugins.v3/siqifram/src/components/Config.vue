@@ -6,7 +6,7 @@
           <v-icon icon="mdi-cog-outline" size="24" />
         </div>
         <div>
-          <div class="siqi-topbar__title">思齐农场 · 配置 · v2.2.1</div>
+          <div class="siqi-topbar__title">思齐农场 · 配置 · v2.2.2</div>
           <div class="siqi-topbar__sub">管理定时任务、自动化策略与站点 Cookie</div>
         </div>
       </div>
@@ -173,7 +173,7 @@
           density="compact" variant="outlined" hide-details
           class="siqi-input"
         />
-        <div class="siqi-field-hint">偷菜巡检只检查所选作物，按站点当日剩余次数执行，与总 Cron 和成熟收获任务独立。只影响偷菜，不改变默认种子或种子解锁列表；全部取消则不偷菜。</div>
+        <div class="siqi-field-hint">偷菜巡检只检查所选作物，按站点当日剩余可偷数量执行，与总 Cron 和成熟收获任务独立。当日可偷数量用完后暂停巡检，次日 0 点恢复（MoviePilot 配置时区）。只影响偷菜，不改变默认种子或种子解锁列表；全部取消则不偷菜。</div>
         <div class="d-flex align-center flex-wrap ga-2">
           <v-btn color="red" size="small" variant="tonal" @click="saveStealConfig(true)" :loading="stealSaving" :disabled="!stealLoaded || stealSaving">保存后运行一次偷菜</v-btn>
           <span class="text-caption text-medium-emphasis">自动偷菜关闭时也可手动运行；仅保存偷菜设置并执行偷菜。</span>

@@ -249,7 +249,7 @@
                   <div class="neu-action-icon">🥷</div>
                   <div class="neu-action-content">
                     <div class="neu-action-label">偷菜</div>
-                    <div class="neu-action-desc">每日一次，自动寻找可偷作物</div>
+                    <div class="neu-action-desc" role="status" aria-live="polite">{{ farm.steal_paused_until ? `今日偷菜已用完，暂停至 ${farm.steal_paused_until}` : '按当日剩余可偷数量寻找所选作物' }}</div>
                   </div>
                   <v-btn :color="farm.can_steal ? 'red' : 'grey'" size="small" @click="steal" :disabled="!farm.can_steal" class="neu-btn farm-action-btn quick-action-btn quick-action-btn--steal">
                     {{ farm.can_steal ? '去偷菜' : '今日已偷' }}

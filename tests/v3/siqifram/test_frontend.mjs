@@ -77,6 +77,18 @@ test('manual steal keeps maturity visible and disables unselected crops', () => 
   assert.equal(isStealablePlot({ seed_id: 91, harvest_time: 200, steal_allowed: true }), false)
 })
 
+test('steal card renders the server pause deadline and clears it when the quota is available again', () => {
+  const source = fs.readFileSync(path.join(plugin, 'src/components/Page.vue'), 'utf8')
+  const template = source.match(/<div class="neu-action-desc" role="status"[^>]*>.*?<\/div>/)[0]
+  const { compile } = require('@vue/compiler-dom')
+  const render = new Function('Vue', compile(template, { mode: 'function' }).code)(require('vue'))
+  const farm = { can_steal: true, steal_paused_until: '2026-10-21 00:00:00' }
+  assert.equal(render({ farm }).children, '今日偷菜已用完，暂停至 2026-10-21 00:00:00')
+  farm.steal_paused_until = null
+  assert.equal(render({ farm }).children, '按当日剩余可偷数量寻找所选作物')
+  assert.match(source, /:disabled="!farm\.can_steal"/)
+})
+
 function configHarness(api, initialConfig = {}) {
   const source = fs.readFileSync(path.join(plugin, 'src/components/Config.vue'), 'utf8')
   const { descriptor } = parse(source)

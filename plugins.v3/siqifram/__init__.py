@@ -163,6 +163,7 @@ class FarmStatus(BaseModel):
     steal_cron: str = "*/15 * * * *"
     last_steal_run: Optional[str] = None
     last_steal_result: Optional[str] = None
+    steal_paused_until: Optional[str] = None
 
 
 class ImageResult(BaseModel):
@@ -189,11 +190,11 @@ class SiqiFram(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/KoWming/MoviePilot-Plugins/main/icons/siqi.png"
     # 插件版本
-    plugin_version = "2.2.1"
+    plugin_version = "2.2.2"
     # 插件作者
-    plugin_author = "KoWming（V3 适配：xchenya）"
+    plugin_author = "xchenya"
     # 作者主页
-    author_url = "https://github.com/KoWming"
+    author_url = "https://github.com/xchenya"
     # 插件配置项ID前缀
     plugin_config_prefix = "siqifram_"
     # 加载顺序
@@ -245,6 +246,8 @@ class SiqiFram(_PluginBase):
         self._steal_crops = list(STEAL_CROPS)
         self._steal_cron = "*/15 * * * *"
         self._steal_target = {}
+        self._resuming_steal = False
+        self._steal_resumed_minute = None
 
     @staticmethod
     def _normalize_steal_crops(value: Any) -> List[str]:
@@ -347,7 +350,7 @@ class SiqiFram(_PluginBase):
 
     def get_service(self) -> List[Dict[str, Any]]:
         """注册独立的总巡检、成熟收获及偷菜巡检。"""
-        if not self._enabled:
+        if not self._enabled or self._stop_event.is_set():
             return []
 
         services = [{
@@ -367,13 +370,24 @@ class SiqiFram(_PluginBase):
                 "kwargs": {"run_date": self._next_run_time},
             })
         if self._auto_steal and self._steal_crops:
-            services.append({
-                "id": "siqifram-steal",
-                "name": "思齐农场 - 偷菜巡检",
-                "trigger": CronTrigger.from_crontab(self._steal_cron, timezone=settings.TZ),
-                "func": self._steal_task,
-                "func_kwargs": {},
-            })
+            pause = self._get_steal_pause()
+            if pause:
+                now = datetime.now(self._timezone())
+                services.append({
+                    "id": "siqifram-steal-resume", "name": "思齐农场 - 恢复偷菜巡检",
+                    "trigger": "date", "func": self._resume_steal_task,
+                    "func_kwargs": {"context": pause["context"], "resume_at": pause["resume_at"]},
+                    "kwargs": {"run_date": max(datetime.fromtimestamp(pause["resume_at"], self._timezone()),
+                                               now + timedelta(seconds=1)), "misfire_grace_time": None},
+                })
+            else:
+                services.append({
+                    "id": "siqifram-steal",
+                    "name": "思齐农场 - 偷菜巡检",
+                    "trigger": CronTrigger.from_crontab(self._steal_cron, timezone=settings.TZ),
+                    "func": self._steal_task,
+                    "func_kwargs": {},
+                })
         return services
 
     @staticmethod
@@ -559,6 +573,7 @@ class SiqiFram(_PluginBase):
             "steal_cron": self._steal_cron,
             "last_steal_run": self.get_data("last_steal_run"),
             "last_steal_result": self.get_data("last_steal_result"),
+            "steal_paused_until": self._steal_paused_until(),
         }
 
     def _get_next_run_time(self) -> str:
@@ -682,6 +697,9 @@ class SiqiFram(_PluginBase):
             else:
                 payload["action"] = action
 
+        observed_day = self._today_key()
+        quota_context = (hashlib.sha256(json.dumps([site_url, cookie_res["cookie"]]).encode()).hexdigest()
+                         if action in {"fetch", "get_victim_farm", "steal_vegetable", "finish_stealing"} else None)
         attempts = 1 if method.upper() == "POST" else self._retry_count + 1
         for idx in range(max(1, attempts)):
             if self._stop_event.is_set():
@@ -695,8 +713,13 @@ class SiqiFram(_PluginBase):
                         result = None
                     if response.status_code != 200 or not isinstance(result, dict) or not isinstance(result.get("success"), bool):
                         raise UncertainWriteError("站点未确认写入结果，本轮已停止；请刷新农场核对后再操作")
+                    if quota_context:
+                        self._observe_steal_quota(result, observed_day, quota_context)
                     return response
-                return requests.get(url, headers=headers, params=params, proxies=self._get_proxies(), timeout=30, allow_redirects=False)
+                response = requests.get(url, headers=headers, params=params, proxies=self._get_proxies(), timeout=30, allow_redirects=False)
+                if quota_context:
+                    self._observe_steal_quota(self._json_response(response), observed_day, quota_context)
+                return response
             except requests.RequestException as e:
                 logger.warning(f"{self.plugin_name}: 请求异常 {action or ''} {idx + 1}: {e}")
                 if method.upper() == "POST":
@@ -725,8 +748,9 @@ class SiqiFram(_PluginBase):
         """返回最近一次成功获取的农场缓存，避免打开页面触发站点请求。"""
         data = self.get_data("farm_status")
         if isinstance(data, dict) and data.get("success"):
-            return {**data, "cached": True}
-        return {"success": False, "message": "暂无缓存数据，请手动刷新"}
+            return {**data, "cached": True, "steal_paused_until": self._steal_paused_until()}
+        return {"success": False, "message": "暂无缓存数据，请手动刷新",
+                "steal_paused_until": self._steal_paused_until()}
 
     def _refresh_data(self, payload: Optional[dict] = None) -> Dict[str, Any]:
         """请求站点获取最新农场数据并更新缓存。"""
@@ -736,7 +760,7 @@ class SiqiFram(_PluginBase):
             self.save_data("farm_status", data)
             self.save_data("last_run", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             self._schedule_next_harvest(data)
-        return data
+        return {**data, "steal_paused_until": self._steal_paused_until()}
 
     def get_farm_data(self) -> Dict[str, Any]:
         """请求站点 fetch 接口并补充汇总统计与页面元信息。"""
@@ -1119,6 +1143,44 @@ class SiqiFram(_PluginBase):
             counts.append(int(value))
         return max(0, counts[0] - counts[1])
 
+    def _get_steal_pause(self) -> Optional[dict]:
+        pause = self.get_data("steal_quota_pause")
+        context = self._seed_cache_key()
+        if (isinstance(pause, dict) and context and pause.get("context") == context
+                and isinstance(pause.get("day"), str) and self._to_int(pause.get("resume_at")) > 0):
+            return {**pause, "resume_at": self._to_int(pause["resume_at"])}
+        return None
+
+    def _steal_paused_until(self) -> Optional[str]:
+        if not self._enabled or not self._auto_steal or not self._steal_crops or self._stop_event.is_set():
+            return None
+        pause = self._get_steal_pause()
+        if pause and pause["resume_at"] > datetime.now(self._timezone()).timestamp():
+            return datetime.fromtimestamp(pause["resume_at"], self._timezone()).strftime("%Y-%m-%d %H:%M:%S")
+        return None
+
+    def _observe_steal_quota(self, result: Dict[str, Any], observed_day: str, context: Optional[str]) -> None:
+        """只按当前账号、当前日期的站点原始响应暂停，跨日响应留待重新读取。"""
+        now = datetime.now(self._timezone())
+        if not context or context != self._seed_cache_key() or observed_day != now.strftime("%Y-%m-%d"):
+            return
+        message = str(result.get("msg") or result.get("message") or "").strip().rstrip("。.!！")
+        if not (result.get("success") is True and self._remaining_steals(result) == 0) and message not in {
+            "今日已偷过菜，明天再来吧", "今日可偷数量已用完", "今日偷菜次数已用完",
+        }:
+            return
+        pause = {"context": context, "day": observed_day,
+                 "resume_at": int((now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())}
+        if self.get_data("steal_quota_pause") == pause:
+            return
+        self.save_data("steal_quota_pause", pause)
+        if (self._enabled and self._auto_steal and self._steal_crops
+                and not self._stop_event.is_set() and not self._resuming_steal):
+            try:
+                update_plugin_job(self._runtime_plugin_id())
+            except Exception as e:
+                logger.warning(f"{self.plugin_name}: 偷菜额度已暂停，更新恢复任务失败：{e}")
+
     def _get_steal_target(self, payload: dict = None) -> Dict[str, Any]:
         """使用站点种子目录识别作物，并保存当前目标供手动操作核对。"""
         self._steal_target = {}
@@ -1128,8 +1190,10 @@ class SiqiFram(_PluginBase):
         if not farm.get("success"):
             return {"success": False, "message": "无法读取种子目录，已跳过偷菜"}
         remaining = self._remaining_steals(farm)
-        if (farm.get("can_steal") is not None and not self._to_bool(farm["can_steal"])) or remaining == 0:
-            return {"success": False, "message": "今日已偷过菜，明天再来吧", "remaining_steals": remaining}
+        if remaining == 0:
+            return {"success": False, "message": "今日可偷数量已用完", "remaining_steals": 0}
+        if farm.get("can_steal") is not None and not self._to_bool(farm["can_steal"]):
+            return {"success": False, "message": "站点当前不允许偷菜，本轮跳过", "remaining_steals": remaining}
         names = {
             str(seed["id"]): str(seed.get("name") or "").strip()
             for seed in farm.get("seeds") or []
@@ -1410,6 +1474,17 @@ class SiqiFram(_PluginBase):
         self._run_activity = "偷菜任务执行中"
         run_time = datetime.now(self._timezone()).strftime("%Y-%m-%d %H:%M:%S")
         try:
+            if (not self._enabled or not self._auto_steal or not self._steal_crops
+                    or self._stop_event.is_set()):
+                return
+            if (not self._resuming_steal
+                    and self._steal_resumed_minute == (self._seed_cache_key(), run_time[:16])):
+                return
+            pause = self._get_steal_pause()
+            if pause:
+                if pause["resume_at"] <= datetime.now(self._timezone()).timestamp():
+                    self._resume_steal_task(pause["context"], pause["resume_at"])
+                return
             self.save_data("last_steal_run", run_time)
             result = self._steal_once()
             message = result.get("msg") or result.get("message") or "偷菜检查完成"
@@ -1427,6 +1502,33 @@ class SiqiFram(_PluginBase):
         finally:
             self._run_activity = previous_activity
             self._run_lock.release()
+
+    def _resume_steal_task(self, context: str, resume_at: int) -> None:
+        """跨日恢复等待当前操作结束，检查一次后再恢复 Cron，避免同一零点重复执行。"""
+        with self._run_lock:
+            if (not self._enabled or not self._auto_steal or not self._steal_crops
+                    or self._stop_event.is_set()):
+                return
+            pause = self._get_steal_pause()
+            consumed = False
+            try:
+                if (not pause or pause["context"] != context or pause["resume_at"] != resume_at
+                        or resume_at > datetime.now(self._timezone()).timestamp()):
+                    return
+                self.save_data("steal_quota_pause", None)
+                consumed = True
+                self._resuming_steal = True
+                self._steal_resumed_minute = (context, datetime.now(self._timezone()).strftime("%Y-%m-%d %H:%M"))
+                self._steal_task()
+            finally:
+                self._resuming_steal = False
+                if self._enabled and self._auto_steal and self._steal_crops and not self._stop_event.is_set():
+                    try:
+                        update_plugin_job(self._runtime_plugin_id())
+                    except Exception as e:
+                        if consumed and not self._get_steal_pause():
+                            self.save_data("steal_quota_pause", pause)
+                        logger.warning(f"{self.plugin_name}: 恢复偷菜巡检调度失败，将在后续调度时补跑：{e}")
 
     def _harvest_task(self) -> None:
         # 一次性成熟任务等待当前操作结束，避免被偷菜巡检占锁后永久漏跑。

@@ -11,7 +11,7 @@ xchenya 的 [MoviePilot](https://github.com/jxxghp/MoviePilot) 第三方插件�
 | [癫影自动签到](./plugins.v3/dian115sign/README.md) | `plugins.v3/dian115sign` | `2.0.6` | V3 测试版；普通签已实测 |
 | [憨憨保种区管家 V3](./plugins.v3/hhclubbutler/README.md) | `plugins.v3/hhclubbutler` | `3.0.12` | 删除后按下载器局部更新，修复独立任务残留与 ID 展示；待真实联调 |
 | [思齐自动收垃圾 V3](./plugins.v3/siqicleanbeach/README.md) | `plugins.v3/siqicleanbeach` | `2.0.0` | V3 移植测试版；未进行思齐站点联调 |
-| [思齐农场 V3](./plugins.v3/siqifram/README.md) | `plugins.v3/siqifram` | `2.1.1` | 种植与偷菜独立配置，恢复完整种子及解锁状态；待宿主及站点联调 |
+| [思齐农场 V3](./plugins.v3/siqifram/README.md) | `plugins.v3/siqifram` | `2.2.2` | 独立偷菜巡检，额度耗尽后暂停至次日0点；待宿主及站点联调 |
 
 癫影签到为独立重写测试版，要求 **MoviePilot V3**；插件版本 `2.0.6` 不代表支持 MoviePilot V2。已完成真实账号普通签到验证；首次安装仍建议先运行诊断。详见插件说明与[测试说明](./tests/v3/dian115sign/README.md)。
 
@@ -19,7 +19,7 @@ xchenya 的 [MoviePilot](https://github.com/jxxghp/MoviePilot) 第三方插件�
 
 “思齐自动收垃圾”移植自 [bfjy2024/MoviePilot-Plugins](https://github.com/bfjy2024/MoviePilot-Plugins/tree/main/plugins.v2/siqicleanbeach)，原作者 bfjy，依上游 GPL-3.0 许可保留署名，当前 V3 版本由 xchenya 适配维护。已添加模拟数据回归测试，但尚未完成真实思齐站点联调；请手动测试成功后再启用定时。
 
-“思齐农场”移植自 [KoWming/MoviePilot-Plugins](https://github.com/KoWming/MoviePilot-Plugins/tree/main/plugins.v2/siqifram) 1.0.3，遵循上游 GPL-3.0 许可并保留署名；V3 适配由 xchenya 维护。
+“思齐农场”当前作者与维护者为 [xchenya](https://github.com/xchenya)，基于原作者 KoWming 的 [siqifram 1.0.3](https://github.com/KoWming/MoviePilot-Plugins/tree/main/plugins.v2/siqifram) 移植并持续修改，遵循上游 GPL-3.0 许可，保留原作来源与许可声明。
 
 ## 使用方法
 

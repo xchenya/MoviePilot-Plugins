@@ -1,7 +1,7 @@
 import { importShared } from './__federation_fn_import-054b33c3.js';
 import { _ as _export_sfc } from './_plugin-vue_export-helper-c4c0bc37.js';
 
-const Config_vue_vue_type_style_index_0_scoped_a3e36013_lang = '';
+const Config_vue_vue_type_style_index_0_scoped_4cf38228_lang = '';
 
 const {resolveComponent:_resolveComponent,createVNode:_createVNode,createElementVNode:_createElementVNode,withCtx:_withCtx,toDisplayString:_toDisplayString,createTextVNode:_createTextVNode,openBlock:_openBlock,createBlock:_createBlock,createCommentVNode:_createCommentVNode,normalizeClass:_normalizeClass,createElementBlock:_createElementBlock,normalizeProps:_normalizeProps,guardReactiveProps:_guardReactiveProps,withModifiers:_withModifiers} = await importShared('vue');
 
@@ -251,7 +251,7 @@ return (_ctx, _cache) => {
           })
         ]),
         _cache[24] || (_cache[24] = _createElementVNode("div", null, [
-          _createElementVNode("div", { class: "siqi-topbar__title" }, "思齐农场 · 配置 · v2.2.1"),
+          _createElementVNode("div", { class: "siqi-topbar__title" }, "思齐农场 · 配置 · v2.2.2"),
           _createElementVNode("div", { class: "siqi-topbar__sub" }, "管理定时任务、自动化策略与站点 Cookie")
         ], -1))
       ]),
@@ -754,7 +754,7 @@ return (_ctx, _cache) => {
           "hide-details": "",
           class: "siqi-input"
         }, null, 8, ["modelValue"]),
-        _cache[48] || (_cache[48] = _createElementVNode("div", { class: "siqi-field-hint" }, "偷菜巡检只检查所选作物，按站点当日剩余次数执行，与总 Cron 和成熟收获任务独立。只影响偷菜，不改变默认种子或种子解锁列表；全部取消则不偷菜。", -1)),
+        _cache[48] || (_cache[48] = _createElementVNode("div", { class: "siqi-field-hint" }, "偷菜巡检只检查所选作物，按站点当日剩余可偷数量执行，与总 Cron 和成熟收获任务独立。当日可偷数量用完后暂停巡检，次日 0 点恢复（MoviePilot 配置时区）。只影响偷菜，不改变默认种子或种子解锁列表；全部取消则不偷菜。", -1)),
         _createElementVNode("div", _hoisted_43, [
           _createVNode(_component_v_btn, {
             color: "red",
@@ -786,6 +786,6 @@ return (_ctx, _cache) => {
 }
 
 };
-const Config = /*#__PURE__*/_export_sfc(_sfc_main, [['__scopeId',"data-v-a3e36013"]]);
+const Config = /*#__PURE__*/_export_sfc(_sfc_main, [['__scopeId',"data-v-4cf38228"]]);
 
 export { Config as default };

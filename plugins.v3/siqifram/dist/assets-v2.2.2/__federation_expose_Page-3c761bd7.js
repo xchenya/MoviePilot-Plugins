@@ -1,7 +1,7 @@
 import { importShared } from './__federation_fn_import-054b33c3.js';
 import { _ as _export_sfc } from './_plugin-vue_export-helper-c4c0bc37.js';
 
-const Page_vue_vue_type_style_index_0_scoped_79fec5ae_lang = '';
+const Page_vue_vue_type_style_index_0_scoped_a1e6f725_lang = '';
 
 const {resolveComponent:_resolveComponent,createVNode:_createVNode,createElementVNode:_createElementVNode,withCtx:_withCtx,toDisplayString:_toDisplayString,createTextVNode:_createTextVNode,openBlock:_openBlock,createBlock:_createBlock,createCommentVNode:_createCommentVNode,Fragment:_Fragment,createElementBlock:_createElementBlock,renderList:_renderList,normalizeClass:_normalizeClass,normalizeStyle:_normalizeStyle} = await importShared('vue');
 
@@ -89,79 +89,85 @@ const _hoisted_53 = { class: "seed-name" };
 const _hoisted_54 = { class: "seed-meta" };
 const _hoisted_55 = ["title"];
 const _hoisted_56 = { class: "neu-action-card neu-action-card--steal" };
-const _hoisted_57 = { class: "neu-action-card neu-action-card--like" };
-const _hoisted_58 = { class: "neu-action-card neu-action-card--visit" };
-const _hoisted_59 = { class: "visit-action-row" };
-const _hoisted_60 = { class: "land-title" };
-const _hoisted_61 = { class: "land-plot-count" };
-const _hoisted_62 = { class: "text-caption text-grey" };
-const _hoisted_63 = {
+const _hoisted_57 = { class: "neu-action-content" };
+const _hoisted_58 = {
+  class: "neu-action-desc",
+  role: "status",
+  "aria-live": "polite"
+};
+const _hoisted_59 = { class: "neu-action-card neu-action-card--like" };
+const _hoisted_60 = { class: "neu-action-card neu-action-card--visit" };
+const _hoisted_61 = { class: "visit-action-row" };
+const _hoisted_62 = { class: "land-title" };
+const _hoisted_63 = { class: "land-plot-count" };
+const _hoisted_64 = { class: "text-caption text-grey" };
+const _hoisted_65 = {
   key: 0,
   class: "land-locked-mobile-hint"
 };
-const _hoisted_64 = { class: "plot-grid" };
-const _hoisted_65 = ["title", "onClick"];
-const _hoisted_66 = ["src", "alt"];
-const _hoisted_67 = {
+const _hoisted_66 = { class: "plot-grid" };
+const _hoisted_67 = ["title", "onClick"];
+const _hoisted_68 = ["src", "alt"];
+const _hoisted_69 = {
   key: 2,
   class: "plot-icon"
 };
-const _hoisted_68 = {
+const _hoisted_70 = {
   key: 0,
   class: "inventory-empty"
 };
-const _hoisted_69 = {
+const _hoisted_71 = {
   key: 1,
   class: "inventory-grid"
 };
-const _hoisted_70 = { class: "inventory-icon" };
-const _hoisted_71 = { class: "inventory-main" };
-const _hoisted_72 = { class: "inventory-name" };
-const _hoisted_73 = { class: "inventory-meta" };
-const _hoisted_74 = { class: "inventory-bonus" };
-const _hoisted_75 = {
+const _hoisted_72 = { class: "inventory-icon" };
+const _hoisted_73 = { class: "inventory-main" };
+const _hoisted_74 = { class: "inventory-name" };
+const _hoisted_75 = { class: "inventory-meta" };
+const _hoisted_76 = { class: "inventory-bonus" };
+const _hoisted_77 = {
   key: 0,
   class: "text-grey text-center py-6"
 };
-const _hoisted_76 = {
+const _hoisted_78 = {
   key: 1,
   class: "history-list"
 };
-const _hoisted_77 = { class: "history-left" };
-const _hoisted_78 = { class: "history-detail" };
-const _hoisted_79 = { class: "history-right" };
-const _hoisted_80 = { class: "history-time" };
-const _hoisted_81 = { class: "neu-visit-info" };
-const _hoisted_82 = { class: "neu-visit-name" };
-const _hoisted_83 = { class: "neu-visit-decor" };
-const _hoisted_84 = { class: "neu-visit-actions" };
-const _hoisted_85 = { class: "visit-like-status" };
-const _hoisted_86 = {
+const _hoisted_79 = { class: "history-left" };
+const _hoisted_80 = { class: "history-detail" };
+const _hoisted_81 = { class: "history-right" };
+const _hoisted_82 = { class: "history-time" };
+const _hoisted_83 = { class: "neu-visit-info" };
+const _hoisted_84 = { class: "neu-visit-name" };
+const _hoisted_85 = { class: "neu-visit-decor" };
+const _hoisted_86 = { class: "neu-visit-actions" };
+const _hoisted_87 = { class: "visit-like-status" };
+const _hoisted_88 = {
   key: 0,
   class: "visit-decor-counts"
 };
-const _hoisted_87 = {
+const _hoisted_89 = {
   key: 1,
   class: "neu-visit-empty"
 };
-const _hoisted_88 = { class: "neu-land-title" };
-const _hoisted_89 = { class: "text-caption text-grey" };
-const _hoisted_90 = {
+const _hoisted_90 = { class: "neu-land-title" };
+const _hoisted_91 = { class: "text-caption text-grey" };
+const _hoisted_92 = {
   key: 0,
   class: "visit-land-locked"
 };
-const _hoisted_91 = {
+const _hoisted_93 = {
   key: 1,
   class: "neu-plot-grid"
 };
-const _hoisted_92 = { class: "neu-plot-icon-wrap" };
-const _hoisted_93 = ["src", "alt"];
-const _hoisted_94 = {
+const _hoisted_94 = { class: "neu-plot-icon-wrap" };
+const _hoisted_95 = ["src", "alt"];
+const _hoisted_96 = {
   key: 1,
   class: "neu-plot-emoji"
 };
-const _hoisted_95 = { class: "neu-plot-label" };
-const _hoisted_96 = {
+const _hoisted_97 = { class: "neu-plot-label" };
+const _hoisted_98 = {
   key: 0,
   class: "neu-plot-badge ready"
 };
@@ -1615,11 +1621,11 @@ return (_ctx, _cache) => {
                           _createVNode(_component_v_col, { cols: "12" }, {
                             default: _withCtx(() => [
                               _createElementVNode("div", _hoisted_56, [
-                                _cache[63] || (_cache[63] = _createElementVNode("div", { class: "neu-action-icon" }, "🥷", -1)),
-                                _cache[64] || (_cache[64] = _createElementVNode("div", { class: "neu-action-content" }, [
-                                  _createElementVNode("div", { class: "neu-action-label" }, "偷菜"),
-                                  _createElementVNode("div", { class: "neu-action-desc" }, "每日一次，自动寻找可偷作物")
-                                ], -1)),
+                                _cache[64] || (_cache[64] = _createElementVNode("div", { class: "neu-action-icon" }, "🥷", -1)),
+                                _createElementVNode("div", _hoisted_57, [
+                                  _cache[63] || (_cache[63] = _createElementVNode("div", { class: "neu-action-label" }, "偷菜", -1)),
+                                  _createElementVNode("div", _hoisted_58, _toDisplayString(farm.value.steal_paused_until ? `今日偷菜已用完，暂停至 ${farm.value.steal_paused_until}` : '按当日剩余可偷数量寻找所选作物'), 1)
+                                ]),
                                 _createVNode(_component_v_btn, {
                                   color: farm.value.can_steal ? 'red' : 'grey',
                                   size: "small",
@@ -1638,7 +1644,7 @@ return (_ctx, _cache) => {
                           }),
                           _createVNode(_component_v_col, { cols: "12" }, {
                             default: _withCtx(() => [
-                              _createElementVNode("div", _hoisted_57, [
+                              _createElementVNode("div", _hoisted_59, [
                                 _cache[66] || (_cache[66] = _createElementVNode("div", { class: "neu-action-icon" }, "👍", -1)),
                                 _cache[67] || (_cache[67] = _createElementVNode("div", { class: "neu-action-content" }, [
                                   _createElementVNode("div", { class: "neu-action-label" }, "一键点赞"),
@@ -1662,13 +1668,13 @@ return (_ctx, _cache) => {
                           }),
                           _createVNode(_component_v_col, { cols: "12" }, {
                             default: _withCtx(() => [
-                              _createElementVNode("div", _hoisted_58, [
+                              _createElementVNode("div", _hoisted_60, [
                                 _cache[70] || (_cache[70] = _createElementVNode("div", { class: "neu-action-icon" }, "🚜", -1)),
                                 _cache[71] || (_cache[71] = _createElementVNode("div", { class: "neu-action-content" }, [
                                   _createElementVNode("div", { class: "neu-action-label" }, "参观农场"),
                                   _createElementVNode("div", { class: "neu-action-desc" }, "输入用户名或随机访问")
                                 ], -1)),
-                                _createElementVNode("div", _hoisted_59, [
+                                _createElementVNode("div", _hoisted_61, [
                                   _createVNode(_component_v_text_field, {
                                     modelValue: visitUsername.value,
                                     "onUpdate:modelValue": _cache[14] || (_cache[14] = $event => ((visitUsername).value = $event)),
@@ -1754,16 +1760,16 @@ return (_ctx, _cache) => {
                         key: land.id,
                         class: _normalizeClass(["land-section", {'land-section--locked': !landUnlocked(land)}])
                       }, [
-                        _createElementVNode("div", _hoisted_60, [
+                        _createElementVNode("div", _hoisted_62, [
                           _createTextVNode(_toDisplayString(land.name), 1),
-                          _createElementVNode("span", _hoisted_61, "（坑位：" + _toDisplayString(landPlotCountLabel(land)) + "）", 1),
+                          _createElementVNode("span", _hoisted_63, "（坑位：" + _toDisplayString(landPlotCountLabel(land)) + "）", 1),
                           _cache[74] || (_cache[74] = _createTextVNode()),
-                          _createElementVNode("span", _hoisted_62, _toDisplayString(landUnlocked(land) ? '' : `解锁需总收获 ${land.unlock_harvest}`), 1)
+                          _createElementVNode("span", _hoisted_64, _toDisplayString(landUnlocked(land) ? '' : `解锁需总收获 ${land.unlock_harvest}`), 1)
                         ]),
                         (!landUnlocked(land))
-                          ? (_openBlock(), _createElementBlock("div", _hoisted_63, "未解锁，移动端已折叠显示"))
+                          ? (_openBlock(), _createElementBlock("div", _hoisted_65, "未解锁，移动端已折叠显示"))
                           : _createCommentVNode("", true),
-                        _createElementVNode("div", _hoisted_64, [
+                        _createElementVNode("div", _hoisted_66, [
                           (_openBlock(true), _createElementBlock(_Fragment, null, _renderList(plotsForLand(land), (plot) => {
                             return (_openBlock(), _createElementBlock("button", {
                               key: `${land.id}-${plot.plot_index}`,
@@ -1815,8 +1821,8 @@ return (_ctx, _cache) => {
                                               src: getStageImg(plot),
                                               class: "stage-img",
                                               alt: plot.seed.name
-                                            }, null, 8, _hoisted_66))
-                                          : (_openBlock(), _createElementBlock("span", _hoisted_67, _toDisplayString(plot.seed.icon), 1)),
+                                            }, null, 8, _hoisted_68))
+                                          : (_openBlock(), _createElementBlock("span", _hoisted_69, _toDisplayString(plot.seed.icon), 1)),
                                         _cache[81] || (_cache[81] = _createElementVNode("br", null, null, -1)),
                                         _createElementVNode("small", null, _toDisplayString(plot.seed.name), 1),
                                         _cache[82] || (_cache[82] = _createElementVNode("br", null, null, -1)),
@@ -1827,7 +1833,7 @@ return (_ctx, _cache) => {
                                         _cache[84] || (_cache[84] = _createElementVNode("br", null, null, -1)),
                                         _cache[85] || (_cache[85] = _createElementVNode("small", null, "点击种植", -1))
                                       ], 64))
-                            ], 10, _hoisted_65))
+                            ], 10, _hoisted_67))
                           }), 128))
                         ])
                       ], 2))
@@ -1876,24 +1882,24 @@ return (_ctx, _cache) => {
                         _createVNode(_component_v_card_text, { class: "inventory-body" }, {
                           default: _withCtx(() => [
                             (!(farm.value.inventory || []).length)
-                              ? (_openBlock(), _createElementBlock("div", _hoisted_68, [...(_cache[88] || (_cache[88] = [
+                              ? (_openBlock(), _createElementBlock("div", _hoisted_70, [...(_cache[88] || (_cache[88] = [
                                   _createElementVNode("div", { class: "inventory-empty-icon" }, "🎒", -1),
                                   _createElementVNode("div", null, "背包空空如也", -1),
                                   _createElementVNode("small", null, "成熟作物收获后会进入这里", -1)
                                 ]))]))
-                              : (_openBlock(), _createElementBlock("div", _hoisted_69, [
+                              : (_openBlock(), _createElementBlock("div", _hoisted_71, [
                                   (_openBlock(true), _createElementBlock(_Fragment, null, _renderList(farm.value.inventory, (item) => {
                                     return (_openBlock(), _createElementBlock("div", {
                                       key: item.seed_id,
                                       class: "inventory-item"
                                     }, [
-                                      _createElementVNode("div", _hoisted_70, _toDisplayString(item.icon || '🌱'), 1),
-                                      _createElementVNode("div", _hoisted_71, [
-                                        _createElementVNode("div", _hoisted_72, _toDisplayString(item.name || `作物 ${item.seed_id}`), 1),
-                                        _createElementVNode("div", _hoisted_73, [
+                                      _createElementVNode("div", _hoisted_72, _toDisplayString(item.icon || '🌱'), 1),
+                                      _createElementVNode("div", _hoisted_73, [
+                                        _createElementVNode("div", _hoisted_74, _toDisplayString(item.name || `作物 ${item.seed_id}`), 1),
+                                        _createElementVNode("div", _hoisted_75, [
                                           _createElementVNode("span", null, "数量 " + _toDisplayString(Number(item.quantity || 0)), 1),
                                           _createElementVNode("span", null, "售：" + _toDisplayString(inventoryUnitReward(item)) + " 魔力/份", 1),
-                                          _createElementVNode("span", _hoisted_74, [
+                                          _createElementVNode("span", _hoisted_76, [
                                             _cache[89] || (_cache[89] = _createTextVNode("含装饰加成 ", -1)),
                                             _createElementVNode("b", null, "+" + _toDisplayString(formatPercentValue(inventoryDecorBonus())) + "%", 1)
                                           ])
@@ -1941,24 +1947,24 @@ return (_ctx, _cache) => {
                         _createVNode(_component_v_card_text, { class: "history-body" }, {
                           default: _withCtx(() => [
                             (!(farm.value.user_logs || []).length)
-                              ? (_openBlock(), _createElementBlock("div", _hoisted_75, "暂无操作记录"))
-                              : (_openBlock(), _createElementBlock("div", _hoisted_76, [
+                              ? (_openBlock(), _createElementBlock("div", _hoisted_77, "暂无操作记录"))
+                              : (_openBlock(), _createElementBlock("div", _hoisted_78, [
                                   (_openBlock(true), _createElementBlock(_Fragment, null, _renderList(farm.value.user_logs || [], (log) => {
                                     return (_openBlock(), _createElementBlock("div", {
                                       key: log.id || `${log.created_at}-${log.action}-${log.plot_index}`,
                                       class: "history-item"
                                     }, [
-                                      _createElementVNode("div", _hoisted_77, [
+                                      _createElementVNode("div", _hoisted_79, [
                                         _createElementVNode("span", {
                                           class: _normalizeClass(["history-action", logMeta(log).actionClass])
                                         }, _toDisplayString(logMeta(log).actionText), 3),
-                                        _createElementVNode("span", _hoisted_78, _toDisplayString(logMeta(log).detailText), 1)
+                                        _createElementVNode("span", _hoisted_80, _toDisplayString(logMeta(log).detailText), 1)
                                       ]),
-                                      _createElementVNode("div", _hoisted_79, [
+                                      _createElementVNode("div", _hoisted_81, [
                                         _createElementVNode("span", {
                                           class: _normalizeClass(["history-value", logMeta(log).valueClass])
                                         }, _toDisplayString(logMeta(log).valueText), 3),
-                                        _createElementVNode("span", _hoisted_80, _toDisplayString(formatLogTime(log.created_at)), 1)
+                                        _createElementVNode("span", _hoisted_82, _toDisplayString(formatLogTime(log.created_at)), 1)
                                       ])
                                     ]))
                                   }), 128))
@@ -1991,8 +1997,8 @@ return (_ctx, _cache) => {
               _createVNode(_component_v_card_title, { class: "neu-visit-header" }, {
                 default: _withCtx(() => [
                   _cache[93] || (_cache[93] = _createElementVNode("div", { class: "neu-visit-avatar visit-avatar" }, "🚜", -1)),
-                  _createElementVNode("div", _hoisted_81, [
-                    _createElementVNode("div", _hoisted_82, [
+                  _createElementVNode("div", _hoisted_83, [
+                    _createElementVNode("div", _hoisted_84, [
                       _createTextVNode(" 农场参观 · " + _toDisplayString(visitTargetName()) + " ", 1),
                       (visitedFarm.value.ready_count)
                         ? (_openBlock(), _createBlock(_component_v_chip, {
@@ -2009,9 +2015,9 @@ return (_ctx, _cache) => {
                           }))
                         : _createCommentVNode("", true)
                     ]),
-                    _createElementVNode("div", _hoisted_83, "正在查看 " + _toDisplayString(visitTargetName()) + " 的农场，成熟作物 " + _toDisplayString(Number(visitedFarm.value.ready_count || 0)) + " 个", 1)
+                    _createElementVNode("div", _hoisted_85, "正在查看 " + _toDisplayString(visitTargetName()) + " 的农场，成熟作物 " + _toDisplayString(Number(visitedFarm.value.ready_count || 0)) + " 个", 1)
                   ]),
-                  _createElementVNode("div", _hoisted_84, [
+                  _createElementVNode("div", _hoisted_86, [
                     _createVNode(_component_v_btn, {
                       color: "green",
                       variant: "flat",
@@ -2045,9 +2051,9 @@ return (_ctx, _cache) => {
               }),
               _createVNode(_component_v_card_text, { style: {"max-height":"60vh"} }, {
                 default: _withCtx(() => [
-                  _createElementVNode("div", _hoisted_85, _toDisplayString(visitLikeStatusText()), 1),
+                  _createElementVNode("div", _hoisted_87, _toDisplayString(visitLikeStatusText()), 1),
                   (visitedFarm.value.decor_counts)
-                    ? (_openBlock(), _createElementBlock("div", _hoisted_86, [
+                    ? (_openBlock(), _createElementBlock("div", _hoisted_88, [
                         (_openBlock(true), _createElementBlock(_Fragment, null, _renderList(visitDecorCounts(), (item) => {
                           return (_openBlock(), _createElementBlock("span", {
                             key: item.type,
@@ -2057,20 +2063,20 @@ return (_ctx, _cache) => {
                       ]))
                     : _createCommentVNode("", true),
                   (!(visitedFarm.value.lands || []).length)
-                    ? (_openBlock(), _createElementBlock("div", _hoisted_87, "该用户暂无已解锁菜地"))
+                    ? (_openBlock(), _createElementBlock("div", _hoisted_89, "该用户暂无已解锁菜地"))
                     : _createCommentVNode("", true),
                   (_openBlock(true), _createElementBlock(_Fragment, null, _renderList(visitedFarm.value.lands || [], (land) => {
                     return (_openBlock(), _createElementBlock("div", {
                       key: 'vl-'+land.id,
                       class: "neu-land-section"
                     }, [
-                      _createElementVNode("div", _hoisted_88, [
+                      _createElementVNode("div", _hoisted_90, [
                         _createTextVNode(_toDisplayString(land.name) + " ", 1),
-                        _createElementVNode("span", _hoisted_89, "坑位：" + _toDisplayString(land.effective_plot_count || land.plot_count || 0), 1)
+                        _createElementVNode("span", _hoisted_91, "坑位：" + _toDisplayString(land.effective_plot_count || land.plot_count || 0), 1)
                       ]),
                       (land.unlocked !== undefined && !Number(land.unlocked))
-                        ? (_openBlock(), _createElementBlock("div", _hoisted_90, "未解锁"))
-                        : (_openBlock(), _createElementBlock("div", _hoisted_91, [
+                        ? (_openBlock(), _createElementBlock("div", _hoisted_92, "未解锁"))
+                        : (_openBlock(), _createElementBlock("div", _hoisted_93, [
                             (_openBlock(true), _createElementBlock(_Fragment, null, _renderList(visitPlotsForLand(land), (plot) => {
                               return (_openBlock(), _createElementBlock("div", {
                                 key: 'vp-'+land.id+'-'+plot.plot_index,
@@ -2078,19 +2084,19 @@ return (_ctx, _cache) => {
                               }, [
                                 (plot.seed_id)
                                   ? (_openBlock(), _createElementBlock(_Fragment, { key: 0 }, [
-                                      _createElementVNode("div", _hoisted_92, [
+                                      _createElementVNode("div", _hoisted_94, [
                                         (getVisitStageImg(plot))
                                           ? (_openBlock(), _createElementBlock("img", {
                                               key: 0,
                                               src: getVisitStageImg(plot),
                                               class: "stage-img-sm",
                                               alt: plot.seed_name || ''
-                                            }, null, 8, _hoisted_93))
-                                          : (_openBlock(), _createElementBlock("span", _hoisted_94, _toDisplayString(plot.seed_icon || seedById(plot.seed_id)?.icon || ''), 1))
+                                            }, null, 8, _hoisted_95))
+                                          : (_openBlock(), _createElementBlock("span", _hoisted_96, _toDisplayString(plot.seed_icon || seedById(plot.seed_id)?.icon || ''), 1))
                                       ]),
-                                      _createElementVNode("div", _hoisted_95, _toDisplayString(plot.seed_name || seedById(plot.seed_id)?.name || ''), 1),
+                                      _createElementVNode("div", _hoisted_97, _toDisplayString(plot.seed_name || seedById(plot.seed_id)?.name || ''), 1),
                                       (isVisitReady(plot))
-                                        ? (_openBlock(), _createElementBlock("div", _hoisted_96, "成熟"))
+                                        ? (_openBlock(), _createElementBlock("div", _hoisted_98, "成熟"))
                                         : _createCommentVNode("", true)
                                     ], 64))
                                   : (_openBlock(), _createElementBlock(_Fragment, { key: 1 }, [
@@ -2117,6 +2123,6 @@ return (_ctx, _cache) => {
 }
 
 };
-const Page = /*#__PURE__*/_export_sfc(_sfc_main, [['__scopeId',"data-v-79fec5ae"]]);
+const Page = /*#__PURE__*/_export_sfc(_sfc_main, [['__scopeId',"data-v-a1e6f725"]]);
 
 export { Page as default };
