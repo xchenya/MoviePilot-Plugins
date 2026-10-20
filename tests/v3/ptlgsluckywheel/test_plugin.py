@@ -245,6 +245,7 @@ def test_once_and_diagnose_dont_need_daily_enable(plugin, module):
     wheel = connect(plugin)
     plugin.init_plugin({"run_once": True, "diagnose_only": True})
     assert plugin.saved_config["run_once"] is False
+    assert plugin.saved_config["diagnose_only"] is False
     job = plugin.get_service()[0]
     job["func"]()
     job["func"]()
@@ -478,3 +479,135 @@ def test_notification_uses_actual_balance_change_not_prize_label(plugin, module)
     result = saved(plugin, module)["last"]
     assert result["spent"] == 1000 and result["change"] == -50
     assert "工分变化 -50.0" in plugin.notifications[0]["text"]
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_diagnosis_alone_is_one_shot_and_cannot_replay_after_reload(plugin, module, fails):
+    wheel = connect(plugin)
+    if fails:
+        wheel.get = Mock(side_effect=requests.Timeout())
+    plugin.init_plugin({"diagnose_only": True})
+    assert plugin.get_state()
+    assert plugin.saved_config["diagnose_only"] is False
+    job = plugin.get_service()[0]["func"]
+    job()
+    job()
+    assert wheel.get.call_count == 1 and not wheel.post.called
+    assert not plugin.get_state()
+    assert saved(plugin, module)["last"]["status"] == ("异常停止" if fails else "诊断成功")
+    plugin.init_plugin(plugin.saved_config)
+    assert plugin.get_service() == []
+
+
+def test_diagnosis_does_not_disable_subsequent_cron_draws(plugin, module):
+    wheel = connect(plugin)
+    plugin.init_plugin({"enabled": True, "diagnose_only": True, "daily_target": 10})
+    jobs = {job["id"].split(".")[-1]: job["func"] for job in plugin.get_service()}
+    jobs["Once"]()
+    assert not wheel.post.called
+    jobs["Daily"]()
+    jobs["Once"]()
+    assert wheel.purchases == [10]
+
+
+def test_diagnosis_reset_failure_blocks_execution(plugin):
+    wheel = connect(plugin)
+    plugin.update_config = Mock(return_value=False)
+    plugin.init_plugin({"enabled": True, "diagnose_only": True})
+    plugin.run(once=True)
+    plugin.run()
+    assert plugin.get_service() == [] and not wheel.get.called
+    assert "复位失败" in plugin._error
+
+
+def card_text(page, title):
+    """Read the visible card, not incidental numbers elsewhere in the page."""
+    def walk(node):
+        yield node
+        for child in node.get("content", []):
+            yield from walk(child)
+
+    for root in page:
+        for node in walk(root):
+            if node.get("component") == "VCard" and node["content"][0].get("text") == title:
+                return [child["text"] for child in walk(node) if "text" in child]
+    raise AssertionError(f"Missing card: {title}")
+
+
+def test_daily_panel_accumulates_runs_and_survives_diagnosis_and_noop(plugin, module):
+    wheel = connect(plugin)
+    plugin.run()
+    plugin._config["daily_target"] = 30
+    plugin.run()
+    plugin.run()  # Already at target: latest invocation has zero draws.
+    plugin.init_plugin({"diagnose_only": True})
+    plugin.get_service()[0]["func"]()
+    assert saved(plugin, module)["last"]["draws"] == 0
+    page = plugin.get_page()
+    assert card_text(page, "今日抽奖（插件）")[-1] == "30 抽"
+    assert card_text(page, "今日消耗工分")[-1] == "30,000"
+    assert card_text(page, "站点今日剩余")[-1] == "470 抽"
+    prizes = card_text(page, "今日奖品统计")
+    assert "工分500" in prizes and "30" in prizes
+    assert wheel.purchases == [10, 10, 10]
+
+
+def test_daily_panel_rollover_is_read_only_and_keeps_history(plugin, module):
+    wheel = connect(plugin)
+    plugin._day = lambda: "2099-01-01"
+    plugin.run()
+    reads = wheel.get.call_count
+    plugin._day = lambda: "2099-01-02"
+    page = plugin.get_page()
+    assert card_text(page, "今日抽奖（插件）")[-1] == "0 抽"
+    assert card_text(page, "站点今日剩余")[-1] == "待检查"
+    assert "工分500" not in card_text(page, "今日奖品统计")
+    previous = card_text(page, "历史每日统计")
+    assert "2099-01-01 · 20 抽" in previous and "工分500" in previous
+    assert wheel.get.call_count == reads and wheel.purchases == [10, 10]
+    wheel.remaining = 500
+    plugin._config["daily_target"] = 10
+    plugin.run()
+    assert card_text(plugin.get_page(), "今日抽奖（插件）")[-1] == "10 抽"
+    assert saved(plugin, module)["days"]["123:2099-01-01"]["draws"] == 20
+
+
+def test_daily_panel_uses_active_account_and_migrates_single_legacy_account(plugin, module):
+    wheel = connect(plugin)
+    plugin.run()
+    state = saved(plugin, module)
+    state.pop("active_uid")
+    state.pop("snapshot")
+    module.storage.save(plugin._path(), state)
+    assert card_text(plugin.get_page(), "今日抽奖（插件）")[-1] == "20 抽"
+    state["days"]["456:" + plugin._day()] = {"draws": 7, "prizes": {"另一账号奖品": 7}}
+    module.storage.save(plugin._path(), state)
+    assert card_text(plugin.get_page(), "今日抽奖（插件）")[-1] == "—"
+    wheel.uid = "456"
+    plugin.init_plugin({"diagnose_only": True})
+    plugin.get_service()[0]["func"]()
+    page = plugin.get_page()
+    assert card_text(page, "今日抽奖（插件）")[-1] == "7 抽"
+    assert "另一账号奖品" in card_text(page, "今日奖品统计")
+    assert "工分500" not in card_text(page, "今日奖品统计")
+
+
+def test_daily_panel_keeps_manual_draws_separate_and_rejects_stale_quota(plugin, module):
+    wheel = connect(plugin, Wheel(remaining=490))
+    plugin.run()
+    assert card_text(plugin.get_page(), "今日抽奖（插件）")[-1] == "10 抽"
+    assert card_text(plugin.get_page(), "站点今日剩余")[-1] == "480 抽"
+    wheel.get = Mock(return_value=response(text=html(remaining=500)))
+    plugin.init_plugin({"diagnose_only": True})
+    plugin.get_service()[0]["func"]()
+    assert card_text(plugin.get_page(), "站点今日剩余")[-1] == "480 抽"
+
+
+def test_diagnosis_crossing_reset_does_not_misdate_quota(plugin, module):
+    wheel = connect(plugin)
+    plugin._day = Mock(side_effect=["2099-01-01", "2099-01-02"])
+    plugin.init_plugin({"diagnose_only": True})
+    plugin.get_service()[0]["func"]()
+    state = saved(plugin, module)
+    assert "snapshot" not in state and state["last"]["status"] == "异常停止"
+    assert not wheel.post.called

@@ -33,7 +33,7 @@ class PtlgsLuckyWheel(_PluginBase):
     plugin_name = "PTLGS 幸运大转盘"
     plugin_desc = "每日定时抽奖、工分保留、原订单重试及奖品汇总通知。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_author = "xchenya"
     author_url = "https://github.com/xchenya"
     plugin_config_prefix = "ptlgsluckywheel_"
@@ -49,6 +49,8 @@ class PtlgsLuckyWheel(_PluginBase):
         self._config = self.defaults()
         self._error = ""
         self._once = False
+        self._diagnose_once = False
+        self._acknowledge = False
         self._trigger = None
 
     @staticmethod
@@ -72,6 +74,7 @@ class PtlgsLuckyWheel(_PluginBase):
             self._generation += 1
             self._cancel = threading.Event()
             self._once = False
+            self._diagnose_once = False
             self._trigger = None
             self._error = ""
             values = {**self.defaults(), **(config or {})}
@@ -90,13 +93,14 @@ class PtlgsLuckyWheel(_PluginBase):
                 ZoneInfo(values["timezone"])
                 values["cron"] = str(values["cron"]).strip()
                 self._trigger = CronTrigger.from_crontab(values["cron"], timezone=values["timezone"])
-                self._once = values["run_once"] or values["acknowledge_pending"]
+                self._once = values["run_once"] or values["diagnose_only"] or values["acknowledge_pending"]
             except Exception as exc:
                 self._error = str(exc) if isinstance(exc, WheelError) else "配置无效，请检查五段 Cron 和 IANA 时区"
             self._config = values
             self._acknowledge = bool(values.get("acknowledge_pending"))
-            changed = values.get("run_once") or values.get("acknowledge_pending")
-            values["run_once"] = values["acknowledge_pending"] = False
+            self._diagnose_once = bool(values.get("diagnose_only"))
+            changed = values.get("run_once") or self._diagnose_once or self._acknowledge
+            values["run_once"] = values["diagnose_only"] = values["acknowledge_pending"] = False
             if changed:
                 try:
                     if self.update_config(copy.deepcopy(values)) is False:
@@ -134,6 +138,8 @@ class PtlgsLuckyWheel(_PluginBase):
         with self._lifecycle:
             self._cancel.set()
             self._once = False
+            self._diagnose_once = False
+            self._acknowledge = False
 
     @staticmethod
     def get_command():
@@ -153,9 +159,9 @@ class PtlgsLuckyWheel(_PluginBase):
         """Render only cached results; opening the page never submits a draw."""
         from .ui import page
         try:
-            return page(storage.load(self._path()), self._error)
+            return page(storage.load(self._path()), self._error, today=self._day())
         except WheelError as exc:
-            return page({}, str(exc))
+            return page({}, str(exc), today=self._day())
 
     def _path(self):
         """Per-instance durable state, separate from updateable plugin source."""
@@ -301,6 +307,9 @@ class PtlgsLuckyWheel(_PluginBase):
         result["spent"] = round(result["spent"] + cost, 1)
         result["change"] = round(result["change"] + delta, 1)
         result["balance"], result["remaining"] = after, remaining
+        state["active_uid"] = pending["uid"]
+        state["snapshot"] = {"uid": pending["uid"], "day": pending["day"],
+                             "balance": after, "remaining": remaining, "limit": limit}
         state["pending"] = None
         state["last"] = copy.deepcopy(result)
         storage.save(self._path(), state)
@@ -318,6 +327,7 @@ class PtlgsLuckyWheel(_PluginBase):
                         or not (self._once if once else self._config["enabled"])):
                     return
                 config, cancel = copy.deepcopy(self._config), self._cancel
+                config["diagnose_only"] = bool(once and self._diagnose_once)
                 acknowledge = once and self._acknowledge
             deadline = time.monotonic() + (45 if once else 0)
             while not cancel.is_set():
@@ -328,6 +338,7 @@ class PtlgsLuckyWheel(_PluginBase):
                                 return
                             if once:
                                 self._once = False
+                                self._diagnose_once = False
                                 self._acknowledge = False
                         self._execute(config, cancel, acknowledge)
                         return
@@ -353,7 +364,10 @@ class PtlgsLuckyWheel(_PluginBase):
             session = self._session(config)
             snapshot = self._fetch(session)
             account = snapshot.uid
-            result.update(balance=snapshot.balance, remaining=snapshot.remaining)
+            if result["day"] != self._day():
+                raise WheelError("站点已跨日，请重新检查连接或等待下一次定时")
+            self._observe(state, snapshot, result["day"])
+            result.update(uid=account, balance=snapshot.balance, remaining=snapshot.remaining)
             if acknowledge:
                 pending = state.get("pending")
                 if pending and pending["uid"] != account:
@@ -380,6 +394,7 @@ class PtlgsLuckyWheel(_PluginBase):
                     break
                 if snapshot.uid != account:
                     raise WheelError("登录账号发生变化，本轮已停止")
+                self._observe(state, snapshot, result["day"])
                 if not snapshot.ready:
                     result.update(status="已停止", message="站点活动暂不可抽奖")
                     break
@@ -436,6 +451,13 @@ class PtlgsLuckyWheel(_PluginBase):
                     result.update(status="异常停止", message="状态保存失败，请核对站点记录后再运行", uncertain=True)
             if config["notify"]:
                 self._notify(result)
+
+    @staticmethod
+    def _observe(state, snapshot, day):
+        """Cache account and dated quota without resetting the daily prize ledger."""
+        state["active_uid"] = snapshot.uid
+        state["snapshot"] = {"uid": snapshot.uid, "day": day, "balance": snapshot.balance,
+                             "remaining": snapshot.remaining, "limit": snapshot.limit}
 
     def _notify(self, result):
         """One concise MP notification per run; failure cannot repeat a purchase."""
