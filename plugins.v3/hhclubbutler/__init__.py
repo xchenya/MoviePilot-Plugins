@@ -206,7 +206,7 @@ class HHClubButler(_PluginBase):
     plugin_name = "憨憨保种区管家"
     plugin_desc = "自动优选添加及换种工具\n保种管理器/Hosts加速"
     plugin_icon = "https://raw.githubusercontent.com/xchenya/MoviePilot-Plugins/main/plugins.v3/hhclubbutler/icon.png"
-    plugin_version = "3.0.12"
+    plugin_version = "3.0.13"
     plugin_author = "六个橙子"
     author_url = "https://github.com/SixOrg"
     plugin_config_prefix = "hhclubbutler_"
@@ -228,7 +228,11 @@ class HHClubButler(_PluginBase):
     _downloaders: list = []        # 管理下载器（多选）
     _push_downloader: str = ""     # 推送下载器（单选）
     _save_path: str = ""
-    _tag: str = ""
+    _tag: str = "hh"
+    _upload_limit: int = 0
+    _download_limit: int = 0
+    _use_proxy: bool = False
+    _download_options_error: str = ""
     _auto_clean_days: float = 0.0
     _hosts_enabled: bool = False
     _hosts_config: str = ""
@@ -321,7 +325,16 @@ class HHClubButler(_PluginBase):
         self._downloaders = _dls
         self._push_downloader = str(config.get("push_downloader") or "") or (_dls[0] if _dls else "")
         self._save_path = config.get("save_path") or ""
-        self._tag = config.get("tag") or ""
+        self._tag = str(config.get("tag", "hh") or "").strip()
+        self._use_proxy = bool(config.get("use_proxy", False))
+        self._download_options_error = ""
+        try:
+            self._upload_limit = self._parse_speed_limit(config.get("upload_limit"))
+            self._download_limit = self._parse_speed_limit(config.get("download_limit"))
+        except (TypeError, ValueError, OverflowError):
+            self._upload_limit = self._download_limit = 0
+            self._download_options_error = "上传和下载限速须为 0～2147483647 的整数（KB/s），自动优选已停止"
+            logger.warning(self._download_options_error)
         try:
             self._auto_clean_days = float(config.get("auto_clean_days") or 0)
         except (TypeError, ValueError):
@@ -341,6 +354,7 @@ class HHClubButler(_PluginBase):
         if self._onlyonce:
             self._onlyonce = False
             self.update_config({
+                **config,
                 "enabled": self._enabled,
                 "onlyonce": False,
                 "notify": self._notify,
@@ -357,6 +371,7 @@ class HHClubButler(_PluginBase):
                 "push_downloader": self._push_downloader,
                 "save_path": self._save_path,
                 "tag": self._tag,
+                "use_proxy": self._use_proxy,
                 "auto_clean_days": self._auto_clean_days,
             })
             self._scheduler = BackgroundScheduler(timezone=settings.TZ)
@@ -367,6 +382,17 @@ class HHClubButler(_PluginBase):
                 name="憨憨保种区管家（立即运行）"
             )
             self._scheduler.start()
+
+    @staticmethod
+    def _parse_speed_limit(value) -> int:
+        if value is None or value == "":
+            return 0
+        if isinstance(value, bool):
+            raise ValueError("限速必须是非负整数")
+        number = float(value)
+        if not 0 <= number <= 2147483647 or not number.is_integer():
+            raise ValueError("限速必须是非负整数")
+        return int(number)
 
     def get_state(self) -> bool:
         return self._enabled
@@ -504,7 +530,31 @@ class HHClubButler(_PluginBase):
                             {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
                              'content': [{'component': 'VTextField', 'props': {
                                  'model': 'tag', 'label': '自定义标签',
-                                 'placeholder': '如 hhan（推送到下载器后自动打标）'}}]},
+                                 'placeholder': 'hh',
+                                 'hint': '仅用于插件新添加的任务，默认 hh；留空不打标签',
+                                 'persistent-hint': True}}]},
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                             'content': [{'component': 'VTextField', 'props': {
+                                 'model': 'upload_limit', 'label': '单任务上传限速（KB/s）',
+                                 'type': 'number', 'min': 0, 'max': 2147483647, 'step': 1,
+                                 'hint': '仅用于新任务；0=不设单任务限制，仍受下载器全局限制',
+                                 'persistent-hint': True}}]},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                             'content': [{'component': 'VTextField', 'props': {
+                                 'model': 'download_limit', 'label': '单任务下载限速（KB/s）',
+                                 'type': 'number', 'min': 0, 'max': 2147483647, 'step': 1,
+                                 'hint': '与 MP 限速单位一致；上传、下载分别设置',
+                                 'persistent-hint': True}}]},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                             'content': [{'component': 'VSwitch', 'props': {
+                                 'model': 'use_proxy', 'label': '使用 MP 代理',
+                                 'hint': '用于站点页面、结算及种子文件请求；需先在 MP 配置代理',
+                                 'persistent-hint': True}}]},
                         ]
                     },
                     {
@@ -551,7 +601,8 @@ class HHClubButler(_PluginBase):
             "cron": "30 14 * * *", "mode": "incremental",
             "target_volume": 0, "seeder_cond": "", "exclude_zero": False,
             "downloader": "", "downloaders": [], "push_downloader": "",
-            "save_path": "", "tag": "", "auto_clean_days": 0,
+            "save_path": "", "tag": "hh", "auto_clean_days": 0,
+            "upload_limit": 0, "download_limit": 0, "use_proxy": False,
             "hosts_enabled": False, "hosts_config": "",
         }
         return form, defaults
@@ -2757,6 +2808,10 @@ buildHead();load(false);resumePendingDelete();
         try:
             if not self._operation_allowed():
                 return
+            if self._download_options_error:
+                self._last_result = self._download_options_error
+                logger.warning(self._last_result)
+                return
             cookie = self._get_site_cookie()
             if not cookie:
                 self._last_result = "未获取到站点Cookie"
@@ -3096,7 +3151,13 @@ buildHead();load(false);resumePendingDelete();
         return None
 
     def _session(self) -> requests.Session:
+        proxy = settings.PROXY if self._use_proxy else None
+        if self._use_proxy and not proxy:
+            raise RuntimeError("已开启使用 MP 代理，但 MP 未配置可用代理")
         s = requests.Session()
+        s.trust_env = False
+        if proxy:
+            s.proxies.update(proxy)
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                           "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -4249,11 +4310,17 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
             return None
 
     def _push_seeds(self, seeds: list, logs: list):
+        if self._download_options_error:
+            return 0, len(seeds), [{"title": s.get("title", ""), "reason": self._download_options_error} for s in seeds]
         service = self._get_downloader_obj()
         if not service:
             logs.append("未配置有效的下载器，无法推送")
             return 0, len(seeds), [{"title": s.get("title", ""), "reason": "推送下载器不可用"} for s in seeds]
+        dl_type = str(getattr(getattr(service, "config", None), "type", "") or getattr(service, "type", "")).lower()
+        if (self._upload_limit or self._download_limit) and not any(name in dl_type for name in ("qbittorrent", "transmission")):
+            return 0, len(seeds), [{"title": s.get("title", ""), "reason": "该下载器不支持本插件的单任务限速，未添加任务"} for s in seeds]
         session = self._session()
+        limited_tr = "transmission" in dl_type and bool(self._upload_limit or self._download_limit)
         push_cookie = self._get_site_cookie() or None
         ok_count = 0
         fail_list = []
@@ -4273,17 +4340,12 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
                     fail_list.extend({"title": pending.get("title", ""), "reason": "配置变化，未添加下载"} for pending in seeds[index:])
                     break
                 if r.status_code == 200 and r.content:
-                    dl_type = ""
-                    try:
-                        dl_type = service.config.type or ""
-                    except Exception:
-                        pass
                     kwargs = {}
+                    failure_reason = ""
                     if self._tag:
-                        dl_l = str(dl_type).lower()
-                        if "qbittorrent" in dl_l:
+                        if "qbittorrent" in dl_type:
                             kwargs["tag"] = self._tag
-                        elif "transmission" in dl_l:
+                        elif "transmission" in dl_type:
                             kwargs["labels"] = [self._tag]
                         else:
                             kwargs["tag"] = self._tag
@@ -4291,8 +4353,11 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
                     # 传入的 save_path，导致填了其他盘的路径仍落在默认盘。
                     # 对 qBittorrent 显式关闭自动管理（ignore_category_check=False），
                     # 使下载目录严格按"保存路径"配置生效；Transmission 无此问题，透传即可。
-                    dl_l = str(dl_type).lower()
-                    if "qbittorrent" in dl_l:
+                    if "qbittorrent" in dl_type:
+                        if self._upload_limit:
+                            kwargs["upload_limit"] = self._upload_limit * 1024
+                        if self._download_limit:
+                            kwargs["download_limit"] = self._download_limit * 1024
                         result = service.instance.add_torrent(
                             content=r.content, download_dir=self._save_path or None,
                             cookie=push_cookie, ignore_category_check=False, **kwargs)
@@ -4301,15 +4366,48 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
                         else:
                             success = bool(result)
                     else:
+                        existing = set()
+                        if limited_tr:
+                            # shortcut: MP hides TR duplicate flags; exclude external concurrent adds when the host exposes provenance.
+                            remote, error = service.instance.get_torrents()
+                            if error or remote is None:
+                                raise RuntimeError("无法读取 Transmission 任务，未添加或修改任务")
+                            for task in remote:
+                                infohash = str(self._torrent_field(task, "hashString", "hash_string", "hash") or "").lower()
+                                if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", infohash, re.I):
+                                    raise RuntimeError("Transmission 清单缺少可靠 Hash，未添加或修改任务")
+                                existing.add(infohash)
+                            kwargs["is_paused"] = True
+                        if not self._operation_allowed():
+                            raise RuntimeError("配置已变化，未添加任务")
                         result = service.instance.add_torrent(
                             content=r.content, download_dir=self._save_path or None,
                             cookie=push_cookie, **kwargs)
                         success = result is not None if not isinstance(result, bool) else result
+                        if success and limited_tr:
+                            infohash = str(self._torrent_field(result, "hashString", "hash_string", "hash") or "").lower()
+                            try:
+                                if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", infohash, re.I):
+                                    raise RuntimeError("添加结果缺少可靠 Hash，未继续设置或启动")
+                                if infohash in existing:
+                                    raise RuntimeError("Hash 已存在，未修改原任务的限速或启动状态")
+                                if not self._operation_allowed():
+                                    raise RuntimeError("配置已变化，未继续设置或启动")
+                                if service.instance.change_torrent(hash_string=infohash,
+                                        upload_limit=self._upload_limit, download_limit=self._download_limit) is not True:
+                                    raise RuntimeError("限速设置未确认，未发送启动指令")
+                                if not self._operation_allowed():
+                                    raise RuntimeError("配置已变化，未发送启动指令")
+                                if service.instance.start_torrents(ids=[infohash]) is not True:
+                                    raise RuntimeError("启动结果未确认")
+                            except Exception as error:
+                                success = False
+                                failure_reason = "添加请求已受理，后续状态需人工核对；不会自动重发：" + self._safe_error(error)
                     if success:
                         ok_count += 1
                         logs.append(f"✅ 已添加：{title}")
                     else:
-                        fail_list.append({"title": title, "reason": "下载器拒绝添加"})
+                        fail_list.append({"title": title, "reason": failure_reason or "下载器拒绝添加"})
                 else:
                     fail_list.append({"title": title, "reason": f"种子文件下载失败(HTTP {r.status_code})"})
             except Exception as e:
