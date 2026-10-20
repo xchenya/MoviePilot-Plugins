@@ -614,83 +614,38 @@ def test_diagnosis_crossing_reset_does_not_misdate_quota(plugin, module):
     assert not wheel.post.called
 
 
-def frame_wheel(plugin):
-    """Synthetic receipts omit credit metadata just like the legacy batch parser."""
+def test_recovered_duplicate_receipt_is_counted_once_without_auxiliary_queries(plugin, module):
     wheel = connect(plugin)
-    spin = wheel.spin
-
-    def frames(*args, **kwargs):
-        r = spin(*args, **kwargs)
-        d = r.json()["data"]
-        d["labels"] = ["二周年限定-头像框"]
-        d["items"] = [{"label": "二周年限定-头像框", "count": d["count"]}]
-        return r
-
-    wheel.post = Mock(side_effect=frames)
-    return wheel
-
-
-def test_retry_freezes_ownership_and_counts_compensation_once(plugin, module):
-    wheel = frame_wheel(plugin)
-    plugin.init_plugin({"enabled": True, "daily_target": 10, "retries": 0, "auto_rewards": False})
+    plugin.init_plugin({"enabled": True, "daily_target": 1, "batch": 1, "retries": 0})
     wheel.fail_after_purchase = True
     plugin.run()
     first = saved(plugin, module)["pending"]
-    assert first["reward_context"]["holdings"]["anniversary_frame"] == 0
-    plugin.init_plugin({"enabled": True, "daily_target": 10, "auto_rewards": False,
-                        "owned_rewards": ["anniversary_frame"]})
+    assert first and "reward_context" not in first
+    # Recover a single-draw receipt explicitly reporting compensation. The server
+    # has committed it, but the first transport response was lost.
+    wheel.balance = first["before"] - 950
+    receipt = wheel.receipts[first["key"]]["data"]
+    receipt.update(bonus=wheel.balance, bonus_gained=50, detail="already_has",
+                   labels=["黑丝娘的献礼"], items=[{"label": "黑丝娘的献礼", "count": 1}])
     plugin._cancel.wait = Mock(return_value=False)
     plugin.run()
     plugin.run()
-    day = saved(plugin, module)["days"]["123:" + plugin._day()]
-    assert day["draws"] == day["reward_accounting"]["covered"] == 10
-    assert day["reward_accounting"]["converted"]["二周年限定-头像框"]["count"] == 9
-    assert wheel.purchases == [10] and wheel.calls[0]["request_key"] == wheel.calls[1]["request_key"]
-
-
-def test_new_grants_survive_reload_without_leaking_to_other_account(plugin, module):
-    wheel = frame_wheel(plugin)
-    plugin.init_plugin({"enabled": True, "daily_target": 10, "auto_rewards": False})
-    plugin.run()
-    plugin.init_plugin({"enabled": True, "daily_target": 20, "auto_rewards": False})
-    plugin.run()
     state = saved(plugin, module)
     day = state["days"]["123:" + plugin._day()]
-    assert day["reward_accounting"]["converted"]["二周年限定-头像框"]["count"] == 19
-    assert state["reward_holdings"]["123"]["anniversary_frame"] is None
-    wheel.uid, wheel.remaining = "456", 500
-    plugin._config["daily_target"] = 10
-    plugin.run()
-    other = saved(plugin, module)["days"]["456:" + plugin._day()]
-    assert other["reward_accounting"]["converted"]["二周年限定-头像框"]["count"] == 9
+    assert day["draws"] == day["reward_accounting"]["covered"] == 1
+    assert day["reward_accounting"]["points"] == 50
+    assert day["reward_accounting"]["converted"] == {"黑丝娘的献礼": {"count": 1, "points": 50}}
+    assert "reward_holdings" not in state and state["pending"] is None
+    assert wheel.purchases == [1] and wheel.calls[0]["request_key"] == wheel.calls[1]["request_key"]
+    assert wheel.get.call_count == 4 and all(call.args[0] == module.URL for call in wheel.get.call_args_list)
+    assert "奖励工分 +50.0" in plugin.notifications[1]["text"]
 
 
-def test_aux_reads_recheck_quota_before_purchase_and_skip_when_already_done(plugin):
+def test_latest_quota_snapshot_updates_notification_when_no_further_draw(plugin, module):
     wheel = connect(plugin)
-    main_reads = []
-
-    def read(url, **kwargs):
-        if "luckywheel.php" in url:
-            main_reads.append(url)
-            return response(text=html(remaining=500 if len(main_reads) == 1 else 0))
-        return response(text="<html></html>")
-
-    wheel.get = Mock(side_effect=read)
+    wheel.get.side_effect = [response(text=html()), response(text=html(remaining=0, balance=750000))]
     plugin.run()
-    assert wheel.get.call_count == 5 and not wheel.post.called
-    plugin.run()
-    assert wheel.get.call_count == 6 and not wheel.post.called
-
-
-def test_cancel_during_aux_reads_does_not_create_pending_order(plugin, module):
-    wheel = connect(plugin)
-
-    def read(url, **kwargs):
-        if "luckywheel.php" in url:
-            return response(text=html())
-        plugin.stop_service()
-        return response(text="<html></html>")
-
-    wheel.get = Mock(side_effect=read)
-    plugin.run()
-    assert not wheel.post.called and saved(plugin, module)["pending"] is None
+    state = saved(plugin, module)
+    assert wheel.purchases == [10]
+    assert state["last"]["remaining"] == 0 and state["last"]["balance"] == 750000
+    assert "当前工分 750,000.0 · 今日剩余 0 抽" in plugin.notifications[0]["text"]
