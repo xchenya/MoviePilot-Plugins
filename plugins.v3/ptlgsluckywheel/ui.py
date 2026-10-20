@@ -1,6 +1,8 @@
 """Native MoviePilot Vuetify configuration and cached result pages."""
 from datetime import datetime, timezone
 
+from .reward_summary import SPECIAL, reward_lines
+
 
 def component(name, text=None, content=None, **props):
     """Build a native component without HTML injection or global styles."""
@@ -58,6 +60,15 @@ def form():
             component("VAlert", type="info", variant="tonal", text="在 MP 站点管理添加 https://ptlgs.org 并填写有效 Cookie；无需在本插件重复填写凭据。首次只需勾选“仅检查连接”后保存，无需同时开启运行一次或每日定时。"),
             switch("acknowledge_pending", "已核对站点，清除待确认订单", "仅用于超过 15 分钟或跨日仍未确认的订单。先到站点核对抽奖记录，再勾选保存；本次只清除标记，不抽奖，也不清除每日计数。"),
         ]),
+        card("奖品折算与通知", [
+            switch("auto_rewards", "自动识别已拥有奖品", "每轮实际抽奖前读取一次个人资料、勋章及头像框目录；按持有有效期和当前价格判断重复奖品"),
+            component("VSelect", model="owned_rewards", label="已拥有的奖品（识别不到时补充）",
+                      items=[{"title": item["name"], "value": key} for key, item in SPECIAL.items()],
+                      multiple=True, chips=True, **{"closable-chips": True}),
+            field("heisiniang_until", "黑丝娘到期时间（北京时间）", placeholder="2026-10-21 11:02",
+                  hint="勾选黑丝娘时填写，到期自动停止按已拥有处理；留空时依赖自动识别", **{"persistent-hint": True}),
+            component("VAlert", type="info", variant="tonal", text="站点回执优先，其次自动识别，最后手动补充。上传/下载合计容量，VIP 合计天数；重复奖品按当前价格的 50% 折算。缺少工分回执时显示余额口径的工分回流，可能包含期间其他收支，折算额已包含其中。仅影响统计，不会主动购买或兑换奖品。"),
+        ]),
     ])]
 
 
@@ -88,6 +99,17 @@ def daily_view(state, today):
     return uid, ledger.get(today, {}), ledger, snapshot
 
 
+def reward_detail(record):
+    """Summarized gains and immutable raw hits coexist without recounting conversions."""
+    lines = reward_lines(record)
+    return [component("div", line, **{"class": "mb-1"}) for line in lines] + [
+        component("VExpansionPanels", content=[component("VExpansionPanel", content=[
+            component("VExpansionPanelTitle", "原始命中明细"),
+            component("VExpansionPanelText", content=[prize_table(record.get("prizes") or {})]),
+        ])], variant="accordion"),
+    ]
+
+
 def page(state, error="", today=None):
     """Show daily totals independently of the latest run, using cached data only."""
     today = today or datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -115,15 +137,15 @@ def page(state, error="", today=None):
                ("今日工分变化", f"{daily.get('change', 0):+,.1f}" if uid else "—"),
                ("站点今日剩余", f"{remaining} 抽" if remaining is not None else "待检查")]
     nodes.append(row([card(label, [component("div", value, **{"class": "text-h6"})]) for label, value in metrics], 3))
-    nodes.append(card("今日奖品统计", [prize_table(daily.get("prizes") or {}),
-        component("div", "包含“谢谢参与”；待确认订单在收到成功回执后计入。站点剩余为最近读取值，跨日后需重新检查。", **{"class": "text-caption mt-2"})]))
-    previous = [(day, value) for day, value in sorted(ledger.items(), reverse=True) if day < today]
+    nodes.append(card("今日奖品统计", reward_detail(daily) + [
+        component("div", "工分回流按订单前后余额加回消耗计算，可能含其他收支。标“约”的折算来自当时持有状态及价格；原始命中明细始终保留。旧记录不按当前持有状态重新折算。", **{"class": "text-caption mt-2"})]))
+    daily_records = {**ledger, **({today: daily} if uid else {})}
+    previous = [(day, value) for day, value in sorted(daily_records.items(), reverse=True) if day <= today]
     panels = [component("VExpansionPanel", content=[
-        component("VExpansionPanelTitle", f"{day} · {value.get('draws', 0)} 抽"),
+        component("VExpansionPanelTitle", f"{day}{'（今日）' if day == today else ''} · {value.get('draws', 0)} 抽"),
         component("VExpansionPanelText", content=[
             component("div", f"消耗 {value.get('spent', 0):,.0f} 工分 · 工分变化 {value.get('change', 0):+,.1f}", **{"class": "mb-2"}),
-            prize_table(value.get("prizes") or {}),
-        ]),
+        ] + reward_detail(value)),
     ]) for day, value in previous]
     nodes.append(card("历史每日统计", [component("VExpansionPanels", content=panels, variant="accordion")]
                       if panels else [component("div", "暂无历史每日记录")]))

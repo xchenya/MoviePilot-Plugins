@@ -103,7 +103,8 @@ def test_normal_target_and_idempotent_repeated_cron(plugin, module):
     assert s["pending"] is None and s["history"][0]["draws"] == 20
     assert s["history"][1]["draws"] == 0
     assert len(plugin.notifications) == 2
-    assert "工分500 ×20" in plugin.notifications[0]["text"]
+    assert "工分回流（余额口径） +0.0" in plugin.notifications[0]["text"]
+    assert "工分500 ×20" not in plugin.notifications[0]["text"]
     assert "fixture-secret" not in json.dumps(s) + json.dumps(plugin.notifications)
 
 
@@ -611,3 +612,85 @@ def test_diagnosis_crossing_reset_does_not_misdate_quota(plugin, module):
     state = saved(plugin, module)
     assert "snapshot" not in state and state["last"]["status"] == "异常停止"
     assert not wheel.post.called
+
+
+def frame_wheel(plugin):
+    """Synthetic receipts omit credit metadata just like the legacy batch parser."""
+    wheel = connect(plugin)
+    spin = wheel.spin
+
+    def frames(*args, **kwargs):
+        r = spin(*args, **kwargs)
+        d = r.json()["data"]
+        d["labels"] = ["二周年限定-头像框"]
+        d["items"] = [{"label": "二周年限定-头像框", "count": d["count"]}]
+        return r
+
+    wheel.post = Mock(side_effect=frames)
+    return wheel
+
+
+def test_retry_freezes_ownership_and_counts_compensation_once(plugin, module):
+    wheel = frame_wheel(plugin)
+    plugin.init_plugin({"enabled": True, "daily_target": 10, "retries": 0, "auto_rewards": False})
+    wheel.fail_after_purchase = True
+    plugin.run()
+    first = saved(plugin, module)["pending"]
+    assert first["reward_context"]["holdings"]["anniversary_frame"] == 0
+    plugin.init_plugin({"enabled": True, "daily_target": 10, "auto_rewards": False,
+                        "owned_rewards": ["anniversary_frame"]})
+    plugin._cancel.wait = Mock(return_value=False)
+    plugin.run()
+    plugin.run()
+    day = saved(plugin, module)["days"]["123:" + plugin._day()]
+    assert day["draws"] == day["reward_accounting"]["covered"] == 10
+    assert day["reward_accounting"]["converted"]["二周年限定-头像框"]["count"] == 9
+    assert wheel.purchases == [10] and wheel.calls[0]["request_key"] == wheel.calls[1]["request_key"]
+
+
+def test_new_grants_survive_reload_without_leaking_to_other_account(plugin, module):
+    wheel = frame_wheel(plugin)
+    plugin.init_plugin({"enabled": True, "daily_target": 10, "auto_rewards": False})
+    plugin.run()
+    plugin.init_plugin({"enabled": True, "daily_target": 20, "auto_rewards": False})
+    plugin.run()
+    state = saved(plugin, module)
+    day = state["days"]["123:" + plugin._day()]
+    assert day["reward_accounting"]["converted"]["二周年限定-头像框"]["count"] == 19
+    assert state["reward_holdings"]["123"]["anniversary_frame"] is None
+    wheel.uid, wheel.remaining = "456", 500
+    plugin._config["daily_target"] = 10
+    plugin.run()
+    other = saved(plugin, module)["days"]["456:" + plugin._day()]
+    assert other["reward_accounting"]["converted"]["二周年限定-头像框"]["count"] == 9
+
+
+def test_aux_reads_recheck_quota_before_purchase_and_skip_when_already_done(plugin):
+    wheel = connect(plugin)
+    main_reads = []
+
+    def read(url, **kwargs):
+        if "luckywheel.php" in url:
+            main_reads.append(url)
+            return response(text=html(remaining=500 if len(main_reads) == 1 else 0))
+        return response(text="<html></html>")
+
+    wheel.get = Mock(side_effect=read)
+    plugin.run()
+    assert wheel.get.call_count == 5 and not wheel.post.called
+    plugin.run()
+    assert wheel.get.call_count == 6 and not wheel.post.called
+
+
+def test_cancel_during_aux_reads_does_not_create_pending_order(plugin, module):
+    wheel = connect(plugin)
+
+    def read(url, **kwargs):
+        if "luckywheel.php" in url:
+            return response(text=html())
+        plugin.stop_service()
+        return response(text="<html></html>")
+
+    wheel.get = Mock(side_effect=read)
+    plugin.run()
+    assert not wheel.post.called and saved(plugin, module)["pending"] is None

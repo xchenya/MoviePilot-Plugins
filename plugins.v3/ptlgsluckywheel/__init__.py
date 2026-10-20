@@ -20,7 +20,7 @@ from app.sdk.logging import logger
 from app.sdk.plugin import _PluginBase
 from app.schemas.types import NotificationType
 
-from . import storage
+from . import storage, reward_summary
 from .protocol import WheelError, daily_counts, integer, number, parse_page, rewards
 
 URL = "https://ptlgs.org/luckywheel.php"
@@ -33,7 +33,7 @@ class PtlgsLuckyWheel(_PluginBase):
     plugin_name = "PTLGS 幸运大转盘"
     plugin_desc = "每日定时抽奖、工分保留、原订单重试及奖品汇总通知。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     plugin_author = "xchenya"
     author_url = "https://github.com/xchenya"
     plugin_config_prefix = "ptlgsluckywheel_"
@@ -60,7 +60,8 @@ class PtlgsLuckyWheel(_PluginBase):
                 "diagnose_only": False, "cron": "5 8 * * *", "timezone": "Asia/Shanghai",
                 "daily_target": 50, "batch": 10, "reserve": 10000,
                 "interval": 35, "retries": 3, "use_proxy": False,
-                "acknowledge_pending": False}
+                "acknowledge_pending": False, "auto_rewards": True,
+                "owned_rewards": [], "heisiniang_until": ""}
 
     @staticmethod
     def _bool(value):
@@ -79,8 +80,18 @@ class PtlgsLuckyWheel(_PluginBase):
             self._error = ""
             values = {**self.defaults(), **(config or {})}
             try:
-                for name in ("enabled", "notify", "run_once", "diagnose_only", "use_proxy", "acknowledge_pending"):
+                for name in ("enabled", "notify", "run_once", "diagnose_only", "use_proxy", "acknowledge_pending", "auto_rewards"):
                     values[name] = self._bool(values[name])
+                owned = values["owned_rewards"]
+                if not isinstance(owned, list) or any(item not in reward_summary.SPECIAL for item in owned):
+                    raise WheelError("已拥有奖品配置无效，请重新选择")
+                values["owned_rewards"] = list(dict.fromkeys(owned))
+                values["heisiniang_until"] = str(values["heisiniang_until"] or "").strip()
+                if values["heisiniang_until"]:
+                    if reward_summary.expiry(values["heisiniang_until"]) is None:
+                        raise WheelError("黑丝娘是限时奖品，须填写具体到期时间")
+                elif not values["auto_rewards"] and "heisiniang" in values["owned_rewards"]:
+                    raise WheelError("手动勾选黑丝娘时须填写到期时间，或开启自动识别")
                 for name, lower, upper in (("daily_target", 1, 500), ("batch", 1, 10),
                                            ("interval", 3, 900), ("retries", 0, 5)):
                     values[name] = integer(values[name])
@@ -224,6 +235,32 @@ class PtlgsLuckyWheel(_PluginBase):
             body["count"] = str(count)
         return session.post(URL, data=body, timeout=(10, 30), allow_redirects=False)
 
+    def _reward_context(self, session, snapshot, config, cancel, state):
+        """Read ownership/expiry and current prices once before new draws, without retries."""
+        ctx = reward_summary.context(config, time.time())
+        acquired = state.get("reward_holdings", {}).get(snapshot.uid, {})
+        manual = {key: ctx["holdings"][key] for key in config["owned_rewards"] if key in ctx["holdings"]}
+        ctx["holdings"] = {**ctx["holdings"], **acquired, **manual}
+        if not config["auto_rewards"]:
+            return ctx
+        pages = [(f"https://ptlgs.org/userdetails.php?id={snapshot.uid}", "holdings"),
+                 ("https://ptlgs.org/medal.php", "prices"),
+                 ("https://ptlgs.org/avatarframe.php", "prices")]
+        for url, field in pages:
+            if cancel.is_set():
+                break
+            try:
+                response = session.get(url, timeout=(10, 15), allow_redirects=False,
+                                       headers={"Cache-Control": "no-cache", "Accept": "text/html"})
+                if response.status_code != 200 or len(response.content) > 4 * 1024 * 1024:
+                    raise WheelError("奖品参考页面暂不可用")
+                parsed = reward_summary.parse_reward_page(response.text)
+                ctx[field].update(getattr(parsed, field))
+            except Exception:
+                # Auxiliary pages cannot turn a successful purchase into a retry.
+                logger.info("PTLGS 大转盘：奖品参考信息读取失败，使用手动配置或保留原始命中")
+        return ctx
+
     def _purchase(self, session, snapshot, state, config, cancel):
         """Bounded same-key retries, including timeout, malformed JSON and throttling."""
         pending = state["pending"]
@@ -294,12 +331,18 @@ class PtlgsLuckyWheel(_PluginBase):
             won = {"奖品明细缺失（请查看站点记录）": count}
         cost = round(pending["cost"] * count, 1)
         delta = round(after - pending["before"], 1)
+        accounting = reward_summary.accounting(data, won, pending)
+        acquired = (pending.get("reward_context") or {}).get("new_holdings", {})
+        if acquired:
+            state.setdefault("reward_holdings", {}).setdefault(pending["uid"], {}).update(acquired)
         key = pending["uid"] + ":" + pending["day"]
         day = state["days"].setdefault(key, {"draws": 0, "site_used": 0, "spent": 0, "change": 0, "prizes": {}})
         day["draws"] += count
         day["site_used"] = max(day["site_used"], pending["used_before"] + count, limit - remaining)
         day["spent"] = round(day["spent"] + cost, 1)
         day["change"] = round(day["change"] + delta, 1)
+        reward_summary.merge_accounting(day.setdefault("reward_accounting", {}), accounting)
+        reward_summary.merge_accounting(result.setdefault("reward_accounting", {}), accounting)
         for label, amount in won.items():
             day["prizes"][label] = day["prizes"].get(label, 0) + amount
             result["prizes"][label] = result["prizes"].get(label, 0) + amount
@@ -355,7 +398,7 @@ class PtlgsLuckyWheel(_PluginBase):
 
     def _execute(self, config, cancel, acknowledge=False):
         """Own one session and one durable state for a complete daily invocation."""
-        state, session = None, None
+        state, session, reward_context = None, None, None
         result = {"time": datetime.now(ZoneInfo(config["timezone"])).isoformat(timespec="seconds"),
                   "day": self._day(), "draws": 0, "spent": 0, "change": 0, "prizes": {},
                   "balance": None, "remaining": None, "status": "进行中", "message": "", "uncertain": False}
@@ -412,11 +455,20 @@ class PtlgsLuckyWheel(_PluginBase):
                     break
                 if cancel.is_set():
                     break
+                if reward_context is None:
+                    reward_context = self._reward_context(session, snapshot, config, cancel, state)
+                    if cancel.is_set():
+                        break
+                    if config["auto_rewards"]:
+                        # Re-check quota, account, CSRF and reset day after auxiliary reads.
+                        snapshot = self._fetch(session)
+                        continue
                 count = max(options)
                 state["pending"] = {"key": str(uuid.uuid4()), "count": count,
                                     "uid": account, "day": result["day"], "created": time.time(),
                                     "cost": snapshot.cost, "before": snapshot.balance,
-                                    "used_before": used, "uncertain": False}
+                                    "used_before": used, "uncertain": False,
+                                    "reward_context": reward_context}
                 # Persistence must succeed before any POST is sent.
                 storage.save(self._path(), state)
                 data = self._purchase(session, snapshot, state, config, cancel)
@@ -461,14 +513,12 @@ class PtlgsLuckyWheel(_PluginBase):
 
     def _notify(self, result):
         """One concise MP notification per run; failure cannot repeat a purchase."""
-        lines = [f"{result['status']} · 本次 {result['draws']} 抽",
-                 f"消耗 {result['spent']:,.0f} 工分 · 工分变化 {result['change']:+,.1f}"]
+        lines = [f"{result['status']} · 本次 {result['draws']} 抽"]
+        lines.extend(reward_summary.reward_lines(result))
+        lines.append(f"消耗 {result['spent']:,.0f} 工分 · 工分变化 {result['change']:+,.1f}")
         if result.get("balance") is not None:
             lines.append(f"当前工分 {result['balance']:,.1f} · 今日剩余 {result['remaining']} 抽")
-        prizes = [(label, count) for label, count in result["prizes"].items() if label != "谢谢参与"]
-        if prizes:
-            lines.append("奖品：" + "、".join(f"{label} ×{count}" for label, count in sorted(prizes, key=lambda x: -x[1])))
-        if result.get("message"):
+        if result.get("message") and (result["status"] != "已完成" or not result["draws"]):
             lines.append(result["message"])
         if result["uncertain"]:
             lines.append("存在待确认订单，下次优先核对原订单。")
