@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -26,6 +27,8 @@ from . import storage
 from .protocol import DRAW_URL, ORIGIN, PAGE_URL, LotteryError, integer, number, parse_page, receipt
 
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
+DEFAULT_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36")
 
 
 class TangptLottery(_PluginBase):
@@ -34,7 +37,7 @@ class TangptLottery(_PluginBase):
     plugin_name = "不可躺自动抽奖"
     plugin_desc = "唐门每日定时抽奖、魔力保留、每日奖品统计与汇总通知。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_author = "xchenya"
     author_url = "https://github.com/xchenya"
     plugin_config_prefix = "tangptlottery_"
@@ -59,7 +62,8 @@ class TangptLottery(_PluginBase):
         """Require opt-in; use a small daily target and conservative request pacing."""
         return {"enabled": False, "notify": True, "run_once": False, "diagnose_only": False,
                 "cron": "0 8 * * *", "daily_target": 10, "batch": 10, "reserve": 100000,
-                "max_cost": 20000, "interval": 30, "use_proxy": False, "acknowledge_pending": False}
+                "max_cost": 20000, "interval": 30, "use_proxy": False, "acknowledge_pending": False,
+                "cookie": "", "user_agent": ""}
 
     @staticmethod
     def _bool(value):
@@ -88,6 +92,8 @@ class TangptLottery(_PluginBase):
                 if values["max_cost"] <= 0:
                     raise LotteryError("单抽费用上限必须大于零")
                 values["cron"] = str(values["cron"]).strip()
+                values["cookie"] = str(values.get("cookie") or "").strip()
+                values["user_agent"] = str(values.get("user_agent") or "").strip()
                 self._trigger = CronTrigger.from_crontab(values["cron"], timezone=LOCAL_TZ)
                 self._once = values["run_once"] or values["diagnose_only"] or values["acknowledge_pending"]
             except Exception as exc:
@@ -164,30 +170,57 @@ class TangptLottery(_PluginBase):
         return datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
 
     def _session(self, config):
-        """Take credentials from the matching MP site, bound to a fixed HTTPS host."""
+        """Prefer an explicit cookie, then the canonical site and nonempty alias."""
         oper = SiteOper()
-        site = oper.get_by_domain("tangpt.top") or oper.get_by_domain("www.tangpt.top")
-        cookie = str(getattr(site, "cookie", "") or "").strip()
-        if not site or not cookie or cookie.lower() == "cookie":
-            raise LotteryError("请在 MP 站点管理添加不可躺（tangpt.top）并更新 Cookie")
-        try:
-            source = urlsplit(str(getattr(site, "url", "") or ""))
-            valid = (source.scheme == "https" and source.hostname in ("www.tangpt.top", "tangpt.top")
-                     and source.port in (None, 443) and not source.username and not source.password)
-        except ValueError:
-            valid = False
-        if not valid:
-            raise LotteryError("站点地址必须使用 https://www.tangpt.top 或 https://tangpt.top")
-        session = requests.Session()
-        session.trust_env = False
+        manual = str(config.get("cookie") or "").strip()
+        site, source_name = None, "手动 Cookie" if manual else ""
+        for domain in ("www.tangpt.top", "tangpt.top"):
+            candidate = oper.get_by_domain(domain)
+            if not candidate:
+                continue
+            candidate_cookie = str(getattr(candidate, "cookie", "") or "").strip()
+            if not manual and (not candidate_cookie or candidate_cookie.lower() == "cookie"):
+                continue
+            try:
+                source = urlsplit(str(getattr(candidate, "url", "") or ""))
+                valid = (source.scheme == "https" and source.hostname in ("www.tangpt.top", "tangpt.top")
+                         and source.port in (None, 443) and not source.username and not source.password)
+            except ValueError:
+                valid = False
+            if not valid:
+                if manual:
+                    continue
+                raise LotteryError("站点地址必须使用 https://www.tangpt.top 或 https://tangpt.top")
+            site = candidate
+            if not manual:
+                source_name = "站点管理（" + domain + "）"
+            break
+        cookie = manual or str(getattr(site, "cookie", "") or "").strip()
+        cookie = re.sub(r"^cookie\s*:\s*", "", cookie, flags=re.I)
+        cookies = {}
         for pair in cookie.split(";"):
             name, sep, value = pair.strip().partition("=")
-            if sep and name:
-                session.cookies.set(name, value, domain="www.tangpt.top", path="/")
-        session.headers.update({"User-Agent": getattr(site, "ua", None) or "Mozilla/5.0",
-                                "Referer": PAGE_URL, "Origin": ORIGIN, "X-Requested-With": "XMLHttpRequest"})
+            if sep and name.strip():
+                name, value = name.strip(), value.strip()
+                if re.search(r"[\s\x00-\x1f\x7f]", name) or re.search(r"[\x00-\x1f\x7f]", value):
+                    raise LotteryError("Cookie 格式无效，请填写浏览器请求头中的 Cookie 内容")
+                cookies[name] = value
+        if not cookies:
+            raise LotteryError("未配置可用 Cookie：请更新站点管理，或填写插件的手动 Cookie")
+        ua = str(config.get("user_agent") or getattr(site, "ua", None) or DEFAULT_UA).strip()
+        if not ua or re.search(r"[\x00-\x1f\x7f]", ua):
+            raise LotteryError("User-Agent 格式无效，请填写完整的浏览器 User-Agent")
+        session = requests.Session()
+        session.trust_env = False
+        for name, value in cookies.items():
+            session.cookies.set(name, value, domain="www.tangpt.top", path="/")
+        # Document navigation and the AJAX draw have different request headers.
+        session.headers.update({"User-Agent": ua, "Accept-Language": "zh-CN,zh;q=0.9",
+                                "Cache-Control": "no-cache", "Pragma": "no-cache"})
         if config["use_proxy"]:
             session.proxies.update(getattr(settings, "PROXY", None) or {})
+        session.credential_source = source_name
+        logger.info(f"不可躺抽奖：凭据来源={source_name}；网络={'MP 系统代理' if config['use_proxy'] else '直连'}")
         return session
 
     @staticmethod
@@ -195,13 +228,35 @@ class TangptLottery(_PluginBase):
         """Single uncached GET; no automatic read retry or background polling."""
         try:
             response = session.get(PAGE_URL, timeout=(10, 30), allow_redirects=False,
-                                   headers={"Accept": "text/html", "Cache-Control": "no-cache"})
+                                   headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                                            "Referer": ORIGIN + "/", "Cache-Control": "no-cache",
+                                            "Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate",
+                                            "Sec-Fetch-Site": "same-origin", "Sec-Fetch-User": "?1",
+                                            "Upgrade-Insecure-Requests": "1"})
+            logger.info(f"不可躺抽奖：读取页面 HTTP {response.status_code}，{len(response.content)} 字节")
+            if response.status_code == 401:
+                raise LotteryError("站点返回 HTTP 401 登录认证失败，请更新所用 Cookie")
+            if response.status_code == 403:
+                raise LotteryError("站点返回 HTTP 403 访问被拒；可能是风控、权限或访问网络，未判定 Cookie 失效")
+            if 300 <= response.status_code < 400:
+                location = str(getattr(response, "headers", {}).get("Location", ""))
+                try:
+                    login_redirect = urlsplit(location).path.rsplit("/", 1)[-1] in ("login.php", "takelogin.php")
+                except ValueError:
+                    login_redirect = False
+                if login_redirect:
+                    raise LotteryError("站点跳转到登录页，当前 Cookie 未获登录，请更新所用 Cookie")
+                raise LotteryError(f"读取抽奖页 HTTP {response.status_code} 重定向；请核对站点地址或访问网络")
             if response.status_code != 200:
-                raise LotteryError(f"读取抽奖页 HTTP {response.status_code}，请核对 Cookie、代理或站点状态")
+                raise LotteryError(f"读取抽奖页 HTTP {response.status_code}，请核对网络、代理或站点状态")
             if len(response.content) > 4 * 1024 * 1024:
                 raise LotteryError("抽奖页面过大，已停止")
             response.encoding = "utf-8"
-            return parse_page(response.text)
+            snap = parse_page(response.text)
+            logger.info(f"不可躺抽奖：登录账号、余额、费用与剩余次数解析成功；使用{snap.source}")
+            return snap
+        except requests.exceptions.SSLError as exc:
+            raise LotteryError("站点 TLS 证书校验失败，请检查网络、代理及系统证书；未判定 Cookie 失效") from exc
         except requests.RequestException as exc:
             raise LotteryError("读取抽奖页失败，请检查网络或代理；未发起新抽奖") from exc
 
@@ -210,7 +265,12 @@ class TangptLottery(_PluginBase):
         """Submit exactly once: the observed endpoint has no idempotency key."""
         try:
             response = session.post(DRAW_URL, data={"count": str(pending["count"])},
-                                    headers={"Accept": "application/json"}, timeout=(10, 60), allow_redirects=False)
+                                    headers={"Accept": "application/json, text/javascript, */*; q=0.01",
+                                             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                                             "Origin": ORIGIN, "Referer": PAGE_URL,
+                                             "X-Requested-With": "XMLHttpRequest", "Sec-Fetch-Dest": "empty",
+                                             "Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "same-origin"},
+                                    timeout=(10, 60), allow_redirects=False)
             if response.status_code != 200:
                 raise LotteryError(f"抽奖 HTTP {response.status_code}，结果待核对；本次未重试")
             if len(response.content) > 2 * 1024 * 1024:
@@ -318,7 +378,8 @@ class TangptLottery(_PluginBase):
                 result.update(status="已核对", message="已解除暂停；原请求仍占用当日目标，本次不抽奖")
                 return
             if config["diagnose_only"]:
-                result.update(status="连接正常", message=f"单抽 {snap.cost:g} 魔力 · 站点剩余 {snap.remaining} 次"
+                source = getattr(session, "credential_source", "当前配置")
+                result.update(status="连接正常", message=f"{source} · {snap.source} · 单抽 {snap.cost:g} 魔力 · 站点剩余 {snap.remaining} 次"
                               + (" · 活动开放" if snap.ready else " · 活动未开放"))
                 return
             while not cancel.is_set():

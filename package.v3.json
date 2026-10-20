@@ -144,7 +144,7 @@
     "name": "不可躺自动抽奖",
     "description": "唐门每日定时抽奖、魔力保留、每日奖品统计与汇总通知。",
     "labels": "不可躺,唐门,抽奖",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "icon": "Moviepilot_A.png",
     "author": "xchenya",
     "author_url": "https://github.com/xchenya",
@@ -152,6 +152,7 @@
     "system_version": ">=3.0.0",
     "release": false,
     "history": {
+      "v1.1.0": "参考 tanglottery 调整凭据选择和网页／抽奖请求头；新增手动 Cookie 与 User-Agent，兼容余额嵌套标签及页面文字状态，区分登录失败、风控与解析错误；重新分区表单并修复组件拥挤。",
       "v1.0.0": "新增 V3 原生定时抽奖：每日目标、批量档位、魔力保留与费用上限、一次性检查／运行、按日奖品统计及通知；无幂等接口的未知结果暂停且不重发。已核对页面协议并离线验证，待宿主及真实抽奖联调。"
     }
   }

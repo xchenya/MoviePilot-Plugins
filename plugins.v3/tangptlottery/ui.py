@@ -16,46 +16,67 @@ def component(name, text=None, content=None, **props):
 
 def row(fields, width=6):
     """Collapse form fields and metrics into one column on small screens."""
-    return component("VRow", content=[component("VCol", content=[field], cols=12, md=width) for field in fields])
+    return component("VRow", content=[component("VCol", content=[field], cols=12, md=width,
+                                                **{"class": "pa-2", "style": "min-width: 0"}) for field in fields],
+                     **{"no-gutters": True, "class": "ma-0"})
 
 
 def card(title, children):
     """Use MP's native theme and spacing."""
-    return component("VCard", content=[component("VCardTitle", title), component("VCardText", content=children)],
-                     variant="outlined", **{"class": "mb-3"})
+    return component("VCard", content=[
+        component("VCardTitle", title, **{"class": "text-subtitle-1 font-weight-bold px-5 pt-4 pb-2 text-wrap"}),
+        component("VCardText", content=children, **{"class": "pa-3"}),
+    ], variant="outlined", **{"class": "mb-4"})
 
 
 def form():
     """Expose one-shot operations and a native Cron picker, with no second save."""
     def field(model, label, **props):
-        return component("VTextField", model=model, label=label, **props)
+        return component("VTextField", model=model, label=label, variant="outlined", density="comfortable",
+                         **{"hide-details": "auto", **props})
 
     def switch(model, label, hint):
-        return component("VSwitch", model=model, label=label, color="primary", hint=hint, **{"persistent-hint": True})
+        return component("div", content=[
+            component("VSwitch", model=model, label=label, color="primary", inset=True,
+                      **{"hide-details": True, "density": "comfortable"}),
+            component("div", hint, **{"class": "text-caption text-medium-emphasis mt-1",
+                                      "style": "white-space: normal; line-height: 1.6"}),
+        ])
+
+    def note(text):
+        return row([component("div", text, **{"class": "text-body-2 text-medium-emphasis",
+                                              "style": "line-height: 1.7"})], 12)
 
     return [component("VForm", content=[
-        card("运行设置", [
+        card("站点连接", [
+            note("默认读取 MP 站点管理的 Cookie 与 User-Agent。也可填写其他正常运行插件所用的同一组凭据，手动填写优先。"),
+            row([field("cookie", "手动 Cookie（可选）", type="password", autocomplete="off", clearable=True,
+                       placeholder="留空时自动读取站点管理")], 12),
+            row([field("user_agent", "User-Agent（可选）", autocomplete="off", clearable=True,
+                       placeholder="留空时使用站点设置或内置浏览器 UA")], 12),
+            row([switch("use_proxy", "使用系统代理", "使用 MP 配置的代理；默认直连。"),
+                 switch("diagnose_only", "仅检查连接", "保存后检查一次，不抽奖；开关自动复位。")]),
+        ]),
+        card("定时与通知", [
             row([switch("enabled", "启用每日定时", "后台自动执行，无需打开插件页面"),
                  switch("notify", "发送结果通知", "每轮一次汇总，使用 MP 插件通知渠道")]),
-            row([switch("run_once", "保存后运行一次", "自动复位；遵守每日目标，不额外增加次数"),
-                 switch("diagnose_only", "仅检查连接（一次性）", "只读取页面，不抽奖；自动复位，优先于运行一次")]),
-            component("VCronField", model="cron", label="执行时间（北京时间）"),
-            component("VAlert", type="info", variant="tonal", text="默认每天 08:00。可设置一天多个时间，例如 0 8,18 * * *；各次执行共用当日目标。"),
+            row([component("VCronField", model="cron", label="执行时间（北京时间）")], 12),
+            note("默认每天 08:00。也可设为 0 8,18 * * *，每天 08:00 和 18:00 执行，共用当日目标。"),
         ]),
         card("抽奖策略", [
-            row([field("daily_target", "每日目标（插件抽奖次数）", type="number", min=1, max=1000),
-                 component("VSelect", model="batch", label="优先连抽数量", items=[
+            row([field("daily_target", "每日目标（抽）", type="number", min=1, max=1000),
+                 component("VSelect", model="batch", label="每批优先抽数", variant="outlined", density="comfortable",
+                           **{"hide-details": "auto"}, items=[
                      {"title": f"{count} 抽", "value": count} for count in (1, 10, 20, 50, 100)])]),
             row([field("reserve", "最低保留魔力", type="number", min=0),
-                 field("max_cost", "允许的单抽最高费用", type="number", min=1)]),
-            row([field("interval", "批次间隔（秒）", type="number", min=5, max=900),
-                 switch("use_proxy", "使用 MP 系统代理", "Cookie 和 User-Agent 读取自站点管理")]),
-            component("VAlert", type="info", variant="tonal", text="默认每日 10 抽、每批 10 抽、间隔 30 秒，保留 100,000 魔力。当前单抽 20,000 魔力，10 抽扣费 200,000（不预支奖励）。尾数或余额不足时自动改用较小档位。"),
-            component("VAlert", type="info", variant="tonal", text="每日目标按北京时间统计本插件的提交次数；网页手动抽奖不计入插件目标，但站点剩余次数始终限制实际抽数。请勿让同一账号同时运行多个抽奖脚本或插件实例。", **{"class": "mt-2"}),
+                 field("max_cost", "单抽费用上限", type="number", min=1)]),
+            row([field("interval", "批次间隔（秒）", type="number", min=5, max=900)]),
+            note("默认每日 10 抽、每批 10 抽、间隔 30 秒。按实际单抽费用扣款前核对保留魔力，额度不足时自动使用较小档位。"),
+            note("每日目标按北京时间统计本插件的提交次数，并受站点剩余次数限制。请避免同一账号同时运行多个抽奖插件。"),
         ]),
-        card("连接与异常恢复", [
-            component("VAlert", type="info", variant="tonal", text="在 MP 站点管理添加 https://www.tangpt.top 并维护 Cookie 与 User-Agent。首次勾选“仅检查连接”后保存，成功后再启用定时。"),
-            switch("acknowledge_pending", "已核对站点结果，解除抽奖暂停", "仅用于超时等结果不明的请求。先核对站点，再勾选保存；本次不抽奖，原请求仍保守占用当日目标，避免重复扣费。"),
+        card("手动运行与恢复", [
+            row([switch("run_once", "保存后运行一次", "自动复位，遵守当日目标；同时勾选连接检查时只检查。")], 12),
+            row([switch("acknowledge_pending", "已核对结果，解除暂停", "用于超时等结果不明的请求。请先到站点核对结果；本次只解除暂停，原请求仍占用当日目标。")], 12),
         ]),
     ])]
 
