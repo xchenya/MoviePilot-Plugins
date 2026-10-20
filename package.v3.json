@@ -122,5 +122,20 @@
       "v1.1.0": "新增独立于页面的后台自动经营，含开业预检、订单调度、每日预算、余额保留和异常写入保护。",
       "v1.0.0": "新增餐厅原生操作面板，厨房状态持久化、员工页面服务、请求防重与不确定写入保护。"
     }
+  },
+  "PtlgsLuckyWheel": {
+    "name": "PTLGS 幸运大转盘",
+    "description": "每日定时抽奖、工分保留、原订单重试及奖品汇总通知。",
+    "labels": "PTLGS,站点,抽奖",
+    "version": "1.0.0",
+    "icon": "Moviepilot_A.png",
+    "author": "xchenya",
+    "author_url": "https://github.com/xchenya",
+    "level": 2,
+    "system_version": ">=3.0.0",
+    "release": false,
+    "history": {
+      "v1.0.0": "新增 V3 原生大转盘插件：Cron、每日目标、工分保留、有限退避、持久化订单防重、奖品统计与汇总通知。已核对页面协议并离线验证，未经宿主及真实抽奖联调。"
+    }
   }
 }
