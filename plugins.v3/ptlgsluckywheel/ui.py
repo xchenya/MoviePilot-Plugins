@@ -1,6 +1,8 @@
 """Native MoviePilot Vuetify configuration and cached result pages."""
 from datetime import datetime, timezone
 
+from .reward_summary import reward_lines
+
 
 def component(name, text=None, content=None, **props):
     """Build a native component without HTML injection or global styles."""
@@ -88,6 +90,17 @@ def daily_view(state, today):
     return uid, ledger.get(today, {}), ledger, snapshot
 
 
+def reward_detail(record):
+    """Summarized gains and immutable raw hits coexist without recounting conversions."""
+    lines = reward_lines(record)
+    return [component("div", line, **{"class": "mb-1"}) for line in lines] + [
+        component("VExpansionPanels", content=[component("VExpansionPanel", content=[
+            component("VExpansionPanelTitle", "原始命中明细"),
+            component("VExpansionPanelText", content=[prize_table(record.get("prizes") or {})]),
+        ])], variant="accordion"),
+    ]
+
+
 def page(state, error="", today=None):
     """Show daily totals independently of the latest run, using cached data only."""
     today = today or datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -115,15 +128,15 @@ def page(state, error="", today=None):
                ("今日工分变化", f"{daily.get('change', 0):+,.1f}" if uid else "—"),
                ("站点今日剩余", f"{remaining} 抽" if remaining is not None else "待检查")]
     nodes.append(row([card(label, [component("div", value, **{"class": "text-h6"})]) for label, value in metrics], 3))
-    nodes.append(card("今日奖品统计", [prize_table(daily.get("prizes") or {}),
-        component("div", "包含“谢谢参与”；待确认订单在收到成功回执后计入。站点剩余为最近读取值，跨日后需重新检查。", **{"class": "text-caption mt-2"})]))
-    previous = [(day, value) for day, value in sorted(ledger.items(), reverse=True) if day < today]
+    nodes.append(card("今日奖品统计", reward_detail(daily) + [
+        component("div", "奖励工分优先采用单抽回执。缺少明细时显示余额口径的工分回流，可能含期间其他收支。重复折算仅按明确回执确认，已计入工分合计；其余保留原始命中，不推算持有状态。", **{"class": "text-caption mt-2"})]))
+    daily_records = {**ledger, **({today: daily} if uid else {})}
+    previous = [(day, value) for day, value in sorted(daily_records.items(), reverse=True) if day <= today]
     panels = [component("VExpansionPanel", content=[
-        component("VExpansionPanelTitle", f"{day} · {value.get('draws', 0)} 抽"),
+        component("VExpansionPanelTitle", f"{day}{'（今日）' if day == today else ''} · {value.get('draws', 0)} 抽"),
         component("VExpansionPanelText", content=[
             component("div", f"消耗 {value.get('spent', 0):,.0f} 工分 · 工分变化 {value.get('change', 0):+,.1f}", **{"class": "mb-2"}),
-            prize_table(value.get("prizes") or {}),
-        ]),
+        ] + reward_detail(value)),
     ]) for day, value in previous]
     nodes.append(card("历史每日统计", [component("VExpansionPanels", content=panels, variant="accordion")]
                       if panels else [component("div", "暂无历史每日记录")]))

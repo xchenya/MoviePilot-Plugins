@@ -103,7 +103,8 @@ def test_normal_target_and_idempotent_repeated_cron(plugin, module):
     assert s["pending"] is None and s["history"][0]["draws"] == 20
     assert s["history"][1]["draws"] == 0
     assert len(plugin.notifications) == 2
-    assert "工分500 ×20" in plugin.notifications[0]["text"]
+    assert "工分回流（余额口径） +0.0" in plugin.notifications[0]["text"]
+    assert "工分500 ×20" not in plugin.notifications[0]["text"]
     assert "fixture-secret" not in json.dumps(s) + json.dumps(plugin.notifications)
 
 
@@ -611,3 +612,40 @@ def test_diagnosis_crossing_reset_does_not_misdate_quota(plugin, module):
     state = saved(plugin, module)
     assert "snapshot" not in state and state["last"]["status"] == "异常停止"
     assert not wheel.post.called
+
+
+def test_recovered_duplicate_receipt_is_counted_once_without_auxiliary_queries(plugin, module):
+    wheel = connect(plugin)
+    plugin.init_plugin({"enabled": True, "daily_target": 1, "batch": 1, "retries": 0})
+    wheel.fail_after_purchase = True
+    plugin.run()
+    first = saved(plugin, module)["pending"]
+    assert first and "reward_context" not in first
+    # Recover a single-draw receipt explicitly reporting compensation. The server
+    # has committed it, but the first transport response was lost.
+    wheel.balance = first["before"] - 950
+    receipt = wheel.receipts[first["key"]]["data"]
+    receipt.update(bonus=wheel.balance, bonus_gained=50, detail="already_has",
+                   labels=["黑丝娘的献礼"], items=[{"label": "黑丝娘的献礼", "count": 1}])
+    plugin._cancel.wait = Mock(return_value=False)
+    plugin.run()
+    plugin.run()
+    state = saved(plugin, module)
+    day = state["days"]["123:" + plugin._day()]
+    assert day["draws"] == day["reward_accounting"]["covered"] == 1
+    assert day["reward_accounting"]["points"] == 50
+    assert day["reward_accounting"]["converted"] == {"黑丝娘的献礼": {"count": 1, "points": 50}}
+    assert "reward_holdings" not in state and state["pending"] is None
+    assert wheel.purchases == [1] and wheel.calls[0]["request_key"] == wheel.calls[1]["request_key"]
+    assert wheel.get.call_count == 4 and all(call.args[0] == module.URL for call in wheel.get.call_args_list)
+    assert "奖励工分 +50.0" in plugin.notifications[1]["text"]
+
+
+def test_latest_quota_snapshot_updates_notification_when_no_further_draw(plugin, module):
+    wheel = connect(plugin)
+    wheel.get.side_effect = [response(text=html()), response(text=html(remaining=0, balance=750000))]
+    plugin.run()
+    state = saved(plugin, module)
+    assert wheel.purchases == [10]
+    assert state["last"]["remaining"] == 0 and state["last"]["balance"] == 750000
+    assert "当前工分 750,000.0 · 今日剩余 0 抽" in plugin.notifications[0]["text"]

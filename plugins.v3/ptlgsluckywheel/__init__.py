@@ -20,7 +20,7 @@ from app.sdk.logging import logger
 from app.sdk.plugin import _PluginBase
 from app.schemas.types import NotificationType
 
-from . import storage
+from . import storage, reward_summary
 from .protocol import WheelError, daily_counts, integer, number, parse_page, rewards
 
 URL = "https://ptlgs.org/luckywheel.php"
@@ -33,7 +33,7 @@ class PtlgsLuckyWheel(_PluginBase):
     plugin_name = "PTLGS 幸运大转盘"
     plugin_desc = "每日定时抽奖、工分保留、原订单重试及奖品汇总通知。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     plugin_author = "xchenya"
     author_url = "https://github.com/xchenya"
     plugin_config_prefix = "ptlgsluckywheel_"
@@ -294,12 +294,15 @@ class PtlgsLuckyWheel(_PluginBase):
             won = {"奖品明细缺失（请查看站点记录）": count}
         cost = round(pending["cost"] * count, 1)
         delta = round(after - pending["before"], 1)
+        accounting = reward_summary.accounting(data, won, pending)
         key = pending["uid"] + ":" + pending["day"]
         day = state["days"].setdefault(key, {"draws": 0, "site_used": 0, "spent": 0, "change": 0, "prizes": {}})
         day["draws"] += count
         day["site_used"] = max(day["site_used"], pending["used_before"] + count, limit - remaining)
         day["spent"] = round(day["spent"] + cost, 1)
         day["change"] = round(day["change"] + delta, 1)
+        reward_summary.merge_accounting(day.setdefault("reward_accounting", {}), accounting)
+        reward_summary.merge_accounting(result.setdefault("reward_accounting", {}), accounting)
         for label, amount in won.items():
             day["prizes"][label] = day["prizes"].get(label, 0) + amount
             result["prizes"][label] = result["prizes"].get(label, 0) + amount
@@ -395,6 +398,7 @@ class PtlgsLuckyWheel(_PluginBase):
                 if snapshot.uid != account:
                     raise WheelError("登录账号发生变化，本轮已停止")
                 self._observe(state, snapshot, result["day"])
+                result.update(balance=snapshot.balance, remaining=snapshot.remaining)
                 if not snapshot.ready:
                     result.update(status="已停止", message="站点活动暂不可抽奖")
                     break
@@ -461,14 +465,12 @@ class PtlgsLuckyWheel(_PluginBase):
 
     def _notify(self, result):
         """One concise MP notification per run; failure cannot repeat a purchase."""
-        lines = [f"{result['status']} · 本次 {result['draws']} 抽",
-                 f"消耗 {result['spent']:,.0f} 工分 · 工分变化 {result['change']:+,.1f}"]
+        lines = [f"{result['status']} · 本次 {result['draws']} 抽"]
+        lines.extend(reward_summary.reward_lines(result))
+        lines.append(f"消耗 {result['spent']:,.0f} 工分 · 工分变化 {result['change']:+,.1f}")
         if result.get("balance") is not None:
             lines.append(f"当前工分 {result['balance']:,.1f} · 今日剩余 {result['remaining']} 抽")
-        prizes = [(label, count) for label, count in result["prizes"].items() if label != "谢谢参与"]
-        if prizes:
-            lines.append("奖品：" + "、".join(f"{label} ×{count}" for label, count in sorted(prizes, key=lambda x: -x[1])))
-        if result.get("message"):
+        if result.get("message") and (result["status"] != "已完成" or not result["draws"]):
             lines.append(result["message"])
         if result["uncertain"]:
             lines.append("存在待确认订单，下次优先核对原订单。")

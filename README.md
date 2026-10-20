@@ -9,7 +9,7 @@ xchenya 的 [MoviePilot](https://github.com/jxxghp/MoviePilot) 第三方插件�
 | 插件 | 目录 | 版本 | 状态 |
 |---|---|---|---|
 | [不可躺自动抽奖](./plugins.v3/tangptlottery/README.md) | `plugins.v3/tangptlottery` | `1.0.0` | 每日定时、批量抽奖、魔力保护及每日奖品通知；待宿主及站点联调 |
-| [PTLGS 幸运大转盘](./plugins.v3/ptlgsluckywheel/README.md) | `plugins.v3/ptlgsluckywheel` | `1.1.0` | 每日定时、每日奖品统计、一次性连接检查；已离线验证，待宿主联调 |
+| [PTLGS 幸运大转盘](./plugins.v3/ptlgsluckywheel/README.md) | `plugins.v3/ptlgsluckywheel` | `1.2.0` | 每日统计、合并通知、重复奖品折算；已离线验证，待宿主联调 |
 | [癫影自动签到](./plugins.v3/dian115sign/README.md) | `plugins.v3/dian115sign` | `2.0.6` | V3 测试版；普通签已实测 |
 | [憨憨保种区管家 V3](./plugins.v3/hhclubbutler/README.md) | `plugins.v3/hhclubbutler` | `3.0.12` | 删除后按下载器局部更新，修复独立任务残留与 ID 展示；待真实联调 |
 | [思齐自动收垃圾 V3](./plugins.v3/siqicleanbeach/README.md) | `plugins.v3/siqicleanbeach` | `2.0.0` | V3 移植测试版；未进行思齐站点联调 |
