@@ -3138,26 +3138,11 @@ class HdskyDiceBetNatural(_PluginBase):
         return None
 
     def _parse_pm_boxes(self) -> Dict[int, str]:
-        """从收件箱页解析自定义短讯箱 boxnumber→name。"""
+        """从收件箱下拉框和归档菜单识别全部自定义短讯箱。"""
         html = self._get("/messages.php?action=viewmailbox&box=1")
         if not html:
-            html = self._get("/messages.php")
-        if not html:
             return {}
-        boxes: Dict[int, str] = {}
-        for m in re.finditer(
-            r'<option[^>]*value=["\']?(\d+)["\']?[^>]*>([^<]+)</option>',
-            html,
-            re.I,
-        ):
-            num = int(m.group(1))
-            name = re.sub(r"\s+", "", m.group(2)).strip()
-            # 跳过收件箱/发件箱等系统项常见文案
-            if name in ("收件箱", "发件箱", "系统箱", "Inbox", "Sentbox", "请选择", ""):
-                continue
-            if num >= 2:
-                boxes[num] = name
-        return boxes
+        return parse_boxes(html)
 
     def _list_inbox_rating_message_ids(self, max_pages: int = 5) -> List[str]:
         ids: List[str] = []
