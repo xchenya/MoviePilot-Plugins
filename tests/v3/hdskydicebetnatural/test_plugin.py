@@ -11,6 +11,7 @@ import json
 import re
 import threading
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
@@ -100,7 +101,7 @@ def _isolate(*names):
         ], type_ignores=[]),
     )
     namespace = {
-        "FakeBase": FakeBase, "threading": threading,
+        "FakeBase": FakeBase, "threading": threading, "partial": partial,
         "settings": SimpleNamespace(TZ="UTC"),
         "pytz": SimpleNamespace(timezone=lambda name: timezone.utc),
         "CronTrigger": FakeCron, "DateTrigger": FakeDate,
@@ -167,7 +168,7 @@ def test_old_config_and_native_cron_lifecycle():
     services = p.get_service()
     assert len(services) == 1
     assert services[0]["id"] == "HdskyDiceBetNatural.Run"
-    assert services[0]["kwargs"]["generation"] == 1
+    assert services[0]["func"].keywords["generation"] == 1
     assert services[0]["trigger"][0] == "cron"
     assert p._site_id == 42
     assert p._fixed_types == ["大"]
@@ -185,7 +186,7 @@ def test_one_shot_must_persist_toggle_before_scheduler():
     assert len(p.get_service()) == 2
     assert p.get_service()[1]["id"].endswith(".Once")
     assert isinstance(p.get_service()[1]["trigger"], FakeDate)
-    assert p.get_service()[1]["kwargs"]["skip_jitter"] is True
+    assert p.get_service()[1]["func"].keywords["skip_jitter"] is True
     assert p.config_saves[-1]["onlyonce"] is False
 
     p2 = cls()
