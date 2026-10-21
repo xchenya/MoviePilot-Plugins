@@ -119,6 +119,8 @@ def host(data):
     p.TICKET_SCAN_MAX_PAGES = 10
     p.TICKET_SCAN_MAX_MESSAGES = 100
     p.TICKET_CACHE_SECONDS = 300
+    p._max_daily_tickets = None
+    p._daily_ticket_limit_reached = lambda: False
     p.TICKET_AWARD_FOLDERS = ("抽奖", "论坛投注", "观影", "奖励", "投注")
     p.LOG_TAG = "[test]"
     return p
@@ -226,7 +228,8 @@ def test_run_internal_quota_fails_closed_on_unverified_inbox():
         _is_cancelled=lambda: False, _load_site_auth=lambda: (True, "ok"),
         _ensure_username=lambda: True, _username="test", LOG_TAG="[test]",
         _humanize=False, _sync_pending_results=lambda: None,
-        _refresh_today_tickets=lambda: False, _max_daily_tickets=3,
+        _daily_ticket_limit_reached=lambda: False,
+        _ticket_count_ready=lambda: False, _max_daily_tickets=3,
     )
     # logger belongs to the compiled function's globals.
     namespace["logger"] = SimpleNamespace(info=Mock())
