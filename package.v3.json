@@ -156,5 +156,24 @@
       "v1.1.0": "参考 tanglottery 调整凭据选择和网页／抽奖请求头；新增手动 Cookie 与 User-Agent，兼容余额嵌套标签及页面文字状态，区分登录失败、风控与解析错误；重新分区表单并修复组件拥挤。",
       "v1.0.0": "新增 V3 原生定时抽奖：每日目标、批量档位、魔力保留与费用上限、一次性检查／运行、按日奖品统计及通知；无幂等接口的未知结果暂停且不重发。已核对页面协议并离线验证，待宿主及真实抽奖联调。"
     }
+  },
+  "HdskyDiceBetNatural": {
+    "name": "空论坛掷骰子（拟人）",
+    "description": "HDSky 论坛自动下注：拟人化浏览/执行间隔、固定/随机/智能/倍投策略、历史结算与日盈亏限制（V3 迁移测试版）。",
+    "labels": "HDSky,论坛,下注,自动化,拟人",
+    "version": "2.0.0",
+    "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/random.png",
+    "author": "Kuanghom",
+    "author_url": "https://github.com/Kuanghom/MoviePilot-Plugins/tree/main/plugins.v2/hdskydicebetnatural",
+    "level": 2,
+    "system_version": ">=3.0.0",
+    "release": false,
+    "history": {
+      "v2.0.0": "MoviePilot V3 迁移：SDK/站点访问适配、宿主 Cron/单次任务、实例隔离、停止信号及精准下注确认；新增模拟测试，未经真实站点联调。",
+      "v1.0.3": "上游：每日止盈/止损",
+      "v1.0.2": "上游：低余额检测与通知",
+      "v1.0.1": "上游：当前魔力展示",
+      "v1.0.0": "上游：拟人化下注策略、开奖时间窗和短讯归档"
+    }
   }
 }
