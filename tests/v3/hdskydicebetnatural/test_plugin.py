@@ -256,7 +256,7 @@ def test_bet_confirmation_rejects_generic_html_success_and_amount_mismatch():
     assert p._post_bet("89", "大", 100) == (True, "ok")
 
 
-def test_post_requires_known_origin_and_no_redirect(monkeypatch):
+def test_post_requires_known_origin_and_no_redirect():
     cls = _isolate("_post", "_allowed_url")
     p = cls()
     p._cancel = threading.Event()
@@ -275,7 +275,7 @@ def test_post_requires_known_origin_and_no_redirect(monkeypatch):
     fake_response = SimpleNamespace(status_code=200, text="ok")
     fake = Mock()
     fake.return_value.post_res.return_value = fake_response
-    p._post.__globals__["RequestUtils"] = fake
+    p._post.__func__.__globals__["RequestUtils"] = fake
     assert p._post("/forums.php?action=post", {"body": "大 100"}) == "ok"
     assert fake.return_value.post_res.call_args.kwargs["allow_redirects"] is False
     count = fake.call_count
