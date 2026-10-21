@@ -37,7 +37,7 @@ class HdskyDiceBetNatural(_PluginBase):
     plugin_desc = "拟人化自动下注：抖动调度、开奖时间窗、进帖停顿、假浏览与短讯解耦"
     # 插件市场使用绝对地址，避免本仓库没有对应图标导致加载失败。
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/random.png"
-    plugin_version = "2.0.0"
+    plugin_version = "2.0.1"
     plugin_author = "Kuanghom"
     author_url = "https://github.com/Kuanghom"
     plugin_config_prefix = "hdskydicebetnatural_"
@@ -3486,9 +3486,16 @@ class HdskyDiceBetNatural(_PluginBase):
         except Exception as exc:
             logger.warning(f"{self.LOG_TAG}观影券收件箱同步异常：{exc.__class__.__name__}")
             message = "短讯读取或解析异常"
+        # Preserve already-confirmed IDs across transient failures. Do not
+        # reinterpret stale legacy day totals as verified mailbox counts.
+        previous_ids = (
+            list(current.get("reward_ids", []))
+            if isinstance(current, dict) and current.get("date") == today else []
+        )
         self.save_data("ticket_inbox_status", {
             "date": today, "verified": False, "error": message[:120],
             "checked_at": self._now_str(), "checked_ts": time.time(),
+            "reward_ids": previous_ids,
         })
         logger.warning(f"{self.LOG_TAG}今日观影券未核实：{message}；未覆盖本地缓存")
         return False
@@ -3508,11 +3515,13 @@ class HdskyDiceBetNatural(_PluginBase):
             if any(keyword in name for keyword in self.TICKET_AWARD_FOLDERS)
         })
         previous = self.get_data("ticket_inbox_status") or {}
+        if not isinstance(previous, dict):
+            previous = {}
         # Carry forward today's already confirmed mail IDs if messages were
         # archived/moved after an earlier scan; do not carry legacy bet counters.
         reward_ids = set(
             str(mid) for mid in previous.get("reward_ids", [])
-            if isinstance(previous, dict) and previous.get("date") == today and str(mid).isdigit()
+            if previous.get("date") == today and str(mid).isdigit()
         )
         inspected = set()
         detail_count = 0
