@@ -2015,6 +2015,12 @@ class HdskyDiceBetNatural(_PluginBase):
     # 主流程
     # ------------------------------------------------------------------ #
     def run_once(self, skip_jitter: bool = False, generation: Optional[int] = None):
+        if skip_jitter:
+            self._once_pending = False
+        if self._daily_ticket_limit_reached():
+            # Existing scheduler callbacks remain registered for tomorrow,
+            # but today's callbacks return before any HTTP call.
+            return
         if self._is_cancelled() or (generation is not None and generation != self._generation):
             logger.info(f"{self.LOG_TAG}已取消的旧调度任务不再执行")
             return
@@ -2023,10 +2029,8 @@ class HdskyDiceBetNatural(_PluginBase):
             return
         self._thread_ctx.generation = self._generation
         self._thread_ctx.cancel = self._cancel
-        if skip_jitter:
-            self._once_pending = False
         try:
-            if self._is_cancelled():
+            if self._is_cancelled() or self._daily_ticket_limit_reached():
                 return
             if self._humanize and not skip_jitter and self._scan_jitter_sec > 0:
                 jitter = random.randint(0, self._scan_jitter_sec)
@@ -2084,6 +2088,10 @@ class HdskyDiceBetNatural(_PluginBase):
     def _run_internal(self) -> str:
         if self._is_cancelled():
             return "任务已取消"
+        if self._daily_ticket_limit_reached():
+            return "今日观影券已达上限，明日恢复自动执行"
+        if not self._ticket_count_ready():
+            return "今日观影券尚未核验或独立检查已过期，暂停本轮下注"
         ok, msg = self._load_site_auth()
         if not ok:
             return msg
@@ -2094,11 +2102,8 @@ class HdskyDiceBetNatural(_PluginBase):
         if self._humanize and self._in_idle_hours():
             return f"不活跃时段({self._idle_hours})，跳过下注"
 
-        # 先同步未结算记录与观影券
+        # 观影券由独立任务按间隔核验，下注任务不再访问收件箱。
         self._sync_pending_results()
-        if not self._refresh_today_tickets() and self._max_daily_tickets is not None:
-            # 限额保护只能依赖可靠的当日站内通知。读取失败不可用旧统计或 0 次继续下注。
-            return "今日观影券收件箱未核实，已暂停本轮下注，等待下次重试"
         self._human_pause(0.4, 1.8)
 
         run_count = int(self.get_data("run_count") or 0) + 1
@@ -3582,10 +3587,13 @@ class HdskyDiceBetNatural(_PluginBase):
         a previously verified mailbox count. Missing/partial pages fail closed.
         """
         today = self._today_str()
+        if self._daily_ticket_limit_reached():
+            return True
         current = self.get_data("ticket_inbox_status") or {}
+        ttl = getattr(self, "_ticket_check_interval", max(1, self.TICKET_CACHE_SECONDS // 60)) * 60
         if (isinstance(current, dict)
                 and current.get("date") == today and current.get("verified") is True
-                and time.time() - float(current.get("checked_ts") or 0) < self.TICKET_CACHE_SECONDS):
+                and time.time() - float(current.get("checked_ts") or 0) < ttl):
             return True
 
         try:
@@ -3603,6 +3611,11 @@ class HdskyDiceBetNatural(_PluginBase):
                 "boxes": box_names,
             })
             logger.info(f"{self.LOG_TAG}今日观影券已按站内收件箱核实：{count} 次；扫描 {len(box_names)} 个短讯箱")
+            if self._max_daily_tickets is not None and count >= self._max_daily_tickets:
+                self.save_data("ticket_limit_reached", {
+                    "date": today, "count": count, "limit": self._max_daily_tickets,
+                })
+                self._notify_daily_limit_stop("tickets", count, self._max_daily_tickets)
             return True
         except TicketInboxError as exc:
             message = str(exc)
