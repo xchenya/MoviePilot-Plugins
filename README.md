@@ -10,6 +10,7 @@ xchenya 的 [MoviePilot](https://github.com/jxxghp/MoviePilot) 第三方插件�
 |---|---|---|---|
 | [不可躺自动抽奖](./plugins.v3/tangptlottery/README.md) | `plugins.v3/tangptlottery` | `1.1.0` | 每日定时、魔力保护、奖品通知；手动凭据、连接诊断与分区表单；待宿主及站点联调 |
 | [PTLGS 幸运大转盘](./plugins.v3/ptlgsluckywheel/README.md) | `plugins.v3/ptlgsluckywheel` | `1.2.0` | 每日统计、合并通知、重复奖品折算；已离线验证，待宿主联调 |
+| [空论坛掷骰子（拟人）V3](./plugins.v3/hdskydicebetnatural/README.md) | `plugins.v3/hdskydicebetnatural` | `2.0.0` | 原功能 V3 移植；未进行真实下注测试 |
 | [癫影自动签到](./plugins.v3/dian115sign/README.md) | `plugins.v3/dian115sign` | `2.0.6` | V3 测试版；普通签已实测 |
 | [憨憨保种区管家 V3](./plugins.v3/hhclubbutler/README.md) | `plugins.v3/hhclubbutler` | `3.0.13` | 自定义标签、上传/下载单任务限速及 MP 代理开关；待真实联调 |
 | [思齐自动收垃圾 V3](./plugins.v3/siqicleanbeach/README.md) | `plugins.v3/siqicleanbeach` | `2.0.0` | V3 移植测试版；未进行思齐站点联调 |
@@ -22,6 +23,8 @@ xchenya 的 [MoviePilot](https://github.com/jxxghp/MoviePilot) 第三方插件�
 “思齐自动收垃圾”移植自 [bfjy2024/MoviePilot-Plugins](https://github.com/bfjy2024/MoviePilot-Plugins/tree/main/plugins.v2/siqicleanbeach)，原作者 bfjy，依上游 GPL-3.0 许可保留署名，当前 V3 版本由 xchenya 适配维护。已添加模拟数据回归测试，但尚未完成真实思齐站点联调；请手动测试成功后再启用定时。
 
 “思齐农场”当前作者与维护者为 [xchenya](https://github.com/xchenya)，基于原作者 KoWming 的 [siqifram 1.0.3](https://github.com/KoWming/MoviePilot-Plugins/tree/main/plugins.v2/siqifram) 移植并持续修改，遵循上游 GPL-3.0 许可，保留原作来源与许可声明。
+
+“空论坛掷骰子（拟人）”移植自 [Kuanghom/MoviePilot-Plugins](https://github.com/Kuanghom/MoviePilot-Plugins/tree/main/plugins.v2/hdskydicebetnatural)，原作者 Kuanghom。上游未见明确许可证，公开分发前建议确认许可；该插件涉及论坛魔力下注，首次安装请先校验策略、每日限额与失败保护，尚未进行真实账号联调。
 
 ## 使用方法
 
