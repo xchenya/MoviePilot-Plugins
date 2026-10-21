@@ -287,6 +287,15 @@ def test_post_requires_known_origin_and_no_redirect():
     assert fake.call_count == count
     fake.return_value.post_res.return_value = SimpleNamespace(status_code=302, text="redirect")
     assert p._post("/forums.php?action=post", {"body": "大 100"}) is None
+    # A normal same-origin forum redirect can be confirmed via a subsequent safe GET.
+    fake.return_value.post_res.return_value = SimpleNamespace(
+        status_code=302, text="", headers={"Location": "/forums.php?action=viewtopic"}
+    )
+    assert p._post("/forums.php?action=post", {"body": "大 100"}) == ""
+    fake.return_value.post_res.return_value = SimpleNamespace(
+        status_code=302, text="", headers={"Location": "https://evil.example/"}
+    )
+    assert p._post("/forums.php?action=post", {"body": "大 100"}) is None
     fake.return_value.post_res.return_value = SimpleNamespace(
         status_code=200, text="<title>HDSky :: 登录</title>"
     )
