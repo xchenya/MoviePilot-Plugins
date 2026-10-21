@@ -8,7 +8,7 @@ xchenya 的 [MoviePilot](https://github.com/jxxghp/MoviePilot) 第三方插件�
 
 | 插件 | 目录 | 版本 | 状态 |
 |---|---|---|---|
-| [不可躺自动抽奖](./plugins.v3/tangptlottery/README.md) | `plugins.v3/tangptlottery` | `1.1.0` | 每日定时、魔力保护、奖品通知；手动凭据、连接诊断与分区表单；待宿主及站点联调 |
+| [不可躺自动抽奖](./plugins.v3/tangptlottery/README.md) | `plugins.v3/tangptlottery` | `1.1.1` | 每日定时、魔力保护、奖品通知；手动凭据、连接诊断与分区表单；待宿主及站点联调 |
 | [PTLGS 幸运大转盘](./plugins.v3/ptlgsluckywheel/README.md) | `plugins.v3/ptlgsluckywheel` | `1.2.0` | 每日统计、合并通知、重复奖品折算；已离线验证，待宿主联调 |
 | [空论坛掷骰子（拟人）V3](./plugins.v3/hdskydicebetnatural/README.md) | `plugins.v3/hdskydicebetnatural` | `2.0.0` | 原功能 V3 移植；未进行真实下注测试 |
 | [癫影自动签到](./plugins.v3/dian115sign/README.md) | `plugins.v3/dian115sign` | `2.0.6` | V3 测试版；普通签已实测 |

@@ -1,6 +1,6 @@
 # 不可躺自动抽奖
 
-MoviePilot V3 插件，对应唐门／不可躺的 `https://www.tangpt.top/omnibot_lottery.php`。定时任务在 MP 后台执行，不依赖打开网页或油猴。
+MoviePilot V3 插件，对应不可躺（外号“躺平”）的 `https://www.tangpt.top/omnibot_lottery.php`。定时任务在 MP 后台执行，不依赖打开网页或油猴。
 
 ## 安装与设置
 

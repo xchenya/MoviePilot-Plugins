@@ -35,9 +35,9 @@ class TangptLottery(_PluginBase):
     """Serialize draws and persist intent before every non-idempotent POST."""
 
     plugin_name = "不可躺自动抽奖"
-    plugin_desc = "唐门每日定时抽奖、魔力保留、每日奖品统计与汇总通知。"
+    plugin_desc = "躺平每日定时抽奖、魔力保留、每日奖品统计与汇总通知。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     plugin_author = "xchenya"
     author_url = "https://github.com/xchenya"
     plugin_config_prefix = "tangptlottery_"
