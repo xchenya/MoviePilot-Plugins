@@ -234,3 +234,36 @@ def test_run_internal_quota_fails_closed_on_unverified_inbox():
     # logger belongs to the compiled function's globals.
     namespace["logger"] = SimpleNamespace(info=Mock())
     assert "暂停本轮下注" in namespace["_run_internal"](fake)
+
+
+def test_successful_independent_scan_marks_cap_and_stops_further_scans():
+    p = host(fixture())
+    p._max_daily_tickets = 2
+    p._ticket_check_interval = 60
+    p._notify_daily_limit_stop = Mock()
+    p._daily_ticket_limit_reached = lambda: (
+        (p.data.get("ticket_limit_reached") or {}).get("date") == p._today_str()
+    )
+    assert p._refresh_today_tickets() is True
+    assert p.data["tickets_by_day"][TODAY] == 2
+    assert p.data["ticket_limit_reached"] == {
+        "date": TODAY, "count": 2, "limit": 2,
+    }
+    p._notify_daily_limit_stop.assert_called_once_with("tickets", 2, 2)
+    count = p._get.call_count
+    assert p._refresh_today_tickets() is True
+    assert p._get.call_count == count
+
+
+def test_new_day_clears_effect_of_yesterday_cap_without_extra_network():
+    p = host(fixture())
+    p._max_daily_tickets = 3
+    p.data["ticket_limit_reached"] = {
+        "date": "2026-10-20", "count": 3, "limit": 3,
+    }
+    # The old marker is not today's marker. Today can be checked independently.
+    p._daily_ticket_limit_reached = lambda: (
+        (p.data.get("ticket_limit_reached") or {}).get("date") == p._today_str()
+    )
+    assert p._refresh_today_tickets() is True
+    assert p.data["tickets_by_day"][TODAY] == 2
