@@ -3615,7 +3615,10 @@ class HdskyDiceBetNatural(_PluginBase):
                 self.save_data("ticket_limit_reached", {
                     "date": today, "count": count, "limit": self._max_daily_tickets,
                 })
-                self._notify_daily_limit_stop("tickets", count, self._max_daily_tickets)
+                try:
+                    self._notify_daily_limit_stop("tickets", count, self._max_daily_tickets)
+                except Exception:
+                    logger.exception(f"{self.LOG_TAG}已达额度但停止通知发送异常，仍保持今日停注")
             return True
         except TicketInboxError as exc:
             message = str(exc)
