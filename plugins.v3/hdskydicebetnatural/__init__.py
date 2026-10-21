@@ -16,6 +16,8 @@ from datetime import datetime, timedelta, date
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, quote, urlsplit
 
+from .ticket_inbox import TicketInboxError, parse_award_message, parse_boxes, parse_mailbox
+
 import pytz
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
@@ -35,7 +37,7 @@ class HdskyDiceBetNatural(_PluginBase):
     plugin_desc = "拟人化自动下注：抖动调度、开奖时间窗、进帖停顿、假浏览与短讯解耦"
     # 插件市场使用绝对地址，避免本仓库没有对应图标导致加载失败。
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/random.png"
-    plugin_version = "2.0.0"
+    plugin_version = "2.0.1"
     plugin_author = "Kuanghom"
     author_url = "https://github.com/Kuanghom"
     plugin_config_prefix = "hdskydicebetnatural_"
@@ -67,6 +69,10 @@ class HdskyDiceBetNatural(_PluginBase):
     SMART_EXTRA_MIN_ROUNDS = 20
     RATING_PM_RE = re.compile(r"管理员在您的帖子#\d+评分")
     RATING_PM_BOX_NAME = "论坛投注"
+    TICKET_SCAN_MAX_PAGES = 10
+    TICKET_SCAN_MAX_MESSAGES = 100
+    TICKET_CACHE_SECONDS = 300
+    TICKET_AWARD_FOLDERS = ("抽奖", "论坛投注", "观影", "奖励", "投注")
     TOPIC_TITLE_RE = re.compile(
         r"本轮开奖时间:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})"
         r"(?:\s*【\s*(豹子|顺子|大|小)\s+([\d,]+)\s*】)?"
@@ -1068,7 +1074,9 @@ class HdskyDiceBetNatural(_PluginBase):
         week_pl = self._summarize_pl(history, "week")
         month_pl = self._summarize_pl(history, "month")
         all_pl = self._summarize_pl(history, "all")
-        tickets_today = int((self.get_data("tickets_by_day") or {}).get(today, 0) or 0)
+        ticket_status = self.get_data("ticket_inbox_status") or {}
+        verified = ticket_status.get("date") == today and ticket_status.get("verified") is True
+        tickets_today = int((self.get_data("tickets_by_day") or {}).get(today, 0)) if verified else None
         bets_today = self._count_bets_on(history, today)
         pending_cnt = sum(1 for h in history if h.get("profit") is None)
         win_rate = (
@@ -1285,13 +1293,10 @@ class HdskyDiceBetNatural(_PluginBase):
                     ),
                     self._metric_card(
                         "今日观影券",
-                        str(tickets_today)
-                        + (
-                            f" / {self._max_daily_tickets}"
-                            if self._max_daily_tickets
-                            else ""
-                        ),
-                        "自然天累计",
+                        (str(tickets_today) if tickets_today is not None else "待核验")
+                        + (f" / {self._max_daily_tickets}" if self._max_daily_tickets else ""),
+                        ("收件箱已核实 · " + str(ticket_status.get("checked_at", ""))[-8:])
+                        if verified else "收件箱未核实，不按 0 次处理",
                         "warning",
                         "mdi-ticket-confirmation",
                     ),
@@ -1693,7 +1698,12 @@ class HdskyDiceBetNatural(_PluginBase):
         history = self.get_data("history") or []
         day_pl = self._summarize_pl(history, "day")
         bets_today = self._count_bets_on(history, today)
-        tickets_today = int((self.get_data("tickets_by_day") or {}).get(today, 0))
+        ticket_status = self.get_data("ticket_inbox_status") or {}
+        tickets_today = (
+            str(int((self.get_data("tickets_by_day") or {}).get(today, 0)))
+            if ticket_status.get("date") == today and ticket_status.get("verified") is True
+            else "待核验"
+        )
         mode_map = {"fixed": "固定", "random": "随机", "smart": "智能", "martingale": "倍投", "manual": "手动"}
         mode_text = mode_map.get(str(record.get("mode")), str(record.get("mode")))
         limit_bet = f" / {self._max_daily_bets}" if self._max_daily_bets else ""
@@ -1949,7 +1959,9 @@ class HdskyDiceBetNatural(_PluginBase):
 
         # 先同步未结算记录与观影券
         self._sync_pending_results()
-        self._refresh_today_tickets()
+        if not self._refresh_today_tickets() and self._max_daily_tickets is not None:
+            # 限额保护只能依赖可靠的当日站内通知。读取失败不可用旧统计或 0 次继续下注。
+            return "今日观影券收件箱未核实，已暂停本轮下注，等待下次重试"
         self._human_pause(0.4, 1.8)
 
         run_count = int(self.get_data("run_count") or 0) + 1
@@ -3126,26 +3138,11 @@ class HdskyDiceBetNatural(_PluginBase):
         return None
 
     def _parse_pm_boxes(self) -> Dict[int, str]:
-        """从收件箱页解析自定义短讯箱 boxnumber→name。"""
+        """从收件箱下拉框和归档菜单识别全部自定义短讯箱。"""
         html = self._get("/messages.php?action=viewmailbox&box=1")
         if not html:
-            html = self._get("/messages.php")
-        if not html:
             return {}
-        boxes: Dict[int, str] = {}
-        for m in re.finditer(
-            r'<option[^>]*value=["\']?(\d+)["\']?[^>]*>([^<]+)</option>',
-            html,
-            re.I,
-        ):
-            num = int(m.group(1))
-            name = re.sub(r"\s+", "", m.group(2)).strip()
-            # 跳过收件箱/发件箱等系统项常见文案
-            if name in ("收件箱", "发件箱", "系统箱", "Inbox", "Sentbox", "请选择", ""):
-                continue
-            if num >= 2:
-                boxes[num] = name
-        return boxes
+        return parse_boxes(html)
 
     def _list_inbox_rating_message_ids(self, max_pages: int = 5) -> List[str]:
         ids: List[str] = []
@@ -3307,7 +3304,6 @@ class HdskyDiceBetNatural(_PluginBase):
     def _sync_pending_results(self):
         history = self.get_data("history") or []
         changed = False
-        tickets_by_day = dict(self.get_data("tickets_by_day") or {})
         newly_settled: List[Dict[str, Any]] = []
         pending_items = [
             item
@@ -3401,8 +3397,7 @@ class HdskyDiceBetNatural(_PluginBase):
                     )
                     if not sibling_has_ticket:
                         item["got_ticket"] = True
-                        day = item.get("date") or self._today_str()
-                        tickets_by_day[day] = int(tickets_by_day.get(day, 0)) + 1
+                        # 下注记录仅记录该局有无奖励，今日次数以收件箱为准。
                         changed = True
 
             # 已开奖但评分未刷出 / 翻页未找到楼层：用本地下注记录 + 开奖类型兜底
@@ -3438,44 +3433,141 @@ class HdskyDiceBetNatural(_PluginBase):
 
         if changed:
             self.save_data("history", history)
-            self.save_data("tickets_by_day", tickets_by_day)
         logger.info(f"{self.LOG_TAG}同步完成，新结算通知 {len(newly_settled)} 条")
         for item in newly_settled:
             self._update_martingale_after_settle(item)
             self._notify_settlement(item)
 
-    def _refresh_today_tickets(self):
-        """按自然天统计自己评论中的观影券次数。"""
+    def _refresh_today_tickets(self) -> bool:
+        """Read today's award notices from the inbox and award archives only.
+
+        The old local-history total is not authoritative and must never overwrite
+        a previously verified mailbox count. Missing/partial pages fail closed.
+        """
         today = self._today_str()
-        history = self.get_data("history") or []
-        known_ids = {str(h.get("topic_id")) for h in history if h.get("got_ticket")}
-        count = sum(1 for h in history if h.get("date") == today and h.get("got_ticket"))
+        current = self.get_data("ticket_inbox_status") or {}
+        if (isinstance(current, dict)
+                and current.get("date") == today and current.get("verified") is True
+                and time.time() - float(current.get("checked_ts") or 0) < self.TICKET_CACHE_SECONDS):
+            return True
 
-        # 仅在配置了观影券上限时额外扫今日已结帖，补录非本插件下注获得的券
-        if self._max_daily_tickets is not None:
-            topics = self._list_forum_topics(pages=2)
-            checked = 0
-            for t in topics:
-                if not (t.get("draw_time") or "").startswith(today):
-                    continue
-                if not t.get("result") and not t.get("locked"):
-                    continue
-                tid = str(t["topic_id"])
-                if tid in known_ids:
-                    continue
-                checked += 1
-                if checked > 12:
+        try:
+            count, reward_ids, checked_ids, box_names = self._scan_ticket_mailboxes(today)
+            days = dict(self.get_data("tickets_by_day") or {})
+            days[today] = count
+            cutoff = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=60)).strftime("%Y-%m-%d")
+            self.save_data("tickets_by_day", {k: v for k, v in days.items() if k >= cutoff})
+            stamp = self._now_str()
+            self.save_data("ticket_inbox_status", {
+                "date": today, "verified": True, "count": count,
+                "reward_ids": sorted(reward_ids),
+                "checked_ids": sorted(checked_ids),
+                "checked_at": stamp, "checked_ts": time.time(),
+                "boxes": box_names,
+            })
+            logger.info(f"{self.LOG_TAG}今日观影券已按站内收件箱核实：{count} 次；扫描 {len(box_names)} 个短讯箱")
+            return True
+        except TicketInboxError as exc:
+            message = str(exc)
+        except Exception as exc:
+            logger.warning(f"{self.LOG_TAG}观影券收件箱同步异常：{exc.__class__.__name__}")
+            message = "短讯读取或解析异常"
+        # Preserve already-confirmed IDs across transient failures. Do not
+        # reinterpret stale legacy day totals as verified mailbox counts.
+        previous_ids = (
+            list(current.get("reward_ids", []))
+            if isinstance(current, dict) and current.get("date") == today else []
+        )
+        previous_checked = (
+            list(current.get("checked_ids", []))
+            if isinstance(current, dict) and current.get("date") == today else []
+        )
+        self.save_data("ticket_inbox_status", {
+            "date": today, "verified": False, "error": message[:120],
+            "checked_at": self._now_str(), "checked_ts": time.time(),
+            "reward_ids": previous_ids,
+            "checked_ids": previous_checked,
+        })
+        logger.warning(f"{self.LOG_TAG}今日观影券未核实：{message}；未覆盖本地缓存")
+        return False
+
+    def _scan_ticket_mailboxes(self, today: str) -> Tuple[int, set, set, List[str]]:
+        """Scan inbox + dedicated archives; one confirmed award PM counts once.
+
+        PM IDs, not forum topics, deduplicate notifications across folders.
+        A bounded incomplete scan cannot assert today's quota.
+        """
+        first = self._get("/messages.php?action=viewmailbox&box=1&page=0")
+        if not first:
+            raise TicketInboxError("无法打开收件箱，可能是网络故障或 Cookie 过期")
+        boxes = {1: "收件箱"}
+        boxes.update({
+            number: name for number, name in parse_boxes(first).items()
+            if any(keyword in name for keyword in self.TICKET_AWARD_FOLDERS)
+        })
+        previous = self.get_data("ticket_inbox_status") or {}
+        if not isinstance(previous, dict):
+            previous = {}
+        # Carry forward today's already confirmed mail IDs if messages were
+        # archived/moved after an earlier scan; do not carry legacy bet counters.
+        reward_ids = set(
+            str(mid) for mid in previous.get("reward_ids", [])
+            if previous.get("date") == today and str(mid).isdigit()
+        )
+        inspected = set(
+            str(mid) for mid in previous.get("checked_ids", [])
+            if previous.get("date") == today and str(mid).isdigit()
+        )
+        detail_count = 0
+        box_names = []
+        for box_no, name in boxes.items():
+            box_names.append(name)
+            scanned_ids = set()
+            for page in range(self.TICKET_SCAN_MAX_PAGES):
+                if self._is_cancelled():
+                    raise TicketInboxError("任务被取消")
+                html = first if box_no == 1 and page == 0 else self._get(
+                    f"/messages.php?action=viewmailbox&box={box_no}&page={page}"
+                )
+                if not html:
+                    raise TicketInboxError("短讯列表读取失败或 Cookie 过期")
+                listing = parse_mailbox(html, box=box_no, page=page, today=today)
+                if not listing.valid:
+                    raise TicketInboxError("短讯列表格式未识别，不能确认今日观影券数量")
+                # NexusPHP lists newest IDs first. When an older row is seen,
+                # all following pages in this mailbox are older as well.
+                has_older = False
+                for entry in listing.entries:
+                    if entry.mid in scanned_ids:
+                        continue
+                    scanned_ids.add(entry.mid)
+                    if entry.day and entry.day < today:
+                        has_older = True
+                        continue
+                    if entry.day and entry.day > today:
+                        continue
+                    if entry.mid in inspected or entry.mid in reward_ids:
+                        continue
+                    detail_count += 1
+                    if detail_count > self.TICKET_SCAN_MAX_MESSAGES:
+                        raise TicketInboxError("今日短讯数量超出安全扫描上限，统计不完整")
+                    if self._wait(0.15):
+                        raise TicketInboxError("任务已取消")
+                    detail_html = self._get(f"/messages.php?action=viewmessage&id={entry.mid}")
+                    if not detail_html:
+                        raise TicketInboxError("短讯详情读取失败，无法确认奖励")
+                    detail_day, awarded = parse_award_message(detail_html, today=today)
+                    day = entry.day or detail_day
+                    if not day:
+                        raise TicketInboxError("部分短讯缺少可靠收件日期，无法判断是否为今日奖励")
+                    if day == today and awarded:
+                        reward_ids.add(entry.mid)
+                    inspected.add(entry.mid)
+                if has_older or not listing.has_next:
                     break
-                detail = self._fetch_topic_detail(tid, max_pages=2)
-                if detail and detail.get("got_ticket"):
-                    count += 1
-                    known_ids.add(tid)
-
-        tickets_by_day = dict(self.get_data("tickets_by_day") or {})
-        tickets_by_day[today] = count
-        cutoff = (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%d")
-        tickets_by_day = {k: v for k, v in tickets_by_day.items() if k >= cutoff}
-        self.save_data("tickets_by_day", tickets_by_day)
+                if page == self.TICKET_SCAN_MAX_PAGES - 1:
+                    raise TicketInboxError("短讯箱分页超出扫描上限，统计不完整")
+        return len(reward_ids), reward_ids, inspected, box_names
 
     def _summarize_pl(self, history: List[dict], period: str) -> Dict[str, Any]:
         today = date.today()
