@@ -11,6 +11,7 @@ import random
 import threading
 import time
 from collections import Counter
+from functools import partial
 from datetime import datetime, timedelta, date
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, quote, urlsplit
@@ -281,8 +282,8 @@ class HdskyDiceBetNatural(_PluginBase):
                 "id": f"{self.__class__.__name__}.Run",
                 "name": "空论坛掷骰子（拟人）定时扫描",
                 "trigger": self._trigger,
-                "func": self.run_once,
-                "kwargs": {"generation": self._generation},
+                "func": partial(self.run_once, generation=self._generation),
+                "kwargs": {"max_instances": 1, "coalesce": True, "misfire_grace_time": 120},
             })
         if self._once_pending:
             jobs.append({
@@ -291,8 +292,8 @@ class HdskyDiceBetNatural(_PluginBase):
                 "trigger": DateTrigger(
                     run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3)
                 ),
-                "func": self.run_once,
-                "kwargs": {"skip_jitter": True, "generation": self._generation},
+                "func": partial(self.run_once, skip_jitter=True, generation=self._generation),
+                "kwargs": {"max_instances": 1, "coalesce": True, "misfire_grace_time": 120},
             })
         return jobs
 
