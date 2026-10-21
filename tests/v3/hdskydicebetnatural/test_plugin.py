@@ -10,6 +10,7 @@ import copy
 import json
 import re
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
@@ -67,6 +68,15 @@ class FakeBase:
     def run_once(self, **kwargs):
         pass
 
+    def run_ticket_check(self, **kwargs):
+        pass
+
+    def _today_str(self):
+        return "2026-10-21"
+
+    def _daily_ticket_limit_reached(self):
+        return False
+
 
 class FakeCron:
     @staticmethod
@@ -74,6 +84,12 @@ class FakeCron:
         if len(expr.split()) != 5:
             raise ValueError("invalid cron")
         return ("cron", expr, timezone)
+
+
+class FakeInterval:
+    def __init__(self, minutes, timezone=None):
+        self.minutes = minutes
+        self.timezone = timezone
 
 
 class FakeDate:
@@ -105,6 +121,7 @@ def _isolate(*names):
         "settings": SimpleNamespace(TZ="UTC"),
         "pytz": SimpleNamespace(timezone=lambda name: timezone.utc),
         "CronTrigger": FakeCron, "DateTrigger": FakeDate,
+        "IntervalTrigger": FakeInterval, "time": time,
         "datetime": datetime, "timedelta": timedelta,
         "urljoin": urljoin, "urlsplit": urlsplit,
         "logger": LOGGER, "re": re,
@@ -134,7 +151,7 @@ def test_market_and_source_metadata():
     }
     package = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))
     entry = package["HdskyDiceBetNatural"]
-    assert entry["version"] == attrs["plugin_version"] == "2.0.1"
+    assert entry["version"] == attrs["plugin_version"] == "2.1.0"
     assert entry["system_version"] == ">=3.0.0"
     assert entry["release"] is False
     assert attrs["plugin_author"] == "Kuanghom"
@@ -166,8 +183,11 @@ def test_old_config_and_native_cron_lifecycle():
     p.init_plugin({"enabled": True, "cron": "*/5 * * * *", "site_id": 42})
     assert p.get_state()
     services = p.get_service()
-    assert len(services) == 1
+    assert len(services) == 3
     assert services[0]["id"] == "HdskyDiceBetNatural.Run"
+    assert services[1]["id"].endswith(".TicketCheck")
+    assert services[1]["trigger"].minutes == 60
+    assert services[2]["id"].endswith(".TicketInitial")
     assert services[0]["func"].keywords["generation"] == 1
     assert services[0]["trigger"][0] == "cron"
     assert p._site_id == 42
@@ -183,10 +203,10 @@ def test_one_shot_must_persist_toggle_before_scheduler():
     p = cls()
     _stub_config_helpers(p)
     p.init_plugin({"enabled": True, "onlyonce": True, "site_id": 1})
-    assert len(p.get_service()) == 2
-    assert p.get_service()[1]["id"].endswith(".Once")
-    assert isinstance(p.get_service()[1]["trigger"], FakeDate)
-    assert p.get_service()[1]["func"].keywords["skip_jitter"] is True
+    assert len(p.get_service()) == 4
+    assert p.get_service()[-1]["id"].endswith(".Once")
+    assert isinstance(p.get_service()[-1]["trigger"], FakeDate)
+    assert p.get_service()[-1]["func"].keywords["skip_jitter"] is True
     assert p.config_saves[-1]["onlyonce"] is False
 
     p2 = cls()
