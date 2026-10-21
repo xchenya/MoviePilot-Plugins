@@ -292,14 +292,44 @@ class HdskyDiceBetNatural(_PluginBase):
         if self._is_cancelled() or self._config_error:
             return []
         jobs = []
+        options = {"max_instances": 1, "coalesce": True, "misfire_grace_time": 120}
         if self._enabled and self._trigger:
             jobs.append({
                 "id": f"{self.__class__.__name__}.Run",
                 "name": "空论坛掷骰子（拟人）定时扫描",
                 "trigger": self._trigger,
                 "func": partial(self.run_once, generation=self._generation),
-                "kwargs": {"max_instances": 1, "coalesce": True, "misfire_grace_time": 120},
+                "kwargs": dict(options),
             })
+        if self._enabled and self._ticket_trigger:
+            jobs.append({
+                "id": f"{self.__class__.__name__}.TicketCheck",
+                "name": "空论坛观影券独立核验",
+                "trigger": self._ticket_trigger,
+                "func": partial(self.run_ticket_check, generation=self._generation),
+                "kwargs": dict(options),
+            })
+            # 首次安装/次日重启可尽快核验，不必等完整的检查间隔。
+            status = self.get_data("ticket_inbox_status") or {}
+            if not isinstance(status, dict):
+                status = {}
+            try:
+                age = time.time() - float(status.get("checked_ts") or 0)
+            except (TypeError, ValueError):
+                age = float("inf")
+            if (not self._daily_ticket_limit_reached()
+                    and (status.get("date") != self._today_str()
+                         or status.get("verified") is not True
+                         or age >= self._ticket_check_interval * 60)):
+                jobs.append({
+                    "id": f"{self.__class__.__name__}.TicketInitial",
+                    "name": "空论坛观影券首次核验",
+                    "trigger": DateTrigger(
+                        run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3)
+                    ),
+                    "func": partial(self.run_ticket_check, generation=self._generation),
+                    "kwargs": dict(options),
+                })
         if self._once_pending:
             jobs.append({
                 "id": f"{self.__class__.__name__}.Once",
@@ -308,9 +338,90 @@ class HdskyDiceBetNatural(_PluginBase):
                     run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3)
                 ),
                 "func": partial(self.run_once, skip_jitter=True, generation=self._generation),
-                "kwargs": {"max_instances": 1, "coalesce": True, "misfire_grace_time": 120},
+                "kwargs": dict(options),
             })
         return jobs
+
+    def _verified_ticket_count(self) -> Optional[int]:
+        """Only confirmed today's inbox scan results may govern quota."""
+        status = self.get_data("ticket_inbox_status") or {}
+        if not isinstance(status, dict) or status.get("date") != self._today_str():
+            return None
+        if status.get("verified") is not True:
+            return None
+        try:
+            return max(0, int(status["count"]))
+        except (TypeError, ValueError, KeyError):
+            return None
+
+    def _daily_ticket_limit_reached(self) -> bool:
+        """All automatic work becomes a no-op after a confirmed daily cap."""
+        if self._max_daily_tickets is None:
+            return False
+        current = self._verified_ticket_count()
+        if current is not None and current >= self._max_daily_tickets:
+            return True
+        marker = self.get_data("ticket_limit_reached") or {}
+        if not isinstance(marker, dict):
+            return False
+        try:
+            return (
+                marker.get("date") == self._today_str()
+                and int(marker.get("limit")) == self._max_daily_tickets
+                and int(marker.get("count")) >= self._max_daily_tickets
+            )
+        except (TypeError, ValueError):
+            return False
+
+    def _ticket_count_ready(self) -> bool:
+        """Betting only reads last verified state; it never scans the inbox."""
+        if self._max_daily_tickets is None:
+            return True
+        if self._daily_ticket_limit_reached():
+            return False
+        if self._verified_ticket_count() is None:
+            return False
+        status = self.get_data("ticket_inbox_status") or {}
+        try:
+            age = time.time() - float(status.get("checked_ts") or 0)
+        except (TypeError, ValueError):
+            return False
+        return 0 <= age < self._ticket_check_interval * 60 + 120
+
+    def run_ticket_check(self, generation: Optional[int] = None):
+        """Independent read-only PM scan, serialized with the betting task."""
+        if not self._enabled or self._is_cancelled() or (
+            generation is not None and generation != self._generation
+        ) or self._daily_ticket_limit_reached():
+            return
+        if not self._run_lock.acquire(blocking=False):
+            logger.debug(f"{self.LOG_TAG}下注或核验仍在运行，跳过此次独立观影券检查")
+            return
+        self._thread_ctx.generation = self._generation
+        self._thread_ctx.cancel = self._cancel
+        try:
+            if self._is_cancelled() or self._daily_ticket_limit_reached():
+                return
+            status = self.get_data("ticket_inbox_status") or {}
+            try:
+                age = time.time() - float(status.get("checked_ts") or 0)
+            except (TypeError, ValueError):
+                age = float("inf")
+            if (status.get("date") == self._today_str() and status.get("verified") is True
+                    and 0 <= age < self._ticket_check_interval * 60):
+                return
+            ok, msg = self._load_site_auth()
+            if not ok:
+                logger.warning(f"{self.LOG_TAG}观影券独立检查未执行：{msg}")
+                return
+            self._refresh_today_tickets()
+        except Exception as exc:
+            logger.error(f"{self.LOG_TAG}独立观影券检查异常：{exc.__class__.__name__}")
+        finally:
+            self._run_lock.release()
+            for key in ("generation", "cancel"):
+                if hasattr(self._thread_ctx, key):
+                    delattr(self._thread_ctx, key)
 
     def stop_service(self):
         self._cancel.set()
