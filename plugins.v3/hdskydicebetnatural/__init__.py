@@ -2385,8 +2385,21 @@ class HdskyDiceBetNatural(_PluginBase):
             timeout=30,
             headers=headers,
         ).post_res(url=url, data=data, allow_redirects=False)
-        if not res or res.status_code != 200:
-            logger.warning(f"{self.LOG_TAG}POST 无明确成功响应，停止本轮后续下注")
+        if not res:
+            logger.warning(f"{self.LOG_TAG}POST 无响应，提交结果待确认")
+            return None
+        # 论坛正常回帖可能以 302 跳转到主题。不得跟随带 Cookie 的外站重定向，
+        # 但对同域跳转，可继续执行一次只读帖内校验（绝不重复 POST）。
+        if res.status_code in (301, 302, 303, 307, 308):
+            location = (getattr(res, "headers", {}) or {}).get("Location", "")
+            if location and self._allowed_url(urljoin(url, location)):
+                self._last_referer = url
+                logger.info(f"{self.LOG_TAG}POST 同域重定向，转为只读结果确认")
+                return ""
+            logger.warning(f"{self.LOG_TAG}POST 重定向目标异常，停止本轮写入")
+            return None
+        if res.status_code != 200:
+            logger.warning(f"{self.LOG_TAG}POST HTTP {res.status_code}，结果待核对")
             return None
         text = res.text or ""
         if "该页面必须在登录后才能访问" in text or "<title>HDSky :: 登录" in text:
