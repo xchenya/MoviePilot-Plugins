@@ -135,9 +135,12 @@ def parse_mailbox(html: str, *, box: int, page: int, today: str) -> InboxPage:
     # A 200 OK login/error page must not be misread as an empty mailbox.
     lower = soup.get_text(" ", strip=True).lower()
     empty_hint = any(x in lower for x in (
-        "没有消息", "没有短讯", "暂无消息", "暂无短讯", "no messages", "no private message",
+        "没有消息", "没有短讯", "没有任何短讯", "暂无消息", "暂无短讯",
+        "no messages", "no private message",
     ))
-    valid = bool(entries or empty_hint or soup.select_one("#pmboxmenu"))
+    # A navigation bar may remain visible on an HTML error page. It does NOT
+    # prove that the message list was successfully loaded and is empty.
+    valid = bool(entries or empty_hint)
     return InboxPage(tuple(entries), has_next, valid)
 
 
