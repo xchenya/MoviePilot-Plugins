@@ -63,6 +63,9 @@ class FakeBase:
         self.config_saves.append(dict(value))
         return True
 
+    def run_once(self, **kwargs):
+        pass
+
 
 class FakeCron:
     @staticmethod
