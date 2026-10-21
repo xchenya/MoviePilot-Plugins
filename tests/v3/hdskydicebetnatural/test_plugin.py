@@ -379,6 +379,7 @@ def test_confirmed_limit_blocks_independent_ticket_scans():
     p = cls()
     p._max_daily_tickets = 3
     p._enabled = True
+    p._is_cancelled = Mock(return_value=False)
     p.data["ticket_inbox_status"] = {
         "date": p._today_str(), "verified": True,
         "count": 3, "checked_ts": time.time(),
