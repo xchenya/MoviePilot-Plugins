@@ -21,6 +21,7 @@ from .ticket_inbox import TicketInboxError, parse_award_message, parse_boxes, pa
 import pytz
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 from app.sdk.config import settings
 from app.db.oper.site import SiteOper
@@ -37,7 +38,7 @@ class HdskyDiceBetNatural(_PluginBase):
     plugin_desc = "拟人化自动下注：抖动调度、开奖时间窗、进帖停顿、假浏览与短讯解耦"
     # 插件市场使用绝对地址，避免本仓库没有对应图标导致加载失败。
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/random.png"
-    plugin_version = "2.0.1"
+    plugin_version = "2.1.0"
     plugin_author = "Kuanghom"
     author_url = "https://github.com/Kuanghom"
     plugin_config_prefix = "hdskydicebetnatural_"
@@ -71,7 +72,7 @@ class HdskyDiceBetNatural(_PluginBase):
     RATING_PM_BOX_NAME = "论坛投注"
     TICKET_SCAN_MAX_PAGES = 10
     TICKET_SCAN_MAX_MESSAGES = 100
-    TICKET_CACHE_SECONDS = 300
+    TICKET_CACHE_SECONDS = 3600
     TICKET_AWARD_FOLDERS = ("抽奖", "论坛投注", "观影", "奖励", "投注")
     TOPIC_TITLE_RE = re.compile(
         r"本轮开奖时间:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})"
@@ -136,6 +137,8 @@ class HdskyDiceBetNatural(_PluginBase):
         self._generation = 0
         self._once_pending = False
         self._trigger = None
+        self._ticket_trigger = None
+        self._ticket_check_interval = 60
         self._config_error = ""
         self._auth_failed = False
         self._fixed_types = ["大"]
@@ -154,6 +157,7 @@ class HdskyDiceBetNatural(_PluginBase):
         self._cancel = threading.Event()
         self._generation += 1
         self._trigger = None
+        self._ticket_trigger = None
         self._config_error = ""
         self._once_pending = False
         self._auth_failed = False
@@ -163,6 +167,10 @@ class HdskyDiceBetNatural(_PluginBase):
         self._notify = bool(config.get("notify"))
         self._onlyonce = bool(config.get("onlyonce"))
         self._cron = (config.get("cron") or "*/5 * * * *").strip()
+        try:
+            self._ticket_check_interval = max(10, min(1440, int(config.get("ticket_check_interval", 60) or 60)))
+        except (TypeError, ValueError):
+            self._ticket_check_interval = 60
         self._site_id = self._normalize_site_id(config.get("site_id"))
         self._bet_mode = config.get("bet_mode") or "smart"
         self._fixed_types = self._parse_fixed_types(config)
@@ -241,6 +249,7 @@ class HdskyDiceBetNatural(_PluginBase):
         # V3 定时全部注册到 MP 宿主，避免私有调度器重复运行。
         try:
             self._trigger = CronTrigger.from_crontab(self._cron, timezone=settings.TZ)
+            self._ticket_trigger = IntervalTrigger(minutes=self._ticket_check_interval, timezone=settings.TZ)
         except (TypeError, ValueError) as exc:
             self._config_error = "Cron 表达式无效，请填写五段表达式"
             logger.warning(f"{self.LOG_TAG}{self._config_error}: {exc.__class__.__name__}")
@@ -283,14 +292,44 @@ class HdskyDiceBetNatural(_PluginBase):
         if self._is_cancelled() or self._config_error:
             return []
         jobs = []
+        options = {"max_instances": 1, "coalesce": True, "misfire_grace_time": 120}
         if self._enabled and self._trigger:
             jobs.append({
                 "id": f"{self.__class__.__name__}.Run",
                 "name": "空论坛掷骰子（拟人）定时扫描",
                 "trigger": self._trigger,
                 "func": partial(self.run_once, generation=self._generation),
-                "kwargs": {"max_instances": 1, "coalesce": True, "misfire_grace_time": 120},
+                "kwargs": dict(options),
             })
+        if self._enabled and self._ticket_trigger:
+            jobs.append({
+                "id": f"{self.__class__.__name__}.TicketCheck",
+                "name": "空论坛观影券独立核验",
+                "trigger": self._ticket_trigger,
+                "func": partial(self.run_ticket_check, generation=self._generation),
+                "kwargs": dict(options),
+            })
+            # 首次安装/次日重启可尽快核验，不必等完整的检查间隔。
+            status = self.get_data("ticket_inbox_status") or {}
+            if not isinstance(status, dict):
+                status = {}
+            try:
+                age = time.time() - float(status.get("checked_ts") or 0)
+            except (TypeError, ValueError):
+                age = float("inf")
+            if (not self._daily_ticket_limit_reached()
+                    and (status.get("date") != self._today_str()
+                         or status.get("verified") is not True
+                         or age >= self._ticket_check_interval * 60)):
+                jobs.append({
+                    "id": f"{self.__class__.__name__}.TicketInitial",
+                    "name": "空论坛观影券首次核验",
+                    "trigger": DateTrigger(
+                        run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3)
+                    ),
+                    "func": partial(self.run_ticket_check, generation=self._generation),
+                    "kwargs": dict(options),
+                })
         if self._once_pending:
             jobs.append({
                 "id": f"{self.__class__.__name__}.Once",
@@ -299,9 +338,90 @@ class HdskyDiceBetNatural(_PluginBase):
                     run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3)
                 ),
                 "func": partial(self.run_once, skip_jitter=True, generation=self._generation),
-                "kwargs": {"max_instances": 1, "coalesce": True, "misfire_grace_time": 120},
+                "kwargs": dict(options),
             })
         return jobs
+
+    def _verified_ticket_count(self) -> Optional[int]:
+        """Only confirmed today's inbox scan results may govern quota."""
+        status = self.get_data("ticket_inbox_status") or {}
+        if not isinstance(status, dict) or status.get("date") != self._today_str():
+            return None
+        if status.get("verified") is not True:
+            return None
+        try:
+            return max(0, int(status["count"]))
+        except (TypeError, ValueError, KeyError):
+            return None
+
+    def _daily_ticket_limit_reached(self) -> bool:
+        """All automatic work becomes a no-op after a confirmed daily cap."""
+        if self._max_daily_tickets is None:
+            return False
+        current = self._verified_ticket_count()
+        if current is not None and current >= self._max_daily_tickets:
+            return True
+        marker = self.get_data("ticket_limit_reached") or {}
+        if not isinstance(marker, dict):
+            return False
+        try:
+            return (
+                marker.get("date") == self._today_str()
+                and int(marker.get("limit")) == self._max_daily_tickets
+                and int(marker.get("count")) >= self._max_daily_tickets
+            )
+        except (TypeError, ValueError):
+            return False
+
+    def _ticket_count_ready(self) -> bool:
+        """Betting only reads last verified state; it never scans the inbox."""
+        if self._max_daily_tickets is None:
+            return True
+        if self._daily_ticket_limit_reached():
+            return False
+        if self._verified_ticket_count() is None:
+            return False
+        status = self.get_data("ticket_inbox_status") or {}
+        try:
+            age = time.time() - float(status.get("checked_ts") or 0)
+        except (TypeError, ValueError):
+            return False
+        return 0 <= age < self._ticket_check_interval * 60 + 120
+
+    def run_ticket_check(self, generation: Optional[int] = None):
+        """Independent read-only PM scan, serialized with the betting task."""
+        if not self._enabled or self._is_cancelled() or (
+            generation is not None and generation != self._generation
+        ) or self._daily_ticket_limit_reached():
+            return
+        if not self._run_lock.acquire(blocking=False):
+            logger.debug(f"{self.LOG_TAG}下注或核验仍在运行，跳过此次独立观影券检查")
+            return
+        self._thread_ctx.generation = self._generation
+        self._thread_ctx.cancel = self._cancel
+        try:
+            if self._is_cancelled() or self._daily_ticket_limit_reached():
+                return
+            status = self.get_data("ticket_inbox_status") or {}
+            try:
+                age = time.time() - float(status.get("checked_ts") or 0)
+            except (TypeError, ValueError):
+                age = float("inf")
+            if (status.get("date") == self._today_str() and status.get("verified") is True
+                    and 0 <= age < self._ticket_check_interval * 60):
+                return
+            ok, msg = self._load_site_auth()
+            if not ok:
+                logger.warning(f"{self.LOG_TAG}观影券独立检查未执行：{msg}")
+                return
+            self._refresh_today_tickets()
+        except Exception as exc:
+            logger.error(f"{self.LOG_TAG}独立观影券检查异常：{exc.__class__.__name__}")
+        finally:
+            self._run_lock.release()
+            for key in ("generation", "cancel"):
+                if hasattr(self._thread_ctx, key):
+                    delattr(self._thread_ctx, key)
 
     def stop_service(self):
         self._cancel.set()
@@ -1017,6 +1137,22 @@ class HdskyDiceBetNatural(_PluginBase):
                 },
             ]
         )
+        form_content.append({
+            "component": "VRow",
+            "content": [{
+                "component": "VCol", "props": {"cols": 12, "md": 4},
+                "content": [{
+                    "component": "VTextField",
+                    "props": {
+                        "model": "ticket_check_interval",
+                        "label": "观影券检查间隔（分钟）",
+                        "type": "number", "min": 10, "max": 1440,
+                        "hint": "独立检查，默认60分钟；达上限后当天不再自动执行",
+                        "persistent-hint": True,
+                    },
+                }],
+            }],
+        })
         return [
             {
                 "component": "VForm",
@@ -1042,6 +1178,7 @@ class HdskyDiceBetNatural(_PluginBase):
             "cron": "*/5 * * * *",
             "max_daily_bets": "",
             "max_daily_tickets": "",
+            "ticket_check_interval": 60,
             "stop_profit": "",
             "stop_loss": "",
             "smart_history_rounds": 50,
@@ -1878,6 +2015,12 @@ class HdskyDiceBetNatural(_PluginBase):
     # 主流程
     # ------------------------------------------------------------------ #
     def run_once(self, skip_jitter: bool = False, generation: Optional[int] = None):
+        if skip_jitter:
+            self._once_pending = False
+        if self._daily_ticket_limit_reached():
+            # Existing scheduler callbacks remain registered for tomorrow,
+            # but today's callbacks return before any HTTP call.
+            return
         if self._is_cancelled() or (generation is not None and generation != self._generation):
             logger.info(f"{self.LOG_TAG}已取消的旧调度任务不再执行")
             return
@@ -1886,10 +2029,8 @@ class HdskyDiceBetNatural(_PluginBase):
             return
         self._thread_ctx.generation = self._generation
         self._thread_ctx.cancel = self._cancel
-        if skip_jitter:
-            self._once_pending = False
         try:
-            if self._is_cancelled():
+            if self._is_cancelled() or self._daily_ticket_limit_reached():
                 return
             if self._humanize and not skip_jitter and self._scan_jitter_sec > 0:
                 jitter = random.randint(0, self._scan_jitter_sec)
@@ -1947,6 +2088,10 @@ class HdskyDiceBetNatural(_PluginBase):
     def _run_internal(self) -> str:
         if self._is_cancelled():
             return "任务已取消"
+        if self._daily_ticket_limit_reached():
+            return "今日观影券已达上限，明日恢复自动执行"
+        if not self._ticket_count_ready():
+            return "今日观影券尚未核验或独立检查已过期，暂停本轮下注"
         ok, msg = self._load_site_auth()
         if not ok:
             return msg
@@ -1957,11 +2102,8 @@ class HdskyDiceBetNatural(_PluginBase):
         if self._humanize and self._in_idle_hours():
             return f"不活跃时段({self._idle_hours})，跳过下注"
 
-        # 先同步未结算记录与观影券
+        # 观影券由独立任务按间隔核验，下注任务不再访问收件箱。
         self._sync_pending_results()
-        if not self._refresh_today_tickets() and self._max_daily_tickets is not None:
-            # 限额保护只能依赖可靠的当日站内通知。读取失败不可用旧统计或 0 次继续下注。
-            return "今日观影券收件箱未核实，已暂停本轮下注，等待下次重试"
         self._human_pause(0.4, 1.8)
 
         run_count = int(self.get_data("run_count") or 0) + 1
@@ -3445,10 +3587,13 @@ class HdskyDiceBetNatural(_PluginBase):
         a previously verified mailbox count. Missing/partial pages fail closed.
         """
         today = self._today_str()
+        if self._daily_ticket_limit_reached():
+            return True
         current = self.get_data("ticket_inbox_status") or {}
+        ttl = getattr(self, "_ticket_check_interval", max(1, self.TICKET_CACHE_SECONDS // 60)) * 60
         if (isinstance(current, dict)
                 and current.get("date") == today and current.get("verified") is True
-                and time.time() - float(current.get("checked_ts") or 0) < self.TICKET_CACHE_SECONDS):
+                and time.time() - float(current.get("checked_ts") or 0) < ttl):
             return True
 
         try:
@@ -3466,6 +3611,14 @@ class HdskyDiceBetNatural(_PluginBase):
                 "boxes": box_names,
             })
             logger.info(f"{self.LOG_TAG}今日观影券已按站内收件箱核实：{count} 次；扫描 {len(box_names)} 个短讯箱")
+            if self._max_daily_tickets is not None and count >= self._max_daily_tickets:
+                self.save_data("ticket_limit_reached", {
+                    "date": today, "count": count, "limit": self._max_daily_tickets,
+                })
+                try:
+                    self._notify_daily_limit_stop("tickets", count, self._max_daily_tickets)
+                except Exception:
+                    logger.exception(f"{self.LOG_TAG}已达额度但停止通知发送异常，仍保持今日停注")
             return True
         except TicketInboxError as exc:
             message = str(exc)

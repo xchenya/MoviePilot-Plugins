@@ -119,6 +119,8 @@ def host(data):
     p.TICKET_SCAN_MAX_PAGES = 10
     p.TICKET_SCAN_MAX_MESSAGES = 100
     p.TICKET_CACHE_SECONDS = 300
+    p._max_daily_tickets = None
+    p._daily_ticket_limit_reached = lambda: False
     p.TICKET_AWARD_FOLDERS = ("抽奖", "论坛投注", "观影", "奖励", "投注")
     p.LOG_TAG = "[test]"
     return p
@@ -226,8 +228,42 @@ def test_run_internal_quota_fails_closed_on_unverified_inbox():
         _is_cancelled=lambda: False, _load_site_auth=lambda: (True, "ok"),
         _ensure_username=lambda: True, _username="test", LOG_TAG="[test]",
         _humanize=False, _sync_pending_results=lambda: None,
-        _refresh_today_tickets=lambda: False, _max_daily_tickets=3,
+        _daily_ticket_limit_reached=lambda: False,
+        _ticket_count_ready=lambda: False, _max_daily_tickets=3,
     )
     # logger belongs to the compiled function's globals.
     namespace["logger"] = SimpleNamespace(info=Mock())
     assert "暂停本轮下注" in namespace["_run_internal"](fake)
+
+
+def test_successful_independent_scan_marks_cap_and_stops_further_scans():
+    p = host(fixture())
+    p._max_daily_tickets = 2
+    p._ticket_check_interval = 60
+    p._notify_daily_limit_stop = Mock()
+    p._daily_ticket_limit_reached = lambda: (
+        (p.data.get("ticket_limit_reached") or {}).get("date") == p._today_str()
+    )
+    assert p._refresh_today_tickets() is True
+    assert p.data["tickets_by_day"][TODAY] == 2
+    assert p.data["ticket_limit_reached"] == {
+        "date": TODAY, "count": 2, "limit": 2,
+    }
+    p._notify_daily_limit_stop.assert_called_once_with("tickets", 2, 2)
+    count = p._get.call_count
+    assert p._refresh_today_tickets() is True
+    assert p._get.call_count == count
+
+
+def test_new_day_clears_effect_of_yesterday_cap_without_extra_network():
+    p = host(fixture())
+    p._max_daily_tickets = 3
+    p.data["ticket_limit_reached"] = {
+        "date": "2026-10-20", "count": 3, "limit": 3,
+    }
+    # The old marker is not today's marker. Today can be checked independently.
+    p._daily_ticket_limit_reached = lambda: (
+        (p.data.get("ticket_limit_reached") or {}).get("date") == p._today_str()
+    )
+    assert p._refresh_today_tickets() is True
+    assert p.data["tickets_by_day"][TODAY] == 2

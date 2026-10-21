@@ -10,6 +10,7 @@ import copy
 import json
 import re
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
@@ -67,6 +68,15 @@ class FakeBase:
     def run_once(self, **kwargs):
         pass
 
+    def run_ticket_check(self, **kwargs):
+        pass
+
+    def _today_str(self):
+        return "2026-10-21"
+
+    def _daily_ticket_limit_reached(self):
+        return False
+
 
 class FakeCron:
     @staticmethod
@@ -74,6 +84,12 @@ class FakeCron:
         if len(expr.split()) != 5:
             raise ValueError("invalid cron")
         return ("cron", expr, timezone)
+
+
+class FakeInterval:
+    def __init__(self, minutes, timezone=None):
+        self.minutes = minutes
+        self.timezone = timezone
 
 
 class FakeDate:
@@ -105,6 +121,7 @@ def _isolate(*names):
         "settings": SimpleNamespace(TZ="UTC"),
         "pytz": SimpleNamespace(timezone=lambda name: timezone.utc),
         "CronTrigger": FakeCron, "DateTrigger": FakeDate,
+        "IntervalTrigger": FakeInterval, "time": time,
         "datetime": datetime, "timedelta": timedelta,
         "urljoin": urljoin, "urlsplit": urlsplit,
         "logger": LOGGER, "re": re,
@@ -134,7 +151,7 @@ def test_market_and_source_metadata():
     }
     package = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))
     entry = package["HdskyDiceBetNatural"]
-    assert entry["version"] == attrs["plugin_version"] == "2.0.1"
+    assert entry["version"] == attrs["plugin_version"] == "2.1.0"
     assert entry["system_version"] == ">=3.0.0"
     assert entry["release"] is False
     assert attrs["plugin_author"] == "Kuanghom"
@@ -166,8 +183,11 @@ def test_old_config_and_native_cron_lifecycle():
     p.init_plugin({"enabled": True, "cron": "*/5 * * * *", "site_id": 42})
     assert p.get_state()
     services = p.get_service()
-    assert len(services) == 1
+    assert len(services) == 3
     assert services[0]["id"] == "HdskyDiceBetNatural.Run"
+    assert services[1]["id"].endswith(".TicketCheck")
+    assert services[1]["trigger"].minutes == 60
+    assert services[2]["id"].endswith(".TicketInitial")
     assert services[0]["func"].keywords["generation"] == 1
     assert services[0]["trigger"][0] == "cron"
     assert p._site_id == 42
@@ -183,10 +203,10 @@ def test_one_shot_must_persist_toggle_before_scheduler():
     p = cls()
     _stub_config_helpers(p)
     p.init_plugin({"enabled": True, "onlyonce": True, "site_id": 1})
-    assert len(p.get_service()) == 2
-    assert p.get_service()[1]["id"].endswith(".Once")
-    assert isinstance(p.get_service()[1]["trigger"], FakeDate)
-    assert p.get_service()[1]["func"].keywords["skip_jitter"] is True
+    assert len(p.get_service()) == 4
+    assert p.get_service()[-1]["id"].endswith(".Once")
+    assert isinstance(p.get_service()[-1]["trigger"], FakeDate)
+    assert p.get_service()[-1]["func"].keywords["skip_jitter"] is True
     assert p.config_saves[-1]["onlyonce"] is False
 
     p2 = cls()
@@ -318,3 +338,126 @@ def test_pending_post_never_blindly_retries():
     assert not ok and "未确认" in message
     assert p._post.call_count == 1
     p._fetch_topic_detail.assert_not_called()
+
+
+def test_ticket_interval_config_is_independent_and_clamped():
+    cls = _isolate("__init__", "init_plugin", "stop_service",
+                   "_is_cancelled", "get_state", "get_service")
+    p = cls()
+    _stub_config_helpers(p)
+    p.init_plugin({"enabled": True, "site_id": 1, "ticket_check_interval": "75"})
+    jobs = p.get_service()
+    assert jobs[0]["id"].endswith(".Run")
+    assert jobs[1]["id"].endswith(".TicketCheck")
+    assert jobs[1]["trigger"].minutes == 75
+    assert p._cron == "*/5 * * * *"
+    p.init_plugin({"enabled": True, "site_id": 1, "ticket_check_interval": "1"})
+    assert p._ticket_check_interval == 10
+    p.init_plugin({"enabled": True, "site_id": 1, "ticket_check_interval": "bad"})
+    assert p._ticket_check_interval == 60
+    p.init_plugin({"enabled": True, "site_id": 1, "ticket_check_interval": "3000"})
+    assert p._ticket_check_interval == 1440
+
+
+def test_confirmed_limit_blocks_auto_betting_before_network():
+    cls = _isolate("_verified_ticket_count", "_daily_ticket_limit_reached", "run_once")
+    p = cls()
+    p._max_daily_tickets = 3
+    p.data["ticket_inbox_status"] = {
+        "date": p._today_str(), "verified": True,
+        "count": 3, "checked_ts": time.time(),
+    }
+    p._load_site_auth = Mock()
+    p._run_internal = Mock()
+    p.run_once()
+    p._load_site_auth.assert_not_called()
+    p._run_internal.assert_not_called()
+
+
+def test_confirmed_limit_blocks_independent_ticket_scans():
+    cls = _isolate("_verified_ticket_count", "_daily_ticket_limit_reached", "run_ticket_check")
+    p = cls()
+    p._max_daily_tickets = 3
+    p._enabled = True
+    p._is_cancelled = Mock(return_value=False)
+    p.data["ticket_inbox_status"] = {
+        "date": p._today_str(), "verified": True,
+        "count": 3, "checked_ts": time.time(),
+    }
+    p._load_site_auth = Mock()
+    p.run_ticket_check()
+    p._load_site_auth.assert_not_called()
+
+
+def test_confirmed_cap_marker_survives_transient_invalid_status():
+    cls = _isolate("_verified_ticket_count", "_daily_ticket_limit_reached")
+    p = cls()
+    p._max_daily_tickets = 3
+    p.data["ticket_inbox_status"] = {"date": p._today_str(), "verified": False}
+    p.data["ticket_limit_reached"] = {
+        "date": p._today_str(), "limit": 3, "count": 3,
+    }
+    assert p._daily_ticket_limit_reached() is True
+    p._today_str = lambda: "2026-10-22"
+    assert p._daily_ticket_limit_reached() is False
+    p._max_daily_tickets = 5
+    assert p._daily_ticket_limit_reached() is False
+
+
+def test_fresh_quota_is_only_read_not_rescanned_by_betting():
+    cls = _isolate("_verified_ticket_count", "_daily_ticket_limit_reached", "_ticket_count_ready")
+    p = cls()
+    p._max_daily_tickets = 3
+    p._ticket_check_interval = 60
+    p.data["ticket_inbox_status"] = {
+        "date": p._today_str(), "verified": True,
+        "count": 2, "checked_ts": time.time(),
+    }
+    assert p._ticket_count_ready() is True
+    p.data["ticket_inbox_status"]["checked_ts"] = time.time() - 7200
+    assert p._ticket_count_ready() is False
+    p.data["ticket_inbox_status"]["date"] = "2026-10-20"
+    assert p._ticket_count_ready() is False
+
+
+def test_independent_ticket_scan_runs_without_bet_execution():
+    cls = _isolate("_verified_ticket_count", "_daily_ticket_limit_reached",
+                   "run_ticket_check")
+    p = cls()
+    p._max_daily_tickets = 3
+    p._enabled = True
+    p._generation = 1
+    p._ticket_check_interval = 60
+    p._cancel = threading.Event()
+    p._thread_ctx = threading.local()
+    p._run_lock = threading.Lock()
+    p._is_cancelled = Mock(return_value=False)
+    p._load_site_auth = Mock(return_value=(True, "ok"))
+    p._refresh_today_tickets = Mock(return_value=True)
+    p._run_internal = Mock()
+    p.run_ticket_check(generation=1)
+    p._load_site_auth.assert_called_once()
+    p._refresh_today_tickets.assert_called_once()
+    p._run_internal.assert_not_called()
+    assert not p._run_lock.locked()
+    assert not hasattr(p._thread_ctx, "cancel")
+
+
+def test_checker_skips_if_betting_has_lock():
+    cls = _isolate("_verified_ticket_count", "_daily_ticket_limit_reached",
+                   "run_ticket_check")
+    p = cls()
+    p._max_daily_tickets = 3
+    p._enabled = True
+    p._generation = 1
+    p._cancel = threading.Event()
+    p._thread_ctx = threading.local()
+    p._run_lock = threading.Lock()
+    p._is_cancelled = Mock(return_value=False)
+    p._load_site_auth = Mock()
+    p._run_lock.acquire()
+    try:
+        p.run_ticket_check(generation=1)
+    finally:
+        p._run_lock.release()
+    p._load_site_auth.assert_not_called()
