@@ -3452,7 +3452,7 @@ class HdskyDiceBetNatural(_PluginBase):
             return True
 
         try:
-            count, reward_ids, box_names = self._scan_ticket_mailboxes(today)
+            count, reward_ids, checked_ids, box_names = self._scan_ticket_mailboxes(today)
             days = dict(self.get_data("tickets_by_day") or {})
             days[today] = count
             cutoff = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=60)).strftime("%Y-%m-%d")
@@ -3461,6 +3461,7 @@ class HdskyDiceBetNatural(_PluginBase):
             self.save_data("ticket_inbox_status", {
                 "date": today, "verified": True, "count": count,
                 "reward_ids": sorted(reward_ids),
+                "checked_ids": sorted(checked_ids),
                 "checked_at": stamp, "checked_ts": time.time(),
                 "boxes": box_names,
             })
@@ -3477,15 +3478,20 @@ class HdskyDiceBetNatural(_PluginBase):
             list(current.get("reward_ids", []))
             if isinstance(current, dict) and current.get("date") == today else []
         )
+        previous_checked = (
+            list(current.get("checked_ids", []))
+            if isinstance(current, dict) and current.get("date") == today else []
+        )
         self.save_data("ticket_inbox_status", {
             "date": today, "verified": False, "error": message[:120],
             "checked_at": self._now_str(), "checked_ts": time.time(),
             "reward_ids": previous_ids,
+            "checked_ids": previous_checked,
         })
         logger.warning(f"{self.LOG_TAG}今日观影券未核实：{message}；未覆盖本地缓存")
         return False
 
-    def _scan_ticket_mailboxes(self, today: str) -> Tuple[int, set, List[str]]:
+    def _scan_ticket_mailboxes(self, today: str) -> Tuple[int, set, set, List[str]]:
         """Scan inbox + dedicated archives; one confirmed award PM counts once.
 
         PM IDs, not forum topics, deduplicate notifications across folders.
@@ -3508,7 +3514,10 @@ class HdskyDiceBetNatural(_PluginBase):
             str(mid) for mid in previous.get("reward_ids", [])
             if previous.get("date") == today and str(mid).isdigit()
         )
-        inspected = set()
+        inspected = set(
+            str(mid) for mid in previous.get("checked_ids", [])
+            if previous.get("date") == today and str(mid).isdigit()
+        )
         detail_count = 0
         box_names = []
         for box_no, name in boxes.items():
@@ -3558,7 +3567,7 @@ class HdskyDiceBetNatural(_PluginBase):
                     break
                 if page == self.TICKET_SCAN_MAX_PAGES - 1:
                     raise TicketInboxError("短讯箱分页超出扫描上限，统计不完整")
-        return len(reward_ids), reward_ids, box_names
+        return len(reward_ids), reward_ids, inspected, box_names
 
     def _summarize_pl(self, history: List[dict], period: str) -> Dict[str, Any]:
         today = date.today()
