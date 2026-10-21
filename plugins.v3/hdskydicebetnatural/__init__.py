@@ -124,6 +124,7 @@ class HdskyDiceBetNatural(_PluginBase):
         super().__init__()
         # V3 插件分身独立运行，运行锁和配置状态不能被其他实例共享。
         self._run_lock = threading.Lock()
+        self._thread_ctx = threading.local()
         self._cancel = threading.Event()
         self._generation = 0
         self._once_pending = False
@@ -249,8 +250,20 @@ class HdskyDiceBetNatural(_PluginBase):
                 self._once_pending = True
                 self._onlyonce = False
 
+    def _is_cancelled(self) -> bool:
+        # Reload 时旧线程保留原 cancel/event generation，新任务不能使旧线程复活。
+        generation = getattr(self._thread_ctx, "generation", self._generation)
+        cancel = getattr(self._thread_ctx, "cancel", self._cancel)
+        return cancel.is_set() or generation != self._generation
+
+    def _wait(self, seconds: float) -> bool:
+        cancel = getattr(self._thread_ctx, "cancel", self._cancel)
+        if cancel.wait(max(0, seconds)):
+            return True
+        return self._is_cancelled()
+
     def get_state(self) -> bool:
-        return bool(self._enabled or self._once_pending) and not self._config_error and not self._cancel.is_set()
+        return bool(self._enabled or self._once_pending) and not self._config_error and not self._is_cancelled()
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
@@ -260,7 +273,7 @@ class HdskyDiceBetNatural(_PluginBase):
         return []
 
     def get_service(self) -> List[Dict[str, Any]]:
-        if self._cancel.is_set() or self._config_error:
+        if self._is_cancelled() or self._config_error:
             return []
         jobs = []
         if self._enabled and self._trigger:
@@ -1854,20 +1867,24 @@ class HdskyDiceBetNatural(_PluginBase):
     # 主流程
     # ------------------------------------------------------------------ #
     def run_once(self, skip_jitter: bool = False, generation: Optional[int] = None):
-        if self._cancel.is_set() or (generation is not None and generation != self._generation):
+        if self._is_cancelled() or (generation is not None and generation != self._generation):
             logger.info(f"{self.LOG_TAG}已取消的旧调度任务不再执行")
             return
         if not self._run_lock.acquire(blocking=False):
             logger.warning(f"{self.LOG_TAG}上一次任务仍在执行，跳过")
             return
+        self._thread_ctx.generation = self._generation
+        self._thread_ctx.cancel = self._cancel
+        if skip_jitter:
+            self._once_pending = False
         try:
-            if self._cancel.is_set():
+            if self._is_cancelled():
                 return
             if self._humanize and not skip_jitter and self._scan_jitter_sec > 0:
                 jitter = random.randint(0, self._scan_jitter_sec)
                 if jitter > 0:
                     logger.info(f"{self.LOG_TAG}拟人启动抖动 {jitter}s")
-                    if self._cancel.wait(jitter):
+                    if self._wait(jitter):
                         return
             next_run = self._next_cron_time()
             logger.info(f"{self.LOG_TAG}====== 开始执行 ======")
@@ -1911,9 +1928,13 @@ class HdskyDiceBetNatural(_PluginBase):
             )
         finally:
             self._run_lock.release()
+            # 删掉线程绑定，下一次正常手动调用不会继承旧版本取消事件。
+            for key in ("generation", "cancel"):
+                if hasattr(self._thread_ctx, key):
+                    delattr(self._thread_ctx, key)
 
     def _run_internal(self) -> str:
-        if self._cancel.is_set():
+        if self._is_cancelled():
             return "任务已取消"
         ok, msg = self._load_site_auth()
         if not ok:
@@ -2016,7 +2037,7 @@ class HdskyDiceBetNatural(_PluginBase):
 
         acted = []
         for topic in open_topics:
-            if self._cancel.is_set() or self._auth_failed:
+            if self._is_cancelled() or self._auth_failed:
                 return "任务已取消或 Cookie 失效，停止后续请求"
             if self._max_daily_bets is not None and self._count_bets_on(
                 self.get_data("history") or [], today
@@ -2089,7 +2110,7 @@ class HdskyDiceBetNatural(_PluginBase):
                     f"{self.LOG_TAG}拟人进帖停顿 {delay}s 后下注 "
                     f"主题#{topic['topic_id']}"
                 )
-                if self._cancel.wait(delay):
+                if self._wait(delay):
                     return "任务已取消，未进行后续下注"
 
             logger.info(
@@ -2098,7 +2119,7 @@ class HdskyDiceBetNatural(_PluginBase):
                 f"(开奖 {topic.get('draw_time')}, 间隔 {self._reply_interval}s)"
             )
             for idx, (bet_type, amount) in enumerate(todo):
-                if self._cancel.is_set() or self._auth_failed:
+                if self._is_cancelled() or self._auth_failed:
                     return "任务已取消或 Cookie 失效，停止后续下注"
                 if self._max_daily_bets is not None and self._count_bets_on(
                     self.get_data("history") or [], today
@@ -2119,7 +2140,7 @@ class HdskyDiceBetNatural(_PluginBase):
                         f"{self.LOG_TAG}同帖多注等待 {wait_s}s "
                         f"后继续 {bet_type} {amount}"
                     )
-                    if self._cancel.wait(wait_s):
+                    if self._wait(wait_s):
                         return "任务已取消，未进行后续下注"
                 ok_bonus, low_msg = self._bonus_allows_bet(int(amount))
                 if not ok_bonus:
@@ -2247,7 +2268,7 @@ class HdskyDiceBetNatural(_PluginBase):
         if not self._site_id:
             return False, "未选择站点，请在配置中选择天空"
         sites = self._list_hdsky_sites()
-        site = next((s for s in sites if int(s.get("id")) == int(self._site_id)), None)
+        site = next((s for s in sites if self._normalize_site_id(s.get("id")) == self._site_id), None)
         if not site:
             # 兜底：直接 SiteOper
             try:
@@ -2317,7 +2338,7 @@ class HdskyDiceBetNatural(_PluginBase):
         }
 
     def _get(self, path: str, referer: Optional[str] = None) -> Optional[str]:
-        if self._cancel.is_set() or self._auth_failed:
+        if self._is_cancelled() or self._auth_failed:
             return None
         url = path if path.startswith("http") else urljoin(self.BASE_URL + "/", path.lstrip("/"))
         if not self._allowed_url(url):
@@ -2330,7 +2351,7 @@ class HdskyDiceBetNatural(_PluginBase):
             proxies=self._proxies(),
             timeout=30,
             headers=headers,
-        ).get_res(url=url)
+        ).get_res(url=url, allow_redirects=False)
         if not res or res.status_code != 200:
             logger.warning(f"{self.LOG_TAG}GET 失败 {url}: {getattr(res, 'status_code', None)}")
             return None
@@ -2344,7 +2365,7 @@ class HdskyDiceBetNatural(_PluginBase):
         return text
 
     def _post(self, path: str, data: Any, referer: Optional[str] = None) -> Optional[str]:
-        if self._cancel.is_set() or self._auth_failed:
+        if self._is_cancelled() or self._auth_failed:
             return None
         url = path if path.startswith("http") else urljoin(self.BASE_URL + "/", path.lstrip("/"))
         if not self._allowed_url(url):
@@ -2362,7 +2383,7 @@ class HdskyDiceBetNatural(_PluginBase):
             proxies=self._proxies(),
             timeout=30,
             headers=headers,
-        ).post_res(url=url, data=data)
+        ).post_res(url=url, data=data, allow_redirects=False)
         if not res or res.status_code != 200:
             logger.warning(f"{self.LOG_TAG}POST 无明确成功响应，停止本轮后续下注")
             return None
@@ -2729,6 +2750,13 @@ class HdskyDiceBetNatural(_PluginBase):
             )
         return posts
 
+    @staticmethod
+    def _same_bet_amount(bet: dict, amount: int) -> bool:
+        try:
+            return int(bet.get("amount")) == int(amount)
+        except (ValueError, TypeError):
+            return False
+
     def _post_bet(self, topic_id: str, bet_type: str, amount: int) -> Tuple[bool, str]:
         body = f"{bet_type} {amount}"
         topic_path = (
@@ -2752,9 +2780,11 @@ class HdskyDiceBetNatural(_PluginBase):
         detail = self._fetch_topic_detail(topic_id, max_pages=2)
         if detail:
             for sb in detail.get("self_bets") or []:
-                if sb.get("bet_type") == bet_type:
+                if sb.get("bet_type") == bet_type and self._same_bet_amount(sb, amount):
                     return True, "ok"
-            if detail.get("self_bet") and detail["self_bet"].get("bet_type") == bet_type:
+            if (detail.get("self_bet")
+                    and detail["self_bet"].get("bet_type") == bet_type
+                    and self._same_bet_amount(detail["self_bet"], amount)):
                 return True, "ok"
         # 必须在帖内确认本人对应的下注，不把页面关键词当作写入成功。
         # 响应模糊时返回待核对，禁止本轮继续盲目下注。
@@ -3486,7 +3516,7 @@ class HdskyDiceBetNatural(_PluginBase):
             return
         low = max(0.0, float(low))
         high = max(low, float(high))
-        self._cancel.wait(random.uniform(low, high))
+        self._wait(random.uniform(low, high))
 
     def _humanize_amount(self, amount: int) -> int:
         if not self._humanize or self._amount_jitter_pct <= 0:
