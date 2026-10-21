@@ -21,6 +21,7 @@ from .ticket_inbox import TicketInboxError, parse_award_message, parse_boxes, pa
 import pytz
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 from app.sdk.config import settings
 from app.db.oper.site import SiteOper
@@ -37,7 +38,7 @@ class HdskyDiceBetNatural(_PluginBase):
     plugin_desc = "拟人化自动下注：抖动调度、开奖时间窗、进帖停顿、假浏览与短讯解耦"
     # 插件市场使用绝对地址，避免本仓库没有对应图标导致加载失败。
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/random.png"
-    plugin_version = "2.0.1"
+    plugin_version = "2.1.0"
     plugin_author = "Kuanghom"
     author_url = "https://github.com/Kuanghom"
     plugin_config_prefix = "hdskydicebetnatural_"
@@ -71,7 +72,7 @@ class HdskyDiceBetNatural(_PluginBase):
     RATING_PM_BOX_NAME = "论坛投注"
     TICKET_SCAN_MAX_PAGES = 10
     TICKET_SCAN_MAX_MESSAGES = 100
-    TICKET_CACHE_SECONDS = 300
+    TICKET_CACHE_SECONDS = 3600
     TICKET_AWARD_FOLDERS = ("抽奖", "论坛投注", "观影", "奖励", "投注")
     TOPIC_TITLE_RE = re.compile(
         r"本轮开奖时间:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})"
@@ -136,6 +137,8 @@ class HdskyDiceBetNatural(_PluginBase):
         self._generation = 0
         self._once_pending = False
         self._trigger = None
+        self._ticket_trigger = None
+        self._ticket_check_interval = 60
         self._config_error = ""
         self._auth_failed = False
         self._fixed_types = ["大"]
@@ -154,6 +157,7 @@ class HdskyDiceBetNatural(_PluginBase):
         self._cancel = threading.Event()
         self._generation += 1
         self._trigger = None
+        self._ticket_trigger = None
         self._config_error = ""
         self._once_pending = False
         self._auth_failed = False
@@ -163,6 +167,10 @@ class HdskyDiceBetNatural(_PluginBase):
         self._notify = bool(config.get("notify"))
         self._onlyonce = bool(config.get("onlyonce"))
         self._cron = (config.get("cron") or "*/5 * * * *").strip()
+        try:
+            self._ticket_check_interval = max(10, min(1440, int(config.get("ticket_check_interval", 60) or 60)))
+        except (TypeError, ValueError):
+            self._ticket_check_interval = 60
         self._site_id = self._normalize_site_id(config.get("site_id"))
         self._bet_mode = config.get("bet_mode") or "smart"
         self._fixed_types = self._parse_fixed_types(config)
@@ -241,6 +249,7 @@ class HdskyDiceBetNatural(_PluginBase):
         # V3 定时全部注册到 MP 宿主，避免私有调度器重复运行。
         try:
             self._trigger = CronTrigger.from_crontab(self._cron, timezone=settings.TZ)
+            self._ticket_trigger = IntervalTrigger(minutes=self._ticket_check_interval, timezone=settings.TZ)
         except (TypeError, ValueError) as exc:
             self._config_error = "Cron 表达式无效，请填写五段表达式"
             logger.warning(f"{self.LOG_TAG}{self._config_error}: {exc.__class__.__name__}")
@@ -1017,6 +1026,22 @@ class HdskyDiceBetNatural(_PluginBase):
                 },
             ]
         )
+        form_content.append({
+            "component": "VRow",
+            "content": [{
+                "component": "VCol", "props": {"cols": 12, "md": 4},
+                "content": [{
+                    "component": "VTextField",
+                    "props": {
+                        "model": "ticket_check_interval",
+                        "label": "观影券检查间隔（分钟）",
+                        "type": "number", "min": 10, "max": 1440,
+                        "hint": "独立检查，默认60分钟；达上限后当天不再自动执行",
+                        "persistent-hint": True,
+                    },
+                }],
+            }],
+        })
         return [
             {
                 "component": "VForm",
@@ -1042,6 +1067,7 @@ class HdskyDiceBetNatural(_PluginBase):
             "cron": "*/5 * * * *",
             "max_daily_bets": "",
             "max_daily_tickets": "",
+            "ticket_check_interval": 60,
             "stop_profit": "",
             "stop_loss": "",
             "smart_history_rounds": 50,
