@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, date
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, quote, urlsplit
 
-from .ticket_inbox import TicketInboxError, parse_award_message, parse_boxes, parse_mailbox
+from .ticket_inbox import (TicketInboxError, parse_award_message, parse_boxes, parse_mailbox, parse_helper_reward_count)
 
 import pytz
 from apscheduler.triggers.cron import CronTrigger
@@ -73,6 +73,8 @@ class HdskyDiceBetNatural(_PluginBase):
     TICKET_SCAN_MAX_PAGES = 10
     TICKET_SCAN_MAX_MESSAGES = 100
     TICKET_CACHE_SECONDS = 3600
+    # 固定辅助站目标；UI 只展示用户要求的“Emby 订阅地址”标签，不显示域名。
+    HELPER_REWARD_URL = "https://helper.hdsky.me/"
     TICKET_AWARD_FOLDERS = ("抽奖", "论坛投注", "观影", "奖励", "投注")
     TOPIC_TITLE_RE = re.compile(
         r"本轮开奖时间:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})"
@@ -139,6 +141,7 @@ class HdskyDiceBetNatural(_PluginBase):
         self._trigger = None
         self._ticket_trigger = None
         self._ticket_check_interval = 60
+        self._helper_cookie = ""
         self._config_error = ""
         self._auth_failed = False
         self._fixed_types = ["大"]
@@ -158,6 +161,7 @@ class HdskyDiceBetNatural(_PluginBase):
         self._generation += 1
         self._trigger = None
         self._ticket_trigger = None
+        self._helper_cookie = ""
         self._config_error = ""
         self._once_pending = False
         self._auth_failed = False
@@ -171,6 +175,7 @@ class HdskyDiceBetNatural(_PluginBase):
             self._ticket_check_interval = max(10, min(1440, int(config.get("ticket_check_interval", 60) or 60)))
         except (TypeError, ValueError):
             self._ticket_check_interval = 60
+        self._helper_cookie = str(config.get("helper_cookie") or "").strip()
         self._site_id = self._normalize_site_id(config.get("site_id"))
         self._bet_mode = config.get("bet_mode") or "smart"
         self._fixed_types = self._parse_fixed_types(config)
@@ -410,10 +415,11 @@ class HdskyDiceBetNatural(_PluginBase):
             if (status.get("date") == self._today_str() and status.get("verified") is True
                     and 0 <= age < self._ticket_check_interval * 60):
                 return
-            ok, msg = self._load_site_auth()
-            if not ok:
-                logger.warning(f"{self.LOG_TAG}观影券独立检查未执行：{msg}")
-                return
+            if not self._helper_cookie:
+                ok, msg = self._load_site_auth()
+                if not ok:
+                    logger.warning(f"{self.LOG_TAG}观影券独立检查未执行：{msg}")
+                    return
             self._refresh_today_tickets()
         except Exception as exc:
             logger.error(f"{self.LOG_TAG}独立观影券检查异常：{exc.__class__.__name__}")
@@ -1140,6 +1146,23 @@ class HdskyDiceBetNatural(_PluginBase):
         form_content.append({
             "component": "VRow",
             "content": [{
+                "component": "VCol", "props": {"cols": 12, "md": 6},
+                "content": [{
+                    "component": "VTextField",
+                    "props": {
+                        "model": "helper_cookie",
+                        "label": "Emby 订阅地址",
+                        "placeholder": "可选：粘贴辅助页面 Cookie",
+                        "type": "password",
+                        "hint": "填写后优先从辅助页面读取今日随机奖励；不填写则使用主站收件箱。Cookie 不会写入日志。",
+                        "persistent-hint": True,
+                    },
+                }],
+            }],
+        })
+        form_content.append({
+            "component": "VRow",
+            "content": [{
                 "component": "VCol", "props": {"cols": 12, "md": 4},
                 "content": [{
                     "component": "VTextField",
@@ -1179,6 +1202,7 @@ class HdskyDiceBetNatural(_PluginBase):
             "max_daily_bets": "",
             "max_daily_tickets": "",
             "ticket_check_interval": 60,
+            "helper_cookie": "",
             "stop_profit": "",
             "stop_loss": "",
             "smart_history_rounds": 50,
@@ -3597,14 +3621,19 @@ class HdskyDiceBetNatural(_PluginBase):
             return True
 
         try:
-            count, reward_ids, checked_ids, box_names = self._scan_ticket_mailboxes(today)
+            source = "helper" if self._helper_cookie else "inbox"
+            if self._helper_cookie:
+                count = self._scan_helper_reward_count()
+                reward_ids, checked_ids, box_names = set(), set(), ["Emby 订阅地址"]
+            else:
+                count, reward_ids, checked_ids, box_names = self._scan_ticket_mailboxes(today)
             days = dict(self.get_data("tickets_by_day") or {})
             days[today] = count
             cutoff = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=60)).strftime("%Y-%m-%d")
             self.save_data("tickets_by_day", {k: v for k, v in days.items() if k >= cutoff})
             stamp = self._now_str()
             self.save_data("ticket_inbox_status", {
-                "date": today, "verified": True, "count": count,
+                "date": today, "verified": True, "count": count, "source": source,
                 "reward_ids": sorted(reward_ids),
                 "checked_ids": sorted(checked_ids),
                 "checked_at": stamp, "checked_ts": time.time(),
@@ -3643,6 +3672,33 @@ class HdskyDiceBetNatural(_PluginBase):
         })
         logger.warning(f"{self.LOG_TAG}今日观影券未核实：{message}；未覆盖本地缓存")
         return False
+
+    def _scan_helper_reward_count(self) -> int:
+        """Read today's reward count from the separately authenticated helper site."""
+        if not self._helper_cookie:
+            raise TicketInboxError("未填写 Emby 订阅地址 Cookie")
+        if "\r" in self._helper_cookie or "\n" in self._helper_cookie:
+            raise TicketInboxError("Emby 订阅地址 Cookie 格式无效")
+        try:
+            response = RequestUtils(
+                cookies=self._helper_cookie,
+                proxies=self._proxies(),
+                timeout=15,
+                headers={
+                    "User-Agent": self._ua or self.DEFAULT_UA,
+                    "Accept": "text/html,application/xhtml+xml",
+                },
+            ).get_res(url=self.HELPER_REWARD_URL, allow_redirects=False)
+        except Exception as exc:
+            logger.warning(f"{self.LOG_TAG}辅助页面读取失败：{exc.__class__.__name__}")
+            raise TicketInboxError("Emby 订阅地址读取失败") from None
+        if response is None:
+            raise TicketInboxError("Emby 订阅地址无响应")
+        if response.status_code in (301, 302, 303, 307, 308):
+            raise TicketInboxError("Emby 订阅地址 Cookie 失效或需要重新登录")
+        if response.status_code != 200:
+            raise TicketInboxError(f"Emby 订阅地址 HTTP {response.status_code}")
+        return parse_helper_reward_count(response.text or "")
 
     def _scan_ticket_mailboxes(self, today: str) -> Tuple[int, set, set, List[str]]:
         """Scan inbox + dedicated archives; one confirmed award PM counts once.
