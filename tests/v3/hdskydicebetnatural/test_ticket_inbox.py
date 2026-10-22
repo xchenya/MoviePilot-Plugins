@@ -377,8 +377,9 @@ def test_expired_access_token_refreshes_and_persists_rotated_tokens():
     post = next(args for kind, args in calls if kind == "post")
     assert post["url"] == p.HELPER_REFRESH_URL
     assert post["json"] == {"refreshToken": "original-refresh-token"}
+    get_init = next(args for kind, args in reversed(calls) if kind == "init")
+    assert get_init["headers"]["Authorization"] == f"Bearer {new_access}"
     get = next(args for kind, args in calls if kind == "get")
-    assert get["headers"]["Authorization"] == f"Bearer {new_access}"
     assert p._helper_cookie == new_access
     assert p._helper_refresh_token == "rotated-refresh-token"
     assert p.config_saves[-1]["helper_cookie"] == new_access
