@@ -323,9 +323,12 @@ class HdskyDiceBetNatural(_PluginBase):
                 age = time.time() - float(status.get("checked_ts") or 0)
             except (TypeError, ValueError):
                 age = float("inf")
+            expected_source, expected_identity = self._ticket_source_identity()
             if (not self._daily_ticket_limit_reached()
                     and (status.get("date") != self._today_str()
                          or status.get("verified") is not True
+                         or status.get("source", "inbox") != expected_source
+                         or status.get("source_identity", "") != expected_identity
                          or age >= self._ticket_check_interval * 60)):
                 jobs.append({
                     "id": f"{self.__class__.__name__}.TicketInitial",
