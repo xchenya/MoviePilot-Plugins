@@ -255,6 +255,7 @@ def test_successful_independent_scan_marks_cap_and_stops_further_scans():
     assert p.data["tickets_by_day"][TODAY] == 2
     assert p.data["ticket_limit_reached"] == {
         "date": TODAY, "count": 2, "limit": 2,
+        "source": "inbox", "source_identity": "",
     }
     p._notify_daily_limit_stop.assert_called_once_with("tickets", 2, 2)
     count = p._get.call_count
