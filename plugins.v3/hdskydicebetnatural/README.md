@@ -2,7 +2,7 @@
 
 此插件移植自 [Kuanghom/MoviePilot-Plugins · hdskydicebetnatural](https://github.com/Kuanghom/MoviePilot-Plugins/tree/main/plugins.v2/hdskydicebetnatural)，原作者 **Kuanghom**，上游 V2 版本 1.0.3。
 
-- **当前版本**：2.3.0（MoviePilot V3 专用）
+- **当前版本**：2.4.0（MoviePilot V3 专用）
 - **宿主要求**：MoviePilot >= 3.0.0
 - **V3 适配维护**：xchenya，保留原作者署名和原插件类名 HdskyDiceBetNatural
 - **状态**：仅静态与模拟环境测试，尚未进行真实 HDSky 账号登录、下注或开奖联调
@@ -25,7 +25,7 @@
 
 https://github.com/xchenya/MoviePilot-Plugins
 
-刷新插件列表，安装「空论坛掷骰子（拟人）」，选择站点管理中的 HDSky（hdsky.me）。主站 Cookie、User-Agent 与代理选项从站点管理读取；若使用辅助奖励来源，还可单独填写「Emby 订阅 Cookie」。
+刷新插件列表，安装「空论坛掷骰子（拟人）」，选择站点管理中的 HDSky（hdsky.me）。主站 Cookie、User-Agent 与代理选项从站点管理读取；若使用辅助奖励来源需要填写「Emby 订阅 Access Token」和「Emby 订阅 Refresh Token」。
 
 **首次安装建议先不开启自动下注。** 先确认已正确选择站点、Cron、下注策略、魔力余额和每日次数上限。建议设置当日止盈、止损并从最小允许下注金额开始；自动下注不会保证正收益，倍投同样存在风险。
 
@@ -39,17 +39,20 @@ https://github.com/xchenya/MoviePilot-Plugins
 - 读取短讯详情可能触发 HDSky 站点自身的“标记已读”，本插件不会主动删除或移动短讯；原有“评分短讯自动归档”仍由独立开关决定。
 - **未进行真实账户联调**。如果站点使用了与 NexusPHP 通用页面不同的短讯 DOM / 奖励文本格式，需用脱敏后的收件箱 HTML 调整解析规则，不能把模拟测试视为真实计数验证。
 
-## 辅助奖励来源（v2.3.0）
+## 辅助奖励来源（v2.4.0）
 
-辅助站前端并非通过主站 Cookie 直接读取奖励。其浏览器代码调用只读 JSON API `/api/user/emby`，并在 `Authorization` 请求头中携带 `Bearer accessToken`。直接向网页根路径请求只会返回 JavaScript 应用壳；只发送 `c_secure_*` Cookie 调用 API 会得到 HTTP 401。
+辅助站前端使用只读 JSON API `/api/user/emby`，通过 `Authorization: Bearer accessToken` 认证。Access Token 的有效期约为 15 分钟，不能长期手动复用。
 
-因此，配置字段已改为 **「Emby 订阅 Token」**，需要填写辅助站登录后获取的 `accessToken`，不是主站 Cookie，也不是完整网址。
+配置页现在有两个独立字段：
 
-- 在浏览器中登录辅助站，打开开发者工具（F12）→ **Application / 应用** → **Local Storage / 本地存储** → 辅助站域名，找到 `accessToken` 并复制其值。
-- 将值粘贴到 MoviePilot 的「Emby 订阅 Token」配置栏并保存；不要把 Token 发到聊天、Issue 或日志里。
-- 插件只请求奖励查询 API，读取 JSON 字段 `data.todayRandomRewardCount`；不会调用取消订阅、恢复订阅或重置密码接口。
-- Token 不写入日志或统计记录。HTTP 401 会提示 Token 无效或过期；非 JSON、字段缺失及其他错误均不会被误判为 0。
-- 旧配置中若仍保存主站 Cookie，插件会明确提示它不是此 API 所需的认证凭据。未填写 Token 时可留空，继续使用主站收件箱统计方案。
+- **Emby 订阅 Access Token**：填写本地存储中的 `accessToken`。
+- **Emby 订阅 Refresh Token**：填写本地存储中的 `refreshToken`。
+
+获取方法：在已登录辅助页面打开浏览器开发者工具（F12）→ **Application / 应用** → **Local Storage / 本地存储** → 辅助站域名，分别复制这两个键的值。不要填写主站 `c_secure_*` Cookie，也不要把 Token 发到聊天、Issue 或日志里。
+
+插件在 Access Token 即将过期时会尝试刷新；若请求返回 HTTP 401，也会使用 Refresh Token 刷新后重试一次。辅助站可能在刷新时轮换两个 Token，插件会自动保存新的值。Token 不写入日志。若 Refresh Token 也已失效，需要重新登录辅助页面并重新填入两个 Token。
+
+只调用查询和刷新认证接口，不会调用取消订阅、恢复订阅或重置密码接口。若未填写辅助站 Token，则继续使用主站收件箱统计方案。
 
 ## 独立观影券检查（v2.1.0）
 
