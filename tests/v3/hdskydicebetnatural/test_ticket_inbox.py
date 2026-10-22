@@ -48,6 +48,7 @@ def _methods(*names):
         "parse_boxes": parser.parse_boxes,
         "parse_mailbox": parser.parse_mailbox,
         "parse_award_message": parser.parse_award_message,
+        "parse_helper_reward_count": parser.parse_helper_reward_count,
         "TicketInboxError": parser.TicketInboxError,
         "time": time, "datetime": datetime, "timedelta": timedelta,
         "Dict": Dict, "List": List, "Any": Any, "Optional": Optional, "Tuple": Tuple,
@@ -267,3 +268,68 @@ def test_new_day_clears_effect_of_yesterday_cap_without_extra_network():
     )
     assert p._refresh_today_tickets() is True
     assert p.data["tickets_by_day"][TODAY] == 2
+
+
+def test_helper_dashboard_reward_count_parser():
+    mod = _parser()
+    assert mod.parse_helper_reward_count("<table><tr><td>今日随机奖励3</td></tr></table>") == 3
+    assert mod.parse_helper_reward_count("<table><tr><td>今日随机奖励</td><td>2</td></tr></table>") == 2
+    assert mod.parse_helper_reward_count("<p>今日随机奖励：0</p>") == 0
+    with pytest.raises(mod.TicketInboxError):
+        mod.parse_helper_reward_count("<html><title>登录</title><p>请登录</p></html>")
+    with pytest.raises(mod.TicketInboxError):
+        mod.parse_helper_reward_count("<html><p>Emby 订阅正常</p></html>")
+
+
+def test_helper_scan_uses_separate_cookie_without_logging_it():
+    import requests  # Only used for a sentinel exception class; no network call is made.
+    fn = _class_method("_scan_helper_reward_count")
+    module = ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[]))
+    calls = []
+    class FakeRequestUtils:
+        def __init__(self, **kwargs):
+            calls.append(("init", kwargs))
+        def get_res(self, **kwargs):
+            calls.append(("get", kwargs))
+            return SimpleNamespace(status_code=200, text="<table><tr><td>今日随机奖励3</td></tr></table>")
+    namespace = {
+        "RequestUtils": FakeRequestUtils,
+        "TicketInboxError": _parser().TicketInboxError,
+        "parse_helper_reward_count": _parser().parse_helper_reward_count,
+        "logger": SimpleNamespace(warning=Mock()),
+    }
+    exec(compile(module, "<helper-scan>", "exec"), namespace)
+    fake = SimpleNamespace(
+        _helper_cookie="session=helper-secret",
+        _proxies=lambda: None, _ua="Test-UA", DEFAULT_UA="Test-UA",
+        HELPER_REWARD_URL="https://helper.hdsky.me/",
+        LOG_TAG="[test]",
+    )
+    assert namespace["_scan_helper_reward_count"](fake) == 3
+    assert calls[0][1]["cookies"] == "session=helper-secret"
+    assert calls[1][1]["allow_redirects"] is False
+    assert calls[1][1]["url"] == "https://helper.hdsky.me/"
+    assert "helper-secret" not in str(namespace["logger"].warning.call_args_list)
+
+
+def test_helper_scan_fails_closed_on_redirect_or_bad_status():
+    fn = _class_method("_scan_helper_reward_count")
+    module = ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[]))
+    class FakeRequestUtils:
+        status = 302
+        def __init__(self, **kwargs): pass
+        def get_res(self, **kwargs): return SimpleNamespace(status_code=self.status, text="")
+    namespace = {
+        "RequestUtils": FakeRequestUtils,
+        "TicketInboxError": _parser().TicketInboxError,
+        "parse_helper_reward_count": _parser().parse_helper_reward_count,
+        "logger": SimpleNamespace(warning=Mock()),
+    }
+    exec(compile(module, "<helper-scan>", "exec"), namespace)
+    fake = SimpleNamespace(_helper_cookie="session=secret", _proxies=lambda:None,
+        _ua="UA", DEFAULT_UA="UA", HELPER_REWARD_URL="https://helper.hdsky.me/", LOG_TAG="[test]")
+    with pytest.raises(_parser().TicketInboxError):
+        namespace["_scan_helper_reward_count"](fake)
+    FakeRequestUtils.status = 500
+    with pytest.raises(_parser().TicketInboxError):
+        namespace["_scan_helper_reward_count"](fake)
