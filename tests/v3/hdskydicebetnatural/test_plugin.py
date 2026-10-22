@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import hashlib
 import json
 import re
 import threading
@@ -54,6 +55,7 @@ class FakeBase:
         self.data = {}
         self.config_saves = []
         self._site_id = None
+        self._helper_cookie = ""
 
     def get_data(self, key):
         return self.data.get(key)
@@ -104,7 +106,10 @@ LOGGER = SimpleNamespace(
 
 def _isolate(*names):
     """Create only selected source methods inside a fake class and fake imports."""
-    body = [copy.deepcopy(_method(name)) for name in names]
+    method_names = list(names)
+    if any(name in method_names for name in ("_verified_ticket_count", "_daily_ticket_limit_reached", "_ticket_count_ready", "_refresh_today_tickets")) and "_ticket_source_identity" not in method_names:
+        method_names.append("_ticket_source_identity")
+    body = [copy.deepcopy(_method(name)) for name in method_names]
     node = ast.fix_missing_locations(
         ast.Module(body=[
             ast.ClassDef(
@@ -117,7 +122,7 @@ def _isolate(*names):
         ], type_ignores=[]),
     )
     namespace = {
-        "FakeBase": FakeBase, "threading": threading, "partial": partial,
+        "FakeBase": FakeBase, "threading": threading, "partial": partial, "hashlib": hashlib,
         "settings": SimpleNamespace(TZ="UTC"),
         "pytz": SimpleNamespace(timezone=lambda name: timezone.utc),
         "CronTrigger": FakeCron, "DateTrigger": FakeDate,
