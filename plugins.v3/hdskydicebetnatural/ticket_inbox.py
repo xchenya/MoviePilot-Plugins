@@ -172,21 +172,51 @@ def parse_award_message(html: str, *, today: str) -> tuple[str | None, bool]:
 
 
 def parse_helper_reward_count(html: str) -> int:
-    """Extract the helper dashboard's explicit '今日随机奖励 N' value."""
+    """Extract the authenticated helper dashboard's explicit daily reward count.
+
+    Keep failure messages diagnostic but never include cookies, request headers,
+    full page contents, usernames, or other account details.
+    """
     soup = BeautifulSoup(html or "", "html.parser")
-    # Reject login screens and generic error pages before looking for a number.
     title = soup.title.get_text(" ", strip=True) if soup.title else ""
-    if re.search(r"(?:登录|login|sign.?in)", title, re.I):
-        raise TicketInboxError("Emby 订阅地址 Cookie 无效或已过期")
     text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
+    lower = text.lower()
+
+    if not text:
+        raise TicketInboxError("Emby 订阅 Cookie 检查失败：辅助页面返回空内容")
+
+    if (
+        re.search(r"(?:登录|login|sign.?in)", title, re.I)
+        or re.search(r"(?:请先登录|请登录|登录后继续|账号登录|sign in to continue)", text, re.I)
+        or soup.select_one('input[type="password"]')
+    ):
+        raise TicketInboxError("Emby 订阅 Cookie 未通过认证或已过期；请重新复制登录后的 Cookie")
+
     patterns = (
-        r"今日随机奖励\s*[:：]?\s*(\d+)",
-        r"今日随机奖励.{0,20}?(\d+)",
+        r"今日\s*随机奖励\s*[:：]?\s*(\d+)",
+        r"今日\s*随机奖励.{0,20}?(\d+)",
     )
     for pattern in patterns:
         match = re.search(pattern, text)
         if match:
             return int(match.group(1))
-    if any(word in text.lower() for word in ("internal server error", "bad gateway", "服务暂不可用")):
+
+    if any(word in lower for word in ("internal server error", "bad gateway", "服务暂不可用")):
         raise TicketInboxError("Emby 订阅页面返回服务错误")
-    raise TicketInboxError("页面未找到“今日随机奖励”计数，无法核实观影券")
+
+    # Browser-visible helper dashboard has these stable account/dashboard labels.
+    # Their absence usually means the request got an app shell, an expired session,
+    # or an unexpected page rather than the authenticated dashboard.
+    has_account_marker = "主站用户" in text or re.search(r"\bUID\s*\d+", text, re.I) is not None
+    has_emby_marker = "Emby 订阅" in text
+    if not (has_account_marker and has_emby_marker):
+        raise TicketInboxError(
+            "未识别到已登录的 Emby 订阅页面；Cookie 可能不完整、已过期，"
+            f"或请求返回了不同页面（诊断：账号标记={int(has_account_marker)}，"
+            f"订阅标记={int(has_emby_marker)}，页面字符数={len(text)}，标题是否存在={int(bool(title))}）"
+        )
+
+    raise TicketInboxError(
+        "已识别到 Emby 订阅页面，但页面中没有可读取的“今日随机奖励”数字；"
+        f"可能是页面结构变化（诊断：奖励标签={int('今日随机奖励' in text)}，页面字符数={len(text)}）"
+    )

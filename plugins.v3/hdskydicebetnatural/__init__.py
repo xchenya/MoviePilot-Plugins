@@ -39,7 +39,7 @@ class HdskyDiceBetNatural(_PluginBase):
     plugin_desc = "拟人化自动下注：抖动调度、开奖时间窗、进帖停顿、假浏览与短讯解耦"
     # 插件市场使用绝对地址，避免本仓库没有对应图标导致加载失败。
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/random.png"
-    plugin_version = "2.2.0"
+    plugin_version = "2.2.1"
     plugin_author = "Kuanghom"
     author_url = "https://github.com/Kuanghom"
     plugin_config_prefix = "hdskydicebetnatural_"
@@ -1171,10 +1171,10 @@ class HdskyDiceBetNatural(_PluginBase):
                     "component": "VTextField",
                     "props": {
                         "model": "helper_cookie",
-                        "label": "Emby 订阅地址",
-                        "placeholder": "可选：粘贴辅助页面 Cookie",
+                        "label": "Emby 订阅 Cookie",
+                        "placeholder": "粘贴辅助页面 Cookie，不要填写网址",
                         "type": "password",
-                        "hint": "填写后优先从辅助页面读取今日随机奖励；不填写则使用主站收件箱。Cookie 不会写入日志。",
+                        "hint": "填写登录后的 Cookie 原文（name=value; name2=value2），不是网页地址。优先读取今日随机奖励；留空则使用主站收件箱。",
                         "persistent-hint": True,
                     },
                 }],
@@ -3703,9 +3703,9 @@ class HdskyDiceBetNatural(_PluginBase):
     def _scan_helper_reward_count(self) -> int:
         """Read today's reward count from the separately authenticated helper site."""
         if not self._helper_cookie:
-            raise TicketInboxError("未填写 Emby 订阅地址 Cookie")
+            raise TicketInboxError("未填写 Emby 订阅 Cookie")
         if "\r" in self._helper_cookie or "\n" in self._helper_cookie:
-            raise TicketInboxError("Emby 订阅地址 Cookie 格式无效")
+            raise TicketInboxError("Emby 订阅 Cookie 格式无效：请粘贴 Cookie 原文，不要包含换行")
         try:
             response = RequestUtils(
                 cookies=self._helper_cookie,
@@ -3718,11 +3718,11 @@ class HdskyDiceBetNatural(_PluginBase):
             ).get_res(url=self.HELPER_REWARD_URL, allow_redirects=False)
         except Exception as exc:
             logger.warning(f"{self.LOG_TAG}辅助页面读取失败：{exc.__class__.__name__}")
-            raise TicketInboxError("Emby 订阅地址读取失败") from None
+            raise TicketInboxError("Emby 订阅页面读取失败；请确认 Cookie 格式、有效期及网络连接") from None
         if response is None:
-            raise TicketInboxError("Emby 订阅地址无响应")
+            raise TicketInboxError("Emby 订阅页面无响应")
         if response.status_code in (301, 302, 303, 307, 308):
-            raise TicketInboxError("Emby 订阅地址 Cookie 失效或需要重新登录")
+            raise TicketInboxError("Emby 订阅 Cookie 未通过认证或需要重新登录")
         if response.status_code != 200:
             raise TicketInboxError(f"Emby 订阅地址 HTTP {response.status_code}")
         return parse_helper_reward_count(response.text or "")
