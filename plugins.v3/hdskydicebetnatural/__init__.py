@@ -6,6 +6,7 @@ V3 适配由 xchenya 维护；未经过真实 HDSky 帐号联调。
 """
 
 import math
+import hashlib
 import re
 import random
 import threading
@@ -38,7 +39,7 @@ class HdskyDiceBetNatural(_PluginBase):
     plugin_desc = "拟人化自动下注：抖动调度、开奖时间窗、进帖停顿、假浏览与短讯解耦"
     # 插件市场使用绝对地址，避免本仓库没有对应图标导致加载失败。
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/random.png"
-    plugin_version = "2.1.0"
+    plugin_version = "2.2.0"
     plugin_author = "Kuanghom"
     author_url = "https://github.com/Kuanghom"
     plugin_config_prefix = "hdskydicebetnatural_"
@@ -347,12 +348,22 @@ class HdskyDiceBetNatural(_PluginBase):
             })
         return jobs
 
+    def _ticket_source_identity(self) -> Tuple[str, str]:
+        if self._helper_cookie:
+            return "helper", hashlib.sha256(self._helper_cookie.encode("utf-8")).hexdigest()[:16]
+        return "inbox", ""
+
     def _verified_ticket_count(self) -> Optional[int]:
-        """Only confirmed today's inbox scan results may govern quota."""
+        """Only confirmed today's count from the currently configured source governs quota."""
         status = self.get_data("ticket_inbox_status") or {}
         if not isinstance(status, dict) or status.get("date") != self._today_str():
             return None
         if status.get("verified") is not True:
+            return None
+        expected_source, expected_identity = self._ticket_source_identity()
+        if status.get("source", "inbox") != expected_source:
+            return None
+        if status.get("source_identity", "") != expected_identity:
             return None
         try:
             return max(0, int(status["count"]))
@@ -369,11 +380,14 @@ class HdskyDiceBetNatural(_PluginBase):
         marker = self.get_data("ticket_limit_reached") or {}
         if not isinstance(marker, dict):
             return False
+        expected_source, expected_identity = self._ticket_source_identity()
         try:
             return (
                 marker.get("date") == self._today_str()
                 and int(marker.get("limit")) == self._max_daily_tickets
                 and int(marker.get("count")) >= self._max_daily_tickets
+                and marker.get("source", "inbox") == expected_source
+                and marker.get("source_identity", "") == expected_identity
             )
         except (TypeError, ValueError):
             return False
@@ -412,7 +426,10 @@ class HdskyDiceBetNatural(_PluginBase):
                 age = time.time() - float(status.get("checked_ts") or 0)
             except (TypeError, ValueError):
                 age = float("inf")
+            expected_source, expected_identity = self._ticket_source_identity()
             if (status.get("date") == self._today_str() and status.get("verified") is True
+                    and status.get("source", "inbox") == expected_source
+                    and status.get("source_identity", "") == expected_identity
                     and 0 <= age < self._ticket_check_interval * 60):
                 return
             if not self._helper_cookie:
@@ -3614,14 +3631,17 @@ class HdskyDiceBetNatural(_PluginBase):
         if self._daily_ticket_limit_reached():
             return True
         current = self.get_data("ticket_inbox_status") or {}
+        expected_source, expected_identity = self._ticket_source_identity()
         ttl = getattr(self, "_ticket_check_interval", max(1, self.TICKET_CACHE_SECONDS // 60)) * 60
         if (isinstance(current, dict)
                 and current.get("date") == today and current.get("verified") is True
+                and current.get("source", "inbox") == expected_source
+                and current.get("source_identity", "") == expected_identity
                 and time.time() - float(current.get("checked_ts") or 0) < ttl):
             return True
 
         try:
-            source = "helper" if self._helper_cookie else "inbox"
+            source, source_identity = self._ticket_source_identity()
             if self._helper_cookie:
                 count = self._scan_helper_reward_count()
                 reward_ids, checked_ids, box_names = set(), set(), ["Emby 订阅地址"]
@@ -3634,6 +3654,7 @@ class HdskyDiceBetNatural(_PluginBase):
             stamp = self._now_str()
             self.save_data("ticket_inbox_status", {
                 "date": today, "verified": True, "count": count, "source": source,
+                "source_identity": source_identity,
                 "reward_ids": sorted(reward_ids),
                 "checked_ids": sorted(checked_ids),
                 "checked_at": stamp, "checked_ts": time.time(),
@@ -3643,6 +3664,7 @@ class HdskyDiceBetNatural(_PluginBase):
             if self._max_daily_tickets is not None and count >= self._max_daily_tickets:
                 self.save_data("ticket_limit_reached", {
                     "date": today, "count": count, "limit": self._max_daily_tickets,
+                    "source": source, "source_identity": source_identity,
                 })
                 try:
                     self._notify_daily_limit_stop("tickets", count, self._max_daily_tickets)
@@ -3656,6 +3678,7 @@ class HdskyDiceBetNatural(_PluginBase):
             message = "短讯读取或解析异常"
         # Preserve already-confirmed IDs across transient failures. Do not
         # reinterpret stale legacy day totals as verified mailbox counts.
+        source, source_identity = self._ticket_source_identity()
         previous_ids = (
             list(current.get("reward_ids", []))
             if isinstance(current, dict) and current.get("date") == today else []
@@ -3665,7 +3688,8 @@ class HdskyDiceBetNatural(_PluginBase):
             if isinstance(current, dict) and current.get("date") == today else []
         )
         self.save_data("ticket_inbox_status", {
-            "date": today, "verified": False, "error": message[:120],
+            "date": today, "verified": False, "source": source, "source_identity": source_identity,
+            "error": message[:120],
             "checked_at": self._now_str(), "checked_ts": time.time(),
             "reward_ids": previous_ids,
             "checked_ids": previous_checked,
