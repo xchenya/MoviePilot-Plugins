@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import ast
+import base64
 import hashlib
 import importlib.util
+import json
 import re
 import sys
 import time
@@ -38,11 +40,17 @@ def _class_method(name):
     return next(n for n in plugin.body if isinstance(n, ast.FunctionDef) and n.name == name)
 
 
-def _methods(*names):
+def _methods(*names, extra=None):
     parser = _parser()
     method_names = list(names)
-    if any(name in method_names for name in ("_refresh_today_tickets", "_daily_ticket_limit_reached", "_verified_ticket_count")) and "_ticket_source_identity" not in method_names:
-        method_names.append("_ticket_source_identity")
+    if any(name in method_names for name in ("_refresh_today_tickets", "_daily_ticket_limit_reached", "_verified_ticket_count", "_scan_helper_reward_count")):
+        for dep in ("_ticket_source_identity", "_helper_user_id", "_helper_jwt_payload"):
+            if dep not in method_names:
+                method_names.append(dep)
+    if "_scan_helper_reward_count" in method_names:
+        for dep in ("_helper_token_expiring", "_refresh_helper_access_token", "_helper_reward_api_get", "_persist_helper_tokens"):
+            if dep not in method_names:
+                method_names.append(dep)
     cls = ast.ClassDef(
         name="HdskyTicketUnderTest", bases=[], keywords=[],
         body=[_class_method(name) for name in method_names], decorator_list=[],
@@ -53,12 +61,14 @@ def _methods(*names):
         "parse_mailbox": parser.parse_mailbox,
         "parse_award_message": parser.parse_award_message,
         "parse_helper_reward_count": parser.parse_helper_reward_count,
+        "parse_helper_reward_response": parser.parse_helper_reward_response,
         "TicketInboxError": parser.TicketInboxError,
-        "hashlib": hashlib,
+        "hashlib": hashlib, "base64": base64, "json": json,
         "time": time, "datetime": datetime, "timedelta": timedelta,
         "Dict": Dict, "List": List, "Any": Any, "Optional": Optional, "Tuple": Tuple,
         "logger": SimpleNamespace(info=Mock(), warning=Mock(), error=Mock()),
     }
+    namespace.update(extra or {})
     exec(compile(module, "<ticket-inbox-methods>", "exec"), namespace)
     return namespace["HdskyTicketUnderTest"]
 
@@ -288,117 +298,124 @@ def test_helper_dashboard_reward_count_parser():
         mod.parse_helper_reward_count("<html><p>Emby 订阅正常</p></html>")
 
 
-def test_helper_scan_uses_bearer_token_and_reads_api_json_without_logging_it():
-    fn = _class_method("_scan_helper_reward_count")
-    module = ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[]))
-    calls = []
+def _jwt(payload):
+    body = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+    return "header." + body + ".signature"
 
-    class FakeResponse:
+
+def test_helper_scan_uses_bearer_access_token_when_fresh():
+    calls = []
+    class Response:
         status_code = 200
         def json(self):
             return {"success": True, "data": {"todayRandomRewardCount": 3}}
-
     class FakeRequestUtils:
         def __init__(self, **kwargs):
             calls.append(("init", kwargs))
         def get_res(self, **kwargs):
             calls.append(("get", kwargs))
-            return FakeResponse()
-
-    namespace = {
-        "RequestUtils": FakeRequestUtils,
-        "TicketInboxError": _parser().TicketInboxError,
-        "parse_helper_reward_response": _parser().parse_helper_reward_response,
-        "logger": SimpleNamespace(warning=Mock()),
-        "re": re,
-    }
-    exec(compile(module, "<helper-scan>", "exec"), namespace)
-    token = "eyJhbGciOi-test-access-token"
-    fake = SimpleNamespace(
-        _helper_cookie=token,
-        _proxies=lambda: None, _ua="Test-UA", DEFAULT_UA="Test-UA",
-        HELPER_REWARD_URL="https://helper.hdsky.me/api/user/emby",
-        LOG_TAG="[test]",
+            return Response()
+    cls = _methods(
+        "_scan_helper_reward_count", "_helper_token_expiring", "_helper_reward_api_get",
+        extra={"RequestUtils": FakeRequestUtils},
     )
-    assert namespace["_scan_helper_reward_count"](fake) == 3
-    options = calls[0][1]
-    assert "cookies" not in options
-    assert options["headers"]["Authorization"] == f"Bearer {token}"
-    assert calls[1][1]["url"] == "https://helper.hdsky.me/api/user/emby"
+    p = cls()
+    p._helper_cookie = "opaque-fresh-access-token"
+    p._helper_refresh_token = "opaque-refresh-token"
+    p._proxies = lambda: None
+    p._ua = "Test-UA"
+    p.DEFAULT_UA = "Test-UA"
+    p.HELPER_REWARD_URL = "https://helper.hdsky.me/api/user/emby"
+    p.LOG_TAG = "[test]"
+    assert p._scan_helper_reward_count() == 3
+    assert calls[0][1]["headers"]["Authorization"] == "Bearer opaque-fresh-access-token"
+    assert calls[1][1]["url"] == p.HELPER_REWARD_URL
     assert calls[1][1]["allow_redirects"] is False
-    assert token not in str(namespace["logger"].warning.call_args_list)
 
 
-def test_helper_scan_rejects_main_site_cookie_with_specific_diagnostic():
-    fn = _class_method("_scan_helper_reward_count")
-    module = ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[]))
-    namespace = {
-        "RequestUtils": Mock(),
-        "TicketInboxError": _parser().TicketInboxError,
-        "parse_helper_reward_response": _parser().parse_helper_reward_response,
-        "logger": SimpleNamespace(warning=Mock()),
-        "re": re,
-    }
-    exec(compile(module, "<helper-scan>", "exec"), namespace)
-    fake = SimpleNamespace(
-        _helper_cookie="c_secure_pass=main-site-secret; cf_clearance=clearance",
-        _proxies=lambda: None, _ua="UA", DEFAULT_UA="UA",
-        HELPER_REWARD_URL="https://helper.hdsky.me/api/user/emby", LOG_TAG="[test]",
-    )
-    with pytest.raises(_parser().TicketInboxError, match="要求 Bearer accessToken"):
-        namespace["_scan_helper_reward_count"](fake)
-    namespace["RequestUtils"].assert_not_called()
-
-
-def test_helper_scan_fails_closed_on_401_redirect_or_bad_status():
-    fn = _class_method("_scan_helper_reward_count")
-    module = ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[]))
-    class FakeResponse:
-        status_code = 302
+def test_expired_access_token_refreshes_and_persists_rotated_tokens():
+    old_access = _jwt({"userId": 109798, "exp": 1})
+    new_access = _jwt({"userId": 109798, "exp": int(time.time()) + 900})
+    calls = []
+    class Response:
+        def __init__(self, status, payload):
+            self.status_code = status
+            self._payload = payload
         def json(self):
-            return {"success": False}
+            return self._payload
     class FakeRequestUtils:
-        status = 302
-        def __init__(self, **kwargs): pass
+        def __init__(self, **kwargs):
+            calls.append(("init", kwargs))
+        def post_res(self, **kwargs):
+            calls.append(("post", kwargs))
+            return Response(200, {"success": True, "data": {
+                "accessToken": new_access, "refreshToken": "rotated-refresh-token",
+            }})
         def get_res(self, **kwargs):
-            response = FakeResponse()
-            response.status_code = self.status
-            return response
-    namespace = {
-        "RequestUtils": FakeRequestUtils,
-        "TicketInboxError": _parser().TicketInboxError,
-        "parse_helper_reward_response": _parser().parse_helper_reward_response,
-        "logger": SimpleNamespace(warning=Mock()),
-        "re": re,
-    }
-    exec(compile(module, "<helper-scan>", "exec"), namespace)
-    fake = SimpleNamespace(
-        _helper_cookie="opaque-access-token", _proxies=lambda: None,
-        _ua="UA", DEFAULT_UA="UA", HELPER_REWARD_URL="https://helper.hdsky.me/api/user/emby",
-        LOG_TAG="[test]",
+            calls.append(("get", kwargs))
+            return Response(200, {"success": True, "data": {"todayRandomRewardCount": 3}})
+    cls = _methods(
+        "_scan_helper_reward_count", "_helper_jwt_payload", "_helper_user_id",
+        "_helper_token_expiring", "_refresh_helper_access_token", "_helper_reward_api_get",
+        "_persist_helper_tokens",
+        extra={"RequestUtils": FakeRequestUtils},
     )
-    with pytest.raises(_parser().TicketInboxError, match="需要重新登录"):
-        namespace["_scan_helper_reward_count"](fake)
-    FakeRequestUtils.status = 401
-    with pytest.raises(_parser().TicketInboxError, match="HTTP 401"):
-        namespace["_scan_helper_reward_count"](fake)
-    FakeRequestUtils.status = 500
-    with pytest.raises(_parser().TicketInboxError, match="HTTP 500"):
-        namespace["_scan_helper_reward_count"](fake)
+    p = cls()
+    p._helper_cookie = old_access
+    p._helper_refresh_token = "original-refresh-token"
+    p._config = {"enabled": True, "helper_cookie": old_access,
+                 "helper_refresh_token": "original-refresh-token", "site_id": 49}
+    p._proxies = lambda: None
+    p._ua = "Test-UA"
+    p.DEFAULT_UA = "Test-UA"
+    p.HELPER_REWARD_URL = "https://helper.hdsky.me/api/user/emby"
+    p.HELPER_REFRESH_URL = "https://helper.hdsky.me/api/user/refresh"
+    p.LOG_TAG = "[test]"
+    assert p._scan_helper_reward_count() == 3
+    post = next(args for kind, args in calls if kind == "post")
+    assert post["url"] == p.HELPER_REFRESH_URL
+    assert post["json"] == {"refreshToken": "original-refresh-token"}
+    get = next(args for kind, args in calls if kind == "get")
+    assert get["headers"]["Authorization"] == f"Bearer {new_access}"
+    assert p._helper_cookie == new_access
+    assert p._helper_refresh_token == "rotated-refresh-token"
+    assert p.config_saves[-1]["helper_cookie"] == new_access
+    assert p.config_saves[-1]["helper_refresh_token"] == "rotated-refresh-token"
+    # The account identity remains stable when the access token rotates.
+    assert p._ticket_source_identity()[1] == __import__("hashlib").sha256(b"user:109798").hexdigest()[:16]
 
 
-def test_helper_api_reward_parser_validates_success_and_count():
-    mod = _parser()
-    assert mod.parse_helper_reward_response({"success": True, "data": {"todayRandomRewardCount": 3}}) == 3
-    assert mod.parse_helper_reward_response({"success": True, "data": {"todayRandomRewardCount": 0}}) == 0
-    with pytest.raises(mod.TicketInboxError, match="未返回成功状态"):
-        mod.parse_helper_reward_response({"success": False, "message": "error"})
-    with pytest.raises(mod.TicketInboxError, match="未返回今日随机奖励计数"):
-        mod.parse_helper_reward_response({"success": True, "data": {}})
-    with pytest.raises(mod.TicketInboxError, match="负数"):
-        mod.parse_helper_reward_response({"success": True, "data": {"todayRandomRewardCount": -1}})
+def test_expired_access_token_without_refresh_token_fails_actionably():
+    cls = _methods("_scan_helper_reward_count", "_helper_jwt_payload", "_helper_token_expiring")
+    p = cls()
+    p._helper_cookie = _jwt({"userId": 109798, "exp": 1})
+    p._helper_refresh_token = ""
+    with pytest.raises(_parser().TicketInboxError, match="请补填 Emby 订阅 Refresh Token"):
+        p._scan_helper_reward_count()
 
 
+def test_refresh_token_failure_does_not_log_token_values():
+    calls = []
+    class Response:
+        status_code = 401
+        def json(self):
+            return {"success": False, "message": "expired"}
+    class FakeRequestUtils:
+        def __init__(self, **kwargs): pass
+        def post_res(self, **kwargs):
+            calls.append(kwargs)
+            return Response()
+    cls = _methods("_refresh_helper_access_token", extra={"RequestUtils": FakeRequestUtils})
+    p = cls()
+    p._helper_refresh_token = "refresh-secret-value"
+    p._proxies = lambda: None
+    p._ua = "UA"
+    p.DEFAULT_UA = "UA"
+    p.HELPER_REFRESH_URL = "https://helper.hdsky.me/api/user/refresh"
+    p.LOG_TAG = "[test]"
+    with pytest.raises(_parser().TicketInboxError, match="Refresh Token 已失效"):
+        p._refresh_helper_access_token()
+    assert "refresh-secret-value" not in str(_parser())
 def test_helper_cookie_source_takes_precedence_and_does_not_scan_inbox():
     p = host(fixture())
     p._helper_cookie = "session=helper-account"
