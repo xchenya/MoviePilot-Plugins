@@ -160,9 +160,9 @@
   },
   "HdskyDiceBetNatural": {
     "name": "空论坛掷骰子（拟人）",
-    "description": "HDSky 拟人化骰子下注；支持独立观影券核验，可选 Emby 订阅 Cookie 读取今日奖励并诊断认证/页面异常。",
+    "description": "HDSky 拟人化骰子下注；观影券从辅助站只读 API 读取，使用独立 Bearer accessToken。",
     "labels": "HDSky,论坛,下注,自动化,拟人",
-    "version": "2.2.1",
+    "version": "2.3.0",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/random.png",
     "author": "Kuanghom",
     "author_url": "https://github.com/Kuanghom/MoviePilot-Plugins/tree/main/plugins.v2/hdskydicebetnatural",
@@ -170,6 +170,7 @@
     "system_version": ">=3.0.0",
     "release": false,
     "history": {
+      "v2.3.0": "修复辅助奖励读取认证方式：改用 /api/user/emby JSON API 与 Bearer accessToken；主站 Cookie 会给出明确提示；配置项改名为“Emby 订阅 Token”。",
       "v2.2.1": "配置项名称改为“Emby 订阅 Cookie”；改进辅助页面错误诊断，区分 Cookie 未通过认证与奖励页面结构变化，不记录 Cookie 或页面隐私内容。",
       "v2.2.0": "新增独立辅助 Cookie 配置（界面标签为 Emby 订阅地址），优先读取辅助页面今日随机奖励；Cookie 不写日志，切换 Cookie 自动使旧统计缓存失效。",
       "v2.1.0": "观影券改为独立 IntervalTrigger，检查间隔默认60分钟可配置；每日额度确认达上限后停注并停止当天自动收件箱检查，次日自动恢复。",
