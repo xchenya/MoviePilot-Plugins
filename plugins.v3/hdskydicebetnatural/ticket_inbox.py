@@ -220,3 +220,28 @@ def parse_helper_reward_count(html: str) -> int:
         "已识别到 Emby 订阅页面，但页面中没有可读取的“今日随机奖励”数字；"
         f"可能是页面结构变化（诊断：奖励标签={int('今日随机奖励' in text)}，页面字符数={len(text)}）"
     )
+
+
+def parse_helper_reward_response(payload) -> int:
+    """Validate the helper API JSON and return its explicit daily reward count."""
+    if not isinstance(payload, dict):
+        raise TicketInboxError("辅助站 API 返回格式无效")
+    if payload.get("success") is not True:
+        # Do not echo arbitrary server text that could contain account details.
+        message = str(payload.get("message") or "").lower()
+        if "登录" in message or "过期" in message or "unauth" in message or "login" in message:
+            raise TicketInboxError("Emby 订阅 Token 无效或已过期，请重新登录后获取 accessToken")
+        raise TicketInboxError("辅助站 API 未返回成功状态")
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise TicketInboxError("辅助站 API 缺少奖励数据")
+    value = data.get("todayRandomRewardCount")
+    if isinstance(value, bool):
+        raise TicketInboxError("辅助站 API 的今日奖励计数格式无效")
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        raise TicketInboxError("辅助站 API 未返回今日随机奖励计数") from None
+    if count < 0:
+        raise TicketInboxError("辅助站 API 返回了负数奖励计数")
+    return count
