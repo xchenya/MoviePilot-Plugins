@@ -156,7 +156,7 @@ def test_market_and_source_metadata():
     }
     package = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))
     entry = package["HdskyDiceBetNatural"]
-    assert entry["version"] == attrs["plugin_version"] == "2.2.0"
+    assert entry["version"] == attrs["plugin_version"] == "2.2.1"
     assert entry["system_version"] == ">=3.0.0"
     assert entry["release"] is False
     assert attrs["plugin_author"] == "Kuanghom"
@@ -471,7 +471,7 @@ def test_checker_skips_if_betting_has_lock():
 def test_helper_cookie_is_separate_from_main_site_cookie_and_not_exposed_as_url():
     source = _source()
     assert 'model": "helper_cookie"' in source
-    assert 'label": "Emby 订阅地址"' in source
+    assert 'label": "Emby 订阅 Cookie"' in source
     assert 'HELPER_REWARD_URL = "https://helper.hdsky.me/"' in source
     assert "helper_cookie" in source
     # The UI label is the requested friendly name, not the actual hostname.
