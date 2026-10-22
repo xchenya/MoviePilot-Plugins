@@ -288,58 +288,115 @@ def test_helper_dashboard_reward_count_parser():
         mod.parse_helper_reward_count("<html><p>Emby 订阅正常</p></html>")
 
 
-def test_helper_scan_uses_separate_cookie_without_logging_it():
-    import requests  # Only used for a sentinel exception class; no network call is made.
+def test_helper_scan_uses_bearer_token_and_reads_api_json_without_logging_it():
     fn = _class_method("_scan_helper_reward_count")
     module = ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[]))
     calls = []
+
+    class FakeResponse:
+        status_code = 200
+        def json(self):
+            return {"success": True, "data": {"todayRandomRewardCount": 3}}
+
     class FakeRequestUtils:
         def __init__(self, **kwargs):
             calls.append(("init", kwargs))
         def get_res(self, **kwargs):
             calls.append(("get", kwargs))
-            return SimpleNamespace(status_code=200, text="<table><tr><td>今日随机奖励3</td></tr></table>")
+            return FakeResponse()
+
     namespace = {
         "RequestUtils": FakeRequestUtils,
         "TicketInboxError": _parser().TicketInboxError,
-        "parse_helper_reward_count": _parser().parse_helper_reward_count,
+        "parse_helper_reward_response": _parser().parse_helper_reward_response,
         "logger": SimpleNamespace(warning=Mock()),
+        "re": re,
     }
     exec(compile(module, "<helper-scan>", "exec"), namespace)
+    token = "eyJhbGciOi-test-access-token"
     fake = SimpleNamespace(
-        _helper_cookie="session=helper-secret",
+        _helper_cookie=token,
         _proxies=lambda: None, _ua="Test-UA", DEFAULT_UA="Test-UA",
-        HELPER_REWARD_URL="https://helper.hdsky.me/",
+        HELPER_REWARD_URL="https://helper.hdsky.me/api/user/emby",
         LOG_TAG="[test]",
     )
     assert namespace["_scan_helper_reward_count"](fake) == 3
-    assert calls[0][1]["cookies"] == "session=helper-secret"
+    options = calls[0][1]
+    assert "cookies" not in options
+    assert options["headers"]["Authorization"] == f"Bearer {token}"
+    assert calls[1][1]["url"] == "https://helper.hdsky.me/api/user/emby"
     assert calls[1][1]["allow_redirects"] is False
-    assert calls[1][1]["url"] == "https://helper.hdsky.me/"
-    assert "helper-secret" not in str(namespace["logger"].warning.call_args_list)
+    assert token not in str(namespace["logger"].warning.call_args_list)
 
 
-def test_helper_scan_fails_closed_on_redirect_or_bad_status():
+def test_helper_scan_rejects_main_site_cookie_with_specific_diagnostic():
     fn = _class_method("_scan_helper_reward_count")
     module = ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[]))
+    namespace = {
+        "RequestUtils": Mock(),
+        "TicketInboxError": _parser().TicketInboxError,
+        "parse_helper_reward_response": _parser().parse_helper_reward_response,
+        "logger": SimpleNamespace(warning=Mock()),
+        "re": re,
+    }
+    exec(compile(module, "<helper-scan>", "exec"), namespace)
+    fake = SimpleNamespace(
+        _helper_cookie="c_secure_pass=main-site-secret; cf_clearance=clearance",
+        _proxies=lambda: None, _ua="UA", DEFAULT_UA="UA",
+        HELPER_REWARD_URL="https://helper.hdsky.me/api/user/emby", LOG_TAG="[test]",
+    )
+    with pytest.raises(_parser().TicketInboxError, match="要求 Bearer accessToken"):
+        namespace["_scan_helper_reward_count"](fake)
+    namespace["RequestUtils"].assert_not_called()
+
+
+def test_helper_scan_fails_closed_on_401_redirect_or_bad_status():
+    fn = _class_method("_scan_helper_reward_count")
+    module = ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[]))
+    class FakeResponse:
+        status_code = 302
+        def json(self):
+            return {"success": False}
     class FakeRequestUtils:
         status = 302
         def __init__(self, **kwargs): pass
-        def get_res(self, **kwargs): return SimpleNamespace(status_code=self.status, text="")
+        def get_res(self, **kwargs):
+            response = FakeResponse()
+            response.status_code = self.status
+            return response
     namespace = {
         "RequestUtils": FakeRequestUtils,
         "TicketInboxError": _parser().TicketInboxError,
-        "parse_helper_reward_count": _parser().parse_helper_reward_count,
+        "parse_helper_reward_response": _parser().parse_helper_reward_response,
         "logger": SimpleNamespace(warning=Mock()),
+        "re": re,
     }
     exec(compile(module, "<helper-scan>", "exec"), namespace)
-    fake = SimpleNamespace(_helper_cookie="session=secret", _proxies=lambda:None,
-        _ua="UA", DEFAULT_UA="UA", HELPER_REWARD_URL="https://helper.hdsky.me/", LOG_TAG="[test]")
-    with pytest.raises(_parser().TicketInboxError):
+    fake = SimpleNamespace(
+        _helper_cookie="opaque-access-token", _proxies=lambda: None,
+        _ua="UA", DEFAULT_UA="UA", HELPER_REWARD_URL="https://helper.hdsky.me/api/user/emby",
+        LOG_TAG="[test]",
+    )
+    with pytest.raises(_parser().TicketInboxError, match="需要重新登录"):
+        namespace["_scan_helper_reward_count"](fake)
+    FakeRequestUtils.status = 401
+    with pytest.raises(_parser().TicketInboxError, match="HTTP 401"):
         namespace["_scan_helper_reward_count"](fake)
     FakeRequestUtils.status = 500
-    with pytest.raises(_parser().TicketInboxError):
+    with pytest.raises(_parser().TicketInboxError, match="HTTP 500"):
         namespace["_scan_helper_reward_count"](fake)
+
+
+def test_helper_api_reward_parser_validates_success_and_count():
+    mod = _parser()
+    assert mod.parse_helper_reward_response({"success": True, "data": {"todayRandomRewardCount": 3}}) == 3
+    assert mod.parse_helper_reward_response({"success": True, "data": {"todayRandomRewardCount": 0}}) == 0
+    with pytest.raises(mod.TicketInboxError, match="未返回成功状态"):
+        mod.parse_helper_reward_response({"success": False, "message": "error"})
+    with pytest.raises(mod.TicketInboxError, match="未返回今日随机奖励计数"):
+        mod.parse_helper_reward_response({"success": True, "data": {}})
+    with pytest.raises(mod.TicketInboxError, match="负数"):
+        mod.parse_helper_reward_response({"success": True, "data": {"todayRandomRewardCount": -1}})
 
 
 def test_helper_cookie_source_takes_precedence_and_does_not_scan_inbox():
