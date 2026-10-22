@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import importlib.util
 import re
 import sys
@@ -39,9 +40,12 @@ def _class_method(name):
 
 def _methods(*names):
     parser = _parser()
+    method_names = list(names)
+    if any(name in method_names for name in ("_refresh_today_tickets", "_daily_ticket_limit_reached", "_verified_ticket_count")) and "_ticket_source_identity" not in method_names:
+        method_names.append("_ticket_source_identity")
     cls = ast.ClassDef(
         name="HdskyTicketUnderTest", bases=[], keywords=[],
-        body=[_class_method(name) for name in names], decorator_list=[],
+        body=[_class_method(name) for name in method_names], decorator_list=[],
     )
     module = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
     namespace = {
@@ -50,6 +54,7 @@ def _methods(*names):
         "parse_award_message": parser.parse_award_message,
         "parse_helper_reward_count": parser.parse_helper_reward_count,
         "TicketInboxError": parser.TicketInboxError,
+        "hashlib": hashlib,
         "time": time, "datetime": datetime, "timedelta": timedelta,
         "Dict": Dict, "List": List, "Any": Any, "Optional": Optional, "Tuple": Tuple,
         "logger": SimpleNamespace(info=Mock(), warning=Mock(), error=Mock()),
@@ -110,6 +115,7 @@ def host(data):
     cls = _methods("_refresh_today_tickets", "_scan_ticket_mailboxes")
     p = cls()
     p.data = {"tickets_by_day": {TODAY: 0, "2026-10-20": 1}}
+    p._helper_cookie = ""
     p._today_str = lambda: TODAY
     p._now_str = lambda: TODAY + " 10:30:00"
     p._get = Mock(side_effect=lambda path: data.get(path))
