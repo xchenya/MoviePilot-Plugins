@@ -366,3 +366,28 @@ def test_changing_helper_cookie_invalidates_old_verified_count():
     assert p._refresh_today_tickets()
     assert p.data["tickets_by_day"][TODAY] == 1
     assert p.data["ticket_inbox_status"]["source"] == "helper"
+
+
+def test_helper_parser_distinguishes_cookie_auth_from_markup_change():
+    mod = _parser()
+    with pytest.raises(mod.TicketInboxError, match="Cookie 可能不完整、已过期"):
+        mod.parse_helper_reward_count(
+            "<html><title>HDSky Self Service</title><body><p>请先登录</p></body></html>"
+        )
+    with pytest.raises(mod.TicketInboxError, match="未识别到已登录的 Emby 订阅页面"):
+        mod.parse_helper_reward_count(
+            "<html><title>HDSky Self Service</title><body><p>应用载入中</p></body></html>"
+        )
+    with pytest.raises(mod.TicketInboxError, match="页面结构变化"):
+        mod.parse_helper_reward_count(
+            "<html><title>HDSky Self Service</title><body><p>主站用户 UID 123</p><p>Emby 订阅</p><p>奖励数据暂不可用</p></body></html>"
+        )
+
+
+def test_helper_parser_reads_counter_when_dashboard_layout_changes():
+    mod = _parser()
+    page = """<html><title>HDSky Self Service</title><body>
+      <section><span>主站用户</span><span>UID 109798</span></section>
+      <section><h2>Emby 订阅</h2><div class="stat"><span>今日随机奖励</span><strong>3</strong></div></section>
+    </body></html>"""
+    assert mod.parse_helper_reward_count(page) == 3
