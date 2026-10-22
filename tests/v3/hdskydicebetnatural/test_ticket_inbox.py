@@ -63,7 +63,7 @@ def _methods(*names, extra=None):
         "parse_helper_reward_count": parser.parse_helper_reward_count,
         "parse_helper_reward_response": parser.parse_helper_reward_response,
         "TicketInboxError": parser.TicketInboxError,
-        "hashlib": hashlib, "base64": base64, "json": json,
+        "hashlib": hashlib, "base64": base64, "json": json, "re": re,
         "time": time, "datetime": datetime, "timedelta": timedelta,
         "Dict": Dict, "List": List, "Any": Any, "Optional": Optional, "Tuple": Tuple,
         "logger": SimpleNamespace(info=Mock(), warning=Mock(), error=Mock()),
@@ -365,6 +365,8 @@ def test_expired_access_token_refreshes_and_persists_rotated_tokens():
     p._helper_refresh_token = "original-refresh-token"
     p._config = {"enabled": True, "helper_cookie": old_access,
                  "helper_refresh_token": "original-refresh-token", "site_id": 49}
+    p.config_saves = []
+    p.update_config = lambda value: (p.config_saves.append(dict(value)) or True)
     p._proxies = lambda: None
     p._ua = "Test-UA"
     p.DEFAULT_UA = "Test-UA"
@@ -413,9 +415,9 @@ def test_refresh_token_failure_does_not_log_token_values():
     p.DEFAULT_UA = "UA"
     p.HELPER_REFRESH_URL = "https://helper.hdsky.me/api/user/refresh"
     p.LOG_TAG = "[test]"
-    with pytest.raises(_parser().TicketInboxError, match="Refresh Token 已失效"):
+    with pytest.raises(_parser().TicketInboxError, match="Refresh Token 已失效") as exc:
         p._refresh_helper_access_token()
-    assert "refresh-secret-value" not in str(_parser())
+    assert "refresh-secret-value" not in str(exc.value)
 def test_helper_cookie_source_takes_precedence_and_does_not_scan_inbox():
     p = host(fixture())
     p._helper_cookie = "session=helper-account"
