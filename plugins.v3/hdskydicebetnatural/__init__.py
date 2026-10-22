@@ -6,6 +6,7 @@ V3 适配由 xchenya 维护；未经过真实 HDSky 帐号联调。
 """
 
 import math
+import hashlib
 import re
 import random
 import threading
@@ -16,7 +17,7 @@ from datetime import datetime, timedelta, date
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, quote, urlsplit
 
-from .ticket_inbox import TicketInboxError, parse_award_message, parse_boxes, parse_mailbox
+from .ticket_inbox import (TicketInboxError, parse_award_message, parse_boxes, parse_mailbox, parse_helper_reward_count)
 
 import pytz
 from apscheduler.triggers.cron import CronTrigger
@@ -38,7 +39,7 @@ class HdskyDiceBetNatural(_PluginBase):
     plugin_desc = "拟人化自动下注：抖动调度、开奖时间窗、进帖停顿、假浏览与短讯解耦"
     # 插件市场使用绝对地址，避免本仓库没有对应图标导致加载失败。
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/random.png"
-    plugin_version = "2.1.0"
+    plugin_version = "2.2.0"
     plugin_author = "Kuanghom"
     author_url = "https://github.com/Kuanghom"
     plugin_config_prefix = "hdskydicebetnatural_"
@@ -73,6 +74,8 @@ class HdskyDiceBetNatural(_PluginBase):
     TICKET_SCAN_MAX_PAGES = 10
     TICKET_SCAN_MAX_MESSAGES = 100
     TICKET_CACHE_SECONDS = 3600
+    # 固定辅助站目标；UI 只展示用户要求的“Emby 订阅地址”标签，不显示域名。
+    HELPER_REWARD_URL = "https://helper.hdsky.me/"
     TICKET_AWARD_FOLDERS = ("抽奖", "论坛投注", "观影", "奖励", "投注")
     TOPIC_TITLE_RE = re.compile(
         r"本轮开奖时间:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})"
@@ -139,6 +142,7 @@ class HdskyDiceBetNatural(_PluginBase):
         self._trigger = None
         self._ticket_trigger = None
         self._ticket_check_interval = 60
+        self._helper_cookie = ""
         self._config_error = ""
         self._auth_failed = False
         self._fixed_types = ["大"]
@@ -158,6 +162,7 @@ class HdskyDiceBetNatural(_PluginBase):
         self._generation += 1
         self._trigger = None
         self._ticket_trigger = None
+        self._helper_cookie = ""
         self._config_error = ""
         self._once_pending = False
         self._auth_failed = False
@@ -171,6 +176,7 @@ class HdskyDiceBetNatural(_PluginBase):
             self._ticket_check_interval = max(10, min(1440, int(config.get("ticket_check_interval", 60) or 60)))
         except (TypeError, ValueError):
             self._ticket_check_interval = 60
+        self._helper_cookie = str(config.get("helper_cookie") or "").strip()
         self._site_id = self._normalize_site_id(config.get("site_id"))
         self._bet_mode = config.get("bet_mode") or "smart"
         self._fixed_types = self._parse_fixed_types(config)
@@ -317,9 +323,12 @@ class HdskyDiceBetNatural(_PluginBase):
                 age = time.time() - float(status.get("checked_ts") or 0)
             except (TypeError, ValueError):
                 age = float("inf")
+            expected_source, expected_identity = self._ticket_source_identity()
             if (not self._daily_ticket_limit_reached()
                     and (status.get("date") != self._today_str()
                          or status.get("verified") is not True
+                         or status.get("source", "inbox") != expected_source
+                         or status.get("source_identity", "") != expected_identity
                          or age >= self._ticket_check_interval * 60)):
                 jobs.append({
                     "id": f"{self.__class__.__name__}.TicketInitial",
@@ -342,12 +351,22 @@ class HdskyDiceBetNatural(_PluginBase):
             })
         return jobs
 
+    def _ticket_source_identity(self) -> Tuple[str, str]:
+        if self._helper_cookie:
+            return "helper", hashlib.sha256(self._helper_cookie.encode("utf-8")).hexdigest()[:16]
+        return "inbox", ""
+
     def _verified_ticket_count(self) -> Optional[int]:
-        """Only confirmed today's inbox scan results may govern quota."""
+        """Only confirmed today's count from the currently configured source governs quota."""
         status = self.get_data("ticket_inbox_status") or {}
         if not isinstance(status, dict) or status.get("date") != self._today_str():
             return None
         if status.get("verified") is not True:
+            return None
+        expected_source, expected_identity = self._ticket_source_identity()
+        if status.get("source", "inbox") != expected_source:
+            return None
+        if status.get("source_identity", "") != expected_identity:
             return None
         try:
             return max(0, int(status["count"]))
@@ -364,11 +383,14 @@ class HdskyDiceBetNatural(_PluginBase):
         marker = self.get_data("ticket_limit_reached") or {}
         if not isinstance(marker, dict):
             return False
+        expected_source, expected_identity = self._ticket_source_identity()
         try:
             return (
                 marker.get("date") == self._today_str()
                 and int(marker.get("limit")) == self._max_daily_tickets
                 and int(marker.get("count")) >= self._max_daily_tickets
+                and marker.get("source", "inbox") == expected_source
+                and marker.get("source_identity", "") == expected_identity
             )
         except (TypeError, ValueError):
             return False
@@ -407,13 +429,17 @@ class HdskyDiceBetNatural(_PluginBase):
                 age = time.time() - float(status.get("checked_ts") or 0)
             except (TypeError, ValueError):
                 age = float("inf")
+            expected_source, expected_identity = self._ticket_source_identity()
             if (status.get("date") == self._today_str() and status.get("verified") is True
+                    and status.get("source", "inbox") == expected_source
+                    and status.get("source_identity", "") == expected_identity
                     and 0 <= age < self._ticket_check_interval * 60):
                 return
-            ok, msg = self._load_site_auth()
-            if not ok:
-                logger.warning(f"{self.LOG_TAG}观影券独立检查未执行：{msg}")
-                return
+            if not self._helper_cookie:
+                ok, msg = self._load_site_auth()
+                if not ok:
+                    logger.warning(f"{self.LOG_TAG}观影券独立检查未执行：{msg}")
+                    return
             self._refresh_today_tickets()
         except Exception as exc:
             logger.error(f"{self.LOG_TAG}独立观影券检查异常：{exc.__class__.__name__}")
@@ -1140,6 +1166,23 @@ class HdskyDiceBetNatural(_PluginBase):
         form_content.append({
             "component": "VRow",
             "content": [{
+                "component": "VCol", "props": {"cols": 12, "md": 6},
+                "content": [{
+                    "component": "VTextField",
+                    "props": {
+                        "model": "helper_cookie",
+                        "label": "Emby 订阅地址",
+                        "placeholder": "可选：粘贴辅助页面 Cookie",
+                        "type": "password",
+                        "hint": "填写后优先从辅助页面读取今日随机奖励；不填写则使用主站收件箱。Cookie 不会写入日志。",
+                        "persistent-hint": True,
+                    },
+                }],
+            }],
+        })
+        form_content.append({
+            "component": "VRow",
+            "content": [{
                 "component": "VCol", "props": {"cols": 12, "md": 4},
                 "content": [{
                     "component": "VTextField",
@@ -1179,6 +1222,7 @@ class HdskyDiceBetNatural(_PluginBase):
             "max_daily_bets": "",
             "max_daily_tickets": "",
             "ticket_check_interval": 60,
+            "helper_cookie": "",
             "stop_profit": "",
             "stop_loss": "",
             "smart_history_rounds": 50,
@@ -1212,8 +1256,8 @@ class HdskyDiceBetNatural(_PluginBase):
         month_pl = self._summarize_pl(history, "month")
         all_pl = self._summarize_pl(history, "all")
         ticket_status = self.get_data("ticket_inbox_status") or {}
-        verified = ticket_status.get("date") == today and ticket_status.get("verified") is True
-        tickets_today = int((self.get_data("tickets_by_day") or {}).get(today, 0)) if verified else None
+        tickets_today = self._verified_ticket_count()
+        verified = tickets_today is not None
         bets_today = self._count_bets_on(history, today)
         pending_cnt = sum(1 for h in history if h.get("profit") is None)
         win_rate = (
@@ -1432,8 +1476,10 @@ class HdskyDiceBetNatural(_PluginBase):
                         "今日观影券",
                         (str(tickets_today) if tickets_today is not None else "待核验")
                         + (f" / {self._max_daily_tickets}" if self._max_daily_tickets else ""),
-                        ("收件箱已核实 · " + str(ticket_status.get("checked_at", ""))[-8:])
-                        if verified else "收件箱未核实，不按 0 次处理",
+                        (
+                            ("辅助页面已核实 · " if ticket_status.get("source") == "helper" else "收件箱已核实 · ")
+                            + str(ticket_status.get("checked_at", ""))[-8:]
+                        ) if verified else "奖励来源未核实，不按 0 次处理",
                         "warning",
                         "mdi-ticket-confirmation",
                     ),
@@ -1836,11 +1882,8 @@ class HdskyDiceBetNatural(_PluginBase):
         day_pl = self._summarize_pl(history, "day")
         bets_today = self._count_bets_on(history, today)
         ticket_status = self.get_data("ticket_inbox_status") or {}
-        tickets_today = (
-            str(int((self.get_data("tickets_by_day") or {}).get(today, 0)))
-            if ticket_status.get("date") == today and ticket_status.get("verified") is True
-            else "待核验"
-        )
+        verified_count = self._verified_ticket_count()
+        tickets_today = str(verified_count) if verified_count is not None else "待核验"
         mode_map = {"fixed": "固定", "random": "随机", "smart": "智能", "martingale": "倍投", "manual": "手动"}
         mode_text = mode_map.get(str(record.get("mode")), str(record.get("mode")))
         limit_bet = f" / {self._max_daily_bets}" if self._max_daily_bets else ""
@@ -3590,30 +3633,41 @@ class HdskyDiceBetNatural(_PluginBase):
         if self._daily_ticket_limit_reached():
             return True
         current = self.get_data("ticket_inbox_status") or {}
+        expected_source, expected_identity = self._ticket_source_identity()
         ttl = getattr(self, "_ticket_check_interval", max(1, self.TICKET_CACHE_SECONDS // 60)) * 60
         if (isinstance(current, dict)
                 and current.get("date") == today and current.get("verified") is True
+                and current.get("source", "inbox") == expected_source
+                and current.get("source_identity", "") == expected_identity
                 and time.time() - float(current.get("checked_ts") or 0) < ttl):
             return True
 
         try:
-            count, reward_ids, checked_ids, box_names = self._scan_ticket_mailboxes(today)
+            source, source_identity = self._ticket_source_identity()
+            if self._helper_cookie:
+                count = self._scan_helper_reward_count()
+                reward_ids, checked_ids, box_names = set(), set(), ["Emby 订阅地址"]
+            else:
+                count, reward_ids, checked_ids, box_names = self._scan_ticket_mailboxes(today)
             days = dict(self.get_data("tickets_by_day") or {})
             days[today] = count
             cutoff = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=60)).strftime("%Y-%m-%d")
             self.save_data("tickets_by_day", {k: v for k, v in days.items() if k >= cutoff})
             stamp = self._now_str()
             self.save_data("ticket_inbox_status", {
-                "date": today, "verified": True, "count": count,
+                "date": today, "verified": True, "count": count, "source": source,
+                "source_identity": source_identity,
                 "reward_ids": sorted(reward_ids),
                 "checked_ids": sorted(checked_ids),
                 "checked_at": stamp, "checked_ts": time.time(),
                 "boxes": box_names,
             })
-            logger.info(f"{self.LOG_TAG}今日观影券已按站内收件箱核实：{count} 次；扫描 {len(box_names)} 个短讯箱")
+            source_name = "辅助页面" if source == "helper" else "站内收件箱"
+            logger.info(f"{self.LOG_TAG}今日观影券已按{source_name}核实：{count} 次")
             if self._max_daily_tickets is not None and count >= self._max_daily_tickets:
                 self.save_data("ticket_limit_reached", {
                     "date": today, "count": count, "limit": self._max_daily_tickets,
+                    "source": source, "source_identity": source_identity,
                 })
                 try:
                     self._notify_daily_limit_stop("tickets", count, self._max_daily_tickets)
@@ -3627,6 +3681,7 @@ class HdskyDiceBetNatural(_PluginBase):
             message = "短讯读取或解析异常"
         # Preserve already-confirmed IDs across transient failures. Do not
         # reinterpret stale legacy day totals as verified mailbox counts.
+        source, source_identity = self._ticket_source_identity()
         previous_ids = (
             list(current.get("reward_ids", []))
             if isinstance(current, dict) and current.get("date") == today else []
@@ -3636,13 +3691,41 @@ class HdskyDiceBetNatural(_PluginBase):
             if isinstance(current, dict) and current.get("date") == today else []
         )
         self.save_data("ticket_inbox_status", {
-            "date": today, "verified": False, "error": message[:120],
+            "date": today, "verified": False, "source": source, "source_identity": source_identity,
+            "error": message[:120],
             "checked_at": self._now_str(), "checked_ts": time.time(),
             "reward_ids": previous_ids,
             "checked_ids": previous_checked,
         })
         logger.warning(f"{self.LOG_TAG}今日观影券未核实：{message}；未覆盖本地缓存")
         return False
+
+    def _scan_helper_reward_count(self) -> int:
+        """Read today's reward count from the separately authenticated helper site."""
+        if not self._helper_cookie:
+            raise TicketInboxError("未填写 Emby 订阅地址 Cookie")
+        if "\r" in self._helper_cookie or "\n" in self._helper_cookie:
+            raise TicketInboxError("Emby 订阅地址 Cookie 格式无效")
+        try:
+            response = RequestUtils(
+                cookies=self._helper_cookie,
+                proxies=self._proxies(),
+                timeout=15,
+                headers={
+                    "User-Agent": self._ua or self.DEFAULT_UA,
+                    "Accept": "text/html,application/xhtml+xml",
+                },
+            ).get_res(url=self.HELPER_REWARD_URL, allow_redirects=False)
+        except Exception as exc:
+            logger.warning(f"{self.LOG_TAG}辅助页面读取失败：{exc.__class__.__name__}")
+            raise TicketInboxError("Emby 订阅地址读取失败") from None
+        if response is None:
+            raise TicketInboxError("Emby 订阅地址无响应")
+        if response.status_code in (301, 302, 303, 307, 308):
+            raise TicketInboxError("Emby 订阅地址 Cookie 失效或需要重新登录")
+        if response.status_code != 200:
+            raise TicketInboxError(f"Emby 订阅地址 HTTP {response.status_code}")
+        return parse_helper_reward_count(response.text or "")
 
     def _scan_ticket_mailboxes(self, today: str) -> Tuple[int, set, set, List[str]]:
         """Scan inbox + dedicated archives; one confirmed award PM counts once.

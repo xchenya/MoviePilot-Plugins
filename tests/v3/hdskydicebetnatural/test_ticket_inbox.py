@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import importlib.util
 import re
 import sys
@@ -39,16 +40,21 @@ def _class_method(name):
 
 def _methods(*names):
     parser = _parser()
+    method_names = list(names)
+    if any(name in method_names for name in ("_refresh_today_tickets", "_daily_ticket_limit_reached", "_verified_ticket_count")) and "_ticket_source_identity" not in method_names:
+        method_names.append("_ticket_source_identity")
     cls = ast.ClassDef(
         name="HdskyTicketUnderTest", bases=[], keywords=[],
-        body=[_class_method(name) for name in names], decorator_list=[],
+        body=[_class_method(name) for name in method_names], decorator_list=[],
     )
     module = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
     namespace = {
         "parse_boxes": parser.parse_boxes,
         "parse_mailbox": parser.parse_mailbox,
         "parse_award_message": parser.parse_award_message,
+        "parse_helper_reward_count": parser.parse_helper_reward_count,
         "TicketInboxError": parser.TicketInboxError,
+        "hashlib": hashlib,
         "time": time, "datetime": datetime, "timedelta": timedelta,
         "Dict": Dict, "List": List, "Any": Any, "Optional": Optional, "Tuple": Tuple,
         "logger": SimpleNamespace(info=Mock(), warning=Mock(), error=Mock()),
@@ -109,6 +115,7 @@ def host(data):
     cls = _methods("_refresh_today_tickets", "_scan_ticket_mailboxes")
     p = cls()
     p.data = {"tickets_by_day": {TODAY: 0, "2026-10-20": 1}}
+    p._helper_cookie = ""
     p._today_str = lambda: TODAY
     p._now_str = lambda: TODAY + " 10:30:00"
     p._get = Mock(side_effect=lambda path: data.get(path))
@@ -248,6 +255,7 @@ def test_successful_independent_scan_marks_cap_and_stops_further_scans():
     assert p.data["tickets_by_day"][TODAY] == 2
     assert p.data["ticket_limit_reached"] == {
         "date": TODAY, "count": 2, "limit": 2,
+        "source": "inbox", "source_identity": "",
     }
     p._notify_daily_limit_stop.assert_called_once_with("tickets", 2, 2)
     count = p._get.call_count
@@ -267,3 +275,94 @@ def test_new_day_clears_effect_of_yesterday_cap_without_extra_network():
     )
     assert p._refresh_today_tickets() is True
     assert p.data["tickets_by_day"][TODAY] == 2
+
+
+def test_helper_dashboard_reward_count_parser():
+    mod = _parser()
+    assert mod.parse_helper_reward_count("<table><tr><td>今日随机奖励3</td></tr></table>") == 3
+    assert mod.parse_helper_reward_count("<table><tr><td>今日随机奖励</td><td>2</td></tr></table>") == 2
+    assert mod.parse_helper_reward_count("<p>今日随机奖励：0</p>") == 0
+    with pytest.raises(mod.TicketInboxError):
+        mod.parse_helper_reward_count("<html><title>登录</title><p>请登录</p></html>")
+    with pytest.raises(mod.TicketInboxError):
+        mod.parse_helper_reward_count("<html><p>Emby 订阅正常</p></html>")
+
+
+def test_helper_scan_uses_separate_cookie_without_logging_it():
+    import requests  # Only used for a sentinel exception class; no network call is made.
+    fn = _class_method("_scan_helper_reward_count")
+    module = ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[]))
+    calls = []
+    class FakeRequestUtils:
+        def __init__(self, **kwargs):
+            calls.append(("init", kwargs))
+        def get_res(self, **kwargs):
+            calls.append(("get", kwargs))
+            return SimpleNamespace(status_code=200, text="<table><tr><td>今日随机奖励3</td></tr></table>")
+    namespace = {
+        "RequestUtils": FakeRequestUtils,
+        "TicketInboxError": _parser().TicketInboxError,
+        "parse_helper_reward_count": _parser().parse_helper_reward_count,
+        "logger": SimpleNamespace(warning=Mock()),
+    }
+    exec(compile(module, "<helper-scan>", "exec"), namespace)
+    fake = SimpleNamespace(
+        _helper_cookie="session=helper-secret",
+        _proxies=lambda: None, _ua="Test-UA", DEFAULT_UA="Test-UA",
+        HELPER_REWARD_URL="https://helper.hdsky.me/",
+        LOG_TAG="[test]",
+    )
+    assert namespace["_scan_helper_reward_count"](fake) == 3
+    assert calls[0][1]["cookies"] == "session=helper-secret"
+    assert calls[1][1]["allow_redirects"] is False
+    assert calls[1][1]["url"] == "https://helper.hdsky.me/"
+    assert "helper-secret" not in str(namespace["logger"].warning.call_args_list)
+
+
+def test_helper_scan_fails_closed_on_redirect_or_bad_status():
+    fn = _class_method("_scan_helper_reward_count")
+    module = ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[]))
+    class FakeRequestUtils:
+        status = 302
+        def __init__(self, **kwargs): pass
+        def get_res(self, **kwargs): return SimpleNamespace(status_code=self.status, text="")
+    namespace = {
+        "RequestUtils": FakeRequestUtils,
+        "TicketInboxError": _parser().TicketInboxError,
+        "parse_helper_reward_count": _parser().parse_helper_reward_count,
+        "logger": SimpleNamespace(warning=Mock()),
+    }
+    exec(compile(module, "<helper-scan>", "exec"), namespace)
+    fake = SimpleNamespace(_helper_cookie="session=secret", _proxies=lambda:None,
+        _ua="UA", DEFAULT_UA="UA", HELPER_REWARD_URL="https://helper.hdsky.me/", LOG_TAG="[test]")
+    with pytest.raises(_parser().TicketInboxError):
+        namespace["_scan_helper_reward_count"](fake)
+    FakeRequestUtils.status = 500
+    with pytest.raises(_parser().TicketInboxError):
+        namespace["_scan_helper_reward_count"](fake)
+
+
+def test_helper_cookie_source_takes_precedence_and_does_not_scan_inbox():
+    p = host(fixture())
+    p._helper_cookie = "session=helper-account"
+    p._scan_helper_reward_count = Mock(return_value=1)
+    p._scan_ticket_mailboxes = Mock(side_effect=AssertionError("inbox must not be scanned when helper Cookie is configured"))
+    assert p._refresh_today_tickets() is True
+    assert p.data["tickets_by_day"][TODAY] == 1
+    assert p.data["ticket_inbox_status"]["source"] == "helper"
+    assert p.data["ticket_inbox_status"]["source_identity"]
+    p._scan_helper_reward_count.assert_called_once()
+    p._scan_ticket_mailboxes.assert_not_called()
+
+
+def test_changing_helper_cookie_invalidates_old_verified_count():
+    p = host(fixture())
+    p._helper_cookie = ""
+    p._scan_ticket_mailboxes = Mock(return_value=(2, {"1", "2"}, {"1", "2"}, ["收件箱"]))
+    assert p._refresh_today_tickets()
+    assert p.data["ticket_inbox_status"]["source"] == "inbox"
+    p._helper_cookie = "session=other-account"
+    p._scan_helper_reward_count = Mock(return_value=1)
+    assert p._refresh_today_tickets()
+    assert p.data["tickets_by_day"][TODAY] == 1
+    assert p.data["ticket_inbox_status"]["source"] == "helper"

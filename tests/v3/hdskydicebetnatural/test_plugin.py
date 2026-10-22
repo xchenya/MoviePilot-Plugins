@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import hashlib
 import json
 import re
 import threading
@@ -54,6 +55,7 @@ class FakeBase:
         self.data = {}
         self.config_saves = []
         self._site_id = None
+        self._helper_cookie = ""
 
     def get_data(self, key):
         return self.data.get(key)
@@ -104,7 +106,10 @@ LOGGER = SimpleNamespace(
 
 def _isolate(*names):
     """Create only selected source methods inside a fake class and fake imports."""
-    body = [copy.deepcopy(_method(name)) for name in names]
+    method_names = list(names)
+    if any(name in method_names for name in ("_verified_ticket_count", "_daily_ticket_limit_reached", "_ticket_count_ready", "_refresh_today_tickets", "get_service")) and "_ticket_source_identity" not in method_names:
+        method_names.append("_ticket_source_identity")
+    body = [copy.deepcopy(_method(name)) for name in method_names]
     node = ast.fix_missing_locations(
         ast.Module(body=[
             ast.ClassDef(
@@ -117,7 +122,7 @@ def _isolate(*names):
         ], type_ignores=[]),
     )
     namespace = {
-        "FakeBase": FakeBase, "threading": threading, "partial": partial,
+        "FakeBase": FakeBase, "threading": threading, "partial": partial, "hashlib": hashlib,
         "settings": SimpleNamespace(TZ="UTC"),
         "pytz": SimpleNamespace(timezone=lambda name: timezone.utc),
         "CronTrigger": FakeCron, "DateTrigger": FakeDate,
@@ -151,7 +156,7 @@ def test_market_and_source_metadata():
     }
     package = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))
     entry = package["HdskyDiceBetNatural"]
-    assert entry["version"] == attrs["plugin_version"] == "2.1.0"
+    assert entry["version"] == attrs["plugin_version"] == "2.2.0"
     assert entry["system_version"] == ">=3.0.0"
     assert entry["release"] is False
     assert attrs["plugin_author"] == "Kuanghom"
@@ -461,3 +466,37 @@ def test_checker_skips_if_betting_has_lock():
     finally:
         p._run_lock.release()
     p._load_site_auth.assert_not_called()
+
+
+def test_helper_cookie_is_separate_from_main_site_cookie_and_not_exposed_as_url():
+    source = _source()
+    assert 'model": "helper_cookie"' in source
+    assert 'label": "Emby 订阅地址"' in source
+    assert 'HELPER_REWARD_URL = "https://helper.hdsky.me/"' in source
+    assert "helper_cookie" in source
+    # The UI label is the requested friendly name, not the actual hostname.
+    form = source[source.index('"model": "helper_cookie"') - 300:source.index('"model": "helper_cookie"') + 700]
+    assert "helper.hdsky.me" not in form
+    assert 'type": "password"' in form
+
+
+def test_helper_cookie_identity_invalidates_cached_count_and_daily_stop_marker():
+    cls = _isolate("_ticket_source_identity", "_verified_ticket_count",
+                   "_daily_ticket_limit_reached")
+    p = cls()
+    p._max_daily_tickets = 3
+    p._today_str = lambda: "2026-10-22"
+    p._helper_cookie = "session=first"
+    p.data["ticket_inbox_status"] = {
+        "date": "2026-10-22", "verified": True, "count": 3,
+        "source": "helper", "source_identity": __import__("hashlib").sha256(b"session=first").hexdigest()[:16],
+    }
+    p.data["ticket_limit_reached"] = {
+        "date": "2026-10-22", "limit": 3, "count": 3,
+        "source": "helper", "source_identity": __import__("hashlib").sha256(b"session=first").hexdigest()[:16],
+    }
+    assert p._verified_ticket_count() == 3
+    assert p._daily_ticket_limit_reached()
+    p._helper_cookie = "session=second"
+    assert p._verified_ticket_count() is None
+    assert not p._daily_ticket_limit_reached()

@@ -160,9 +160,9 @@
   },
   "HdskyDiceBetNatural": {
     "name": "空论坛掷骰子（拟人）",
-    "description": "HDSky 拟人化骰子下注，独立观影券核验（默认60分钟），当日额度已满自动停注停查。",
+    "description": "HDSky 拟人化骰子下注；支持独立观影券核验，并可选使用 Emby 订阅 Cookie 读取今日奖励。",
     "labels": "HDSky,论坛,下注,自动化,拟人",
-    "version": "2.1.0",
+    "version": "2.2.0",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/random.png",
     "author": "Kuanghom",
     "author_url": "https://github.com/Kuanghom/MoviePilot-Plugins/tree/main/plugins.v2/hdskydicebetnatural",
@@ -170,6 +170,7 @@
     "system_version": ">=3.0.0",
     "release": false,
     "history": {
+      "v2.2.0": "新增独立辅助 Cookie 配置（界面标签为 Emby 订阅地址），优先读取辅助页面今日随机奖励；Cookie 不写日志，切换 Cookie 自动使旧统计缓存失效。",
       "v2.1.0": "观影券改为独立 IntervalTrigger，检查间隔默认60分钟可配置；每日额度确认达上限后停注并停止当天自动收件箱检查，次日自动恢复。",
       "v2.0.1": "修复今日观影券误计：按收件箱及抽奖/论坛投注归档短讯核验，短讯 ID 去重、按接收日统计；失败不覆盖缓存、配额保护暂停下注，增加离线测试。",
       "v2.0.0": "MoviePilot V3 迁移：SDK/站点访问适配、宿主 Cron/单次任务、实例隔离、停止信号及精准下注确认；新增模拟测试，未经真实站点联调。",

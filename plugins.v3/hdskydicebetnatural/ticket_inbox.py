@@ -169,3 +169,24 @@ def parse_award_message(html: str, *, today: str) -> tuple[str | None, bool]:
             if detail_day:
                 break
     return detail_day, is_reward
+
+
+def parse_helper_reward_count(html: str) -> int:
+    """Extract the helper dashboard's explicit '今日随机奖励 N' value."""
+    soup = BeautifulSoup(html or "", "html.parser")
+    # Reject login screens and generic error pages before looking for a number.
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    if re.search(r"(?:登录|login|sign.?in)", title, re.I):
+        raise TicketInboxError("Emby 订阅地址 Cookie 无效或已过期")
+    text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
+    patterns = (
+        r"今日随机奖励\s*[:：]?\s*(\d+)",
+        r"今日随机奖励.{0,20}?(\d+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return int(match.group(1))
+    if any(word in text.lower() for word in ("internal server error", "bad gateway", "服务暂不可用")):
+        raise TicketInboxError("Emby 订阅页面返回服务错误")
+    raise TicketInboxError("页面未找到“今日随机奖励”计数，无法核实观影券")
