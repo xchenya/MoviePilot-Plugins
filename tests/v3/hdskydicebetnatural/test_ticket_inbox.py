@@ -339,3 +339,29 @@ def test_helper_scan_fails_closed_on_redirect_or_bad_status():
     FakeRequestUtils.status = 500
     with pytest.raises(_parser().TicketInboxError):
         namespace["_scan_helper_reward_count"](fake)
+
+
+def test_helper_cookie_source_takes_precedence_and_does_not_scan_inbox():
+    p = host(fixture())
+    p._helper_cookie = "session=helper-account"
+    p._scan_helper_reward_count = Mock(return_value=1)
+    p._scan_ticket_mailboxes = Mock(side_effect=AssertionError("inbox must not be scanned when helper Cookie is configured"))
+    assert p._refresh_today_tickets() is True
+    assert p.data["tickets_by_day"][TODAY] == 1
+    assert p.data["ticket_inbox_status"]["source"] == "helper"
+    assert p.data["ticket_inbox_status"]["source_identity"]
+    p._scan_helper_reward_count.assert_called_once()
+    p._scan_ticket_mailboxes.assert_not_called()
+
+
+def test_changing_helper_cookie_invalidates_old_verified_count():
+    p = host(fixture())
+    p._helper_cookie = ""
+    p._scan_ticket_mailboxes = Mock(return_value=(2, {"1", "2"}, {"1", "2"}, ["收件箱"]))
+    assert p._refresh_today_tickets()
+    assert p.data["ticket_inbox_status"]["source"] == "inbox"
+    p._helper_cookie = "session=other-account"
+    p._scan_helper_reward_count = Mock(return_value=1)
+    assert p._refresh_today_tickets()
+    assert p.data["tickets_by_day"][TODAY] == 1
+    assert p.data["ticket_inbox_status"]["source"] == "helper"
