@@ -3731,27 +3731,56 @@ class HdskyDiceBetNatural(_PluginBase):
         logger.warning(f"{self.LOG_TAG}今日观影券未核实：{message}；未覆盖本地缓存")
         return False
 
-    def _scan_helper_reward_count(self) -> int:
-        """Read the helper API using its Bearer accessToken, never the main-site Cookie."""
-        if not self._helper_cookie:
-            raise TicketInboxError("未填写 Emby 订阅 Token")
-        credential = self._helper_cookie.strip()
-        if "\r" in credential or "\n" in credential:
-            raise TicketInboxError("Emby 订阅 Token 格式无效：请粘贴 accessToken 原文")
-        # Keep the persisted config key for backward compatibility, but detect
-        # old Cookie values and explain why they cannot authenticate this API.
-        if ";" in credential or re.match(r"(?i)^(?:c_secure_[^=]*|cf_clearance|session|cookie)=\s*", credential):
-            raise TicketInboxError(
-                "你填写的是 Cookie；辅助站奖励接口要求 Bearer accessToken。"
-                "请在浏览器本地存储中复制 accessToken，不能使用主站 c_secure Cookie"
+    def _helper_jwt_payload(self, token: str) -> dict:
+        """Decode JWT metadata locally; never trust it for authorization."""
+        try:
+            parts = str(token or "").split(".")
+            if len(parts) != 3:
+                return {}
+            raw = parts[1]
+            raw += "=" * (-len(raw) % 4)
+            value = json.loads(base64.urlsafe_b64decode(raw.encode("ascii")).decode("utf-8"))
+            return value if isinstance(value, dict) else {}
+        except Exception:
+            return {}
+
+    def _helper_user_id(self, token: str) -> str:
+        """Stable cache identity across access/refresh-token rotation."""
+        user_id = self._helper_jwt_payload(token).get("userId")
+        return str(user_id) if user_id not in (None, "") else ""
+
+    def _helper_token_expiring(self, token: str) -> bool:
+        exp = self._helper_jwt_payload(token).get("exp")
+        try:
+            return int(exp) <= int(time.time()) + 60
+        except (TypeError, ValueError):
+            return False
+
+    def _persist_helper_tokens(self, access_token: str, refresh_token: str) -> None:
+        """Persist rotated credentials without logging their values."""
+        config = dict(getattr(self, "_config", {}) or {})
+        config["helper_cookie"] = access_token
+        config["helper_refresh_token"] = refresh_token
+        self._helper_cookie = access_token
+        self._helper_refresh_token = refresh_token
+        self._config = config
+        try:
+            if self.update_config(config) is False:
+                raise RuntimeError("config save returned false")
+        except Exception as exc:
+            logger.warning(
+                f"{self.LOG_TAG}辅助站 Token 已刷新，但配置持久化失败：{exc.__class__.__name__}"
             )
-        token = credential
-        if token.lower().startswith("bearer "):
-            token = token[7:].strip()
-        elif token.startswith("accessToken="):
-            token = token.split("=", 1)[1].strip()
-        if not token:
-            raise TicketInboxError("Emby 订阅 Token 为空")
+
+    def _refresh_helper_access_token(self) -> str:
+        """Rotate helper access/refresh tokens through the official refresh API."""
+        refresh_token = str(getattr(self, "_helper_refresh_token", "") or "").strip()
+        if not refresh_token:
+            raise TicketInboxError(
+                "accessToken 已过期，但未配置 Refresh Token；请补填 refreshToken 后即可自动续期"
+            )
+        if "\r" in refresh_token or "\n" in refresh_token or ";" in refresh_token:
+            raise TicketInboxError("Emby 订阅 Refresh Token 格式无效，请粘贴 refreshToken 原文")
         try:
             response = RequestUtils(
                 proxies=self._proxies(),
@@ -3759,22 +3788,107 @@ class HdskyDiceBetNatural(_PluginBase):
                 headers={
                     "User-Agent": self._ua or self.DEFAULT_UA,
                     "Accept": "application/json",
-                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
                     "Referer": "https://helper.hdsky.me/",
                 },
-            ).get_res(url=self.HELPER_REWARD_URL, allow_redirects=False)
+            ).post_res(
+                url=self.HELPER_REFRESH_URL,
+                json={"refreshToken": refresh_token},
+                allow_redirects=False,
+            )
+        except Exception as exc:
+            logger.warning(f"{self.LOG_TAG}辅助站 Token 刷新请求失败：{exc.__class__.__name__}")
+            raise TicketInboxError("辅助站 Token 刷新请求失败，请检查网络") from None
+        if response is None:
+            raise TicketInboxError("辅助站 Token 刷新接口无响应")
+        if response.status_code in (301, 302, 303, 307, 308):
+            raise TicketInboxError("辅助站 Refresh Token 未通过认证，请重新登录获取新 Token")
+        if response.status_code in (401, 403):
+            raise TicketInboxError("辅助站 Refresh Token 已失效，请重新登录并更新两个 Token")
+        if response.status_code != 200:
+            raise TicketInboxError(f"辅助站 Token 刷新接口 HTTP {response.status_code}")
+        try:
+            payload = response.json()
+        except Exception:
+            raise TicketInboxError("辅助站 Token 刷新接口未返回 JSON") from None
+        if not isinstance(payload, dict) or payload.get("success") is not True:
+            message = str(payload.get("message") or "").lower() if isinstance(payload, dict) else ""
+            if any(word in message for word in ("登录", "过期", "unauth", "refresh token", "token expired")):
+                raise TicketInboxError("辅助站 Refresh Token 已失效，请重新登录并更新两个 Token")
+            raise TicketInboxError("辅助站 Token 刷新失败；未返回成功状态")
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            raise TicketInboxError("辅助站 Token 刷新响应缺少 Token 数据")
+        new_access = str(data.get("accessToken") or "").strip()
+        new_refresh = str(data.get("refreshToken") or refresh_token).strip()
+        if not new_access:
+            raise TicketInboxError("辅助站 Token 刷新响应缺少 accessToken")
+        self._persist_helper_tokens(new_access, new_refresh)
+        return new_access
+
+    def _helper_reward_api_get(self, token: str):
+        """GET-only helper reward endpoint with explicit Bearer authentication."""
+        return RequestUtils(
+            proxies=self._proxies(),
+            timeout=15,
+            headers={
+                "User-Agent": self._ua or self.DEFAULT_UA,
+                "Accept": "application/json",
+                "Authorization": f"Bearer {token}",
+                "Referer": "https://helper.hdsky.me/",
+            },
+        ).get_res(url=self.HELPER_REWARD_URL, allow_redirects=False)
+
+    def _scan_helper_reward_count(self) -> int:
+        """Read today's reward count, refreshing short-lived access tokens as needed."""
+        if not self._helper_cookie:
+            raise TicketInboxError("未填写 Emby 订阅 Access Token")
+        credential = self._helper_cookie.strip()
+        if "\r" in credential or "\n" in credential:
+            raise TicketInboxError("Emby 订阅 Access Token 格式无效：请粘贴 accessToken 原文")
+        if ";" in credential or re.match(r"(?i)^(?:c_secure_[^=]*|cf_clearance|session|cookie)=\s*", credential):
+            raise TicketInboxError(
+                "你填写的是 Cookie；辅助站奖励接口要求 Bearer accessToken，不能使用主站 c_secure Cookie"
+            )
+        token = credential
+        if token.lower().startswith("bearer "):
+            token = token[7:].strip()
+        elif token.startswith("accessToken="):
+            token = token.split("=", 1)[1].strip()
+        if not token:
+            raise TicketInboxError("Emby 订阅 Access Token 为空")
+
+        if self._helper_token_expiring(token):
+            if not getattr(self, "_helper_refresh_token", ""):
+                raise TicketInboxError(
+                    "accessToken 已过期（有效期约15分钟）；请补填 Emby 订阅 Refresh Token 以启用自动续期"
+                )
+            token = self._refresh_helper_access_token()
+
+        try:
+            response = self._helper_reward_api_get(token)
         except Exception as exc:
             logger.warning(f"{self.LOG_TAG}辅助奖励 API 请求失败：{exc.__class__.__name__}")
             raise TicketInboxError("Emby 订阅奖励 API 请求失败；请检查网络") from None
         if response is None:
             raise TicketInboxError("Emby 订阅奖励 API 无响应")
         if response.status_code in (301, 302, 303, 307, 308):
-            raise TicketInboxError("Emby 订阅 Token 未通过认证或需要重新登录")
+            raise TicketInboxError("Emby 订阅 Access Token 未通过认证或需要重新登录")
         if response.status_code == 401:
-            raise TicketInboxError(
-                "辅助站返回 HTTP 401：accessToken 无效或已过期；"
-                "请重新登录辅助页面并复制最新 accessToken"
-            )
+            if not getattr(self, "_helper_refresh_token", ""):
+                raise TicketInboxError(
+                    "辅助站返回 HTTP 401：accessToken 无效或已过期；请补填 Refresh Token 启用自动续期"
+                )
+            token = self._refresh_helper_access_token()
+            try:
+                response = self._helper_reward_api_get(token)
+            except Exception as exc:
+                logger.warning(f"{self.LOG_TAG}辅助奖励 API 重试失败：{exc.__class__.__name__}")
+                raise TicketInboxError("Token 刷新后读取奖励接口失败") from None
+            if response is None:
+                raise TicketInboxError("Token 刷新后奖励 API 无响应")
+            if response.status_code == 401:
+                raise TicketInboxError("刷新后的 accessToken 仍未通过认证，请重新登录并更新两个 Token")
         if response.status_code == 403:
             raise TicketInboxError("辅助站返回 HTTP 403：当前 Token 无权读取奖励信息")
         if response.status_code != 200:
@@ -3783,6 +3897,19 @@ class HdskyDiceBetNatural(_PluginBase):
             payload = response.json()
         except Exception:
             raise TicketInboxError("辅助站奖励 API 未返回 JSON；请确认接口地址和登录状态") from None
+        if isinstance(payload, dict) and payload.get("success") is not True:
+            message = str(payload.get("message") or "").lower()
+            if any(word in message for word in ("登录", "过期", "unauth", "login", "token")):
+                if not getattr(self, "_helper_refresh_token", ""):
+                    raise TicketInboxError("辅助站未认证：请配置 Refresh Token 以自动续期")
+                token = self._refresh_helper_access_token()
+                response = self._helper_reward_api_get(token)
+                if response is None or response.status_code != 200:
+                    raise TicketInboxError("Token 刷新后仍无法读取奖励接口")
+                try:
+                    payload = response.json()
+                except Exception:
+                    raise TicketInboxError("Token 刷新后接口未返回 JSON") from None
         return parse_helper_reward_response(payload)
 
     def _scan_ticket_mailboxes(self, today: str) -> Tuple[int, set, set, List[str]]:
