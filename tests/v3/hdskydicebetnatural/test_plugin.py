@@ -466,3 +466,37 @@ def test_checker_skips_if_betting_has_lock():
     finally:
         p._run_lock.release()
     p._load_site_auth.assert_not_called()
+
+
+def test_helper_cookie_is_separate_from_main_site_cookie_and_not_exposed_as_url():
+    source = _source()
+    assert 'model": "helper_cookie"' in source
+    assert 'label": "Emby 订阅地址"' in source
+    assert 'HELPER_REWARD_URL = "https://helper.hdsky.me/"' in source
+    assert "helper_cookie" in source
+    # The UI label is the requested friendly name, not the actual hostname.
+    form = source[source.index('"model": "helper_cookie"') - 300:source.index('"model": "helper_cookie"') + 700]
+    assert "helper.hdsky.me" not in form
+    assert 'type": "password"' in form
+
+
+def test_helper_cookie_identity_invalidates_cached_count_and_daily_stop_marker():
+    cls = _isolate("_ticket_source_identity", "_verified_ticket_count",
+                   "_daily_ticket_limit_reached")
+    p = cls()
+    p._max_daily_tickets = 3
+    p._today_str = lambda: "2026-10-22"
+    p._helper_cookie = "session=first"
+    p.data["ticket_inbox_status"] = {
+        "date": "2026-10-22", "verified": True, "count": 3,
+        "source": "helper", "source_identity": __import__("hashlib").sha256(b"session=first").hexdigest()[:16],
+    }
+    p.data["ticket_limit_reached"] = {
+        "date": "2026-10-22", "limit": 3, "count": 3,
+        "source": "helper", "source_identity": __import__("hashlib").sha256(b"session=first").hexdigest()[:16],
+    }
+    assert p._verified_ticket_count() == 3
+    assert p._daily_ticket_limit_reached()
+    p._helper_cookie = "session=second"
+    assert p._verified_ticket_count() is None
+    assert not p._daily_ticket_limit_reached()
