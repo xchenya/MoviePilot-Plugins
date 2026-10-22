@@ -6,7 +6,9 @@ V3 适配由 xchenya 维护；未经过真实 HDSky 帐号联调。
 """
 
 import math
+import base64
 import hashlib
+import json
 import re
 import random
 import threading
@@ -39,7 +41,7 @@ class HdskyDiceBetNatural(_PluginBase):
     plugin_desc = "拟人化自动下注：抖动调度、开奖时间窗、进帖停顿、假浏览与短讯解耦"
     # 插件市场使用绝对地址，避免本仓库没有对应图标导致加载失败。
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/random.png"
-    plugin_version = "2.3.0"
+    plugin_version = "2.4.0"
     plugin_author = "Kuanghom"
     author_url = "https://github.com/Kuanghom"
     plugin_config_prefix = "hdskydicebetnatural_"
@@ -76,6 +78,7 @@ class HdskyDiceBetNatural(_PluginBase):
     TICKET_CACHE_SECONDS = 3600
     # 固定辅助站目标；UI 只展示用户要求的“Emby 订阅地址”标签，不显示域名。
     HELPER_REWARD_URL = "https://helper.hdsky.me/api/user/emby"
+    HELPER_REFRESH_URL = "https://helper.hdsky.me/api/user/refresh"
     TICKET_AWARD_FOLDERS = ("抽奖", "论坛投注", "观影", "奖励", "投注")
     TOPIC_TITLE_RE = re.compile(
         r"本轮开奖时间:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})"
@@ -143,6 +146,8 @@ class HdskyDiceBetNatural(_PluginBase):
         self._ticket_trigger = None
         self._ticket_check_interval = 60
         self._helper_cookie = ""
+        self._helper_refresh_token = ""
+        self._config = {}
         self._config_error = ""
         self._auth_failed = False
         self._fixed_types = ["大"]
@@ -163,11 +168,14 @@ class HdskyDiceBetNatural(_PluginBase):
         self._trigger = None
         self._ticket_trigger = None
         self._helper_cookie = ""
+        self._helper_refresh_token = ""
+        self._config = {}
         self._config_error = ""
         self._once_pending = False
         self._auth_failed = False
         self._last_referer = None
         config = dict(config or {})
+        self._config = dict(config)
         self._enabled = bool(config.get("enabled"))
         self._notify = bool(config.get("notify"))
         self._onlyonce = bool(config.get("onlyonce"))
@@ -177,6 +185,7 @@ class HdskyDiceBetNatural(_PluginBase):
         except (TypeError, ValueError):
             self._ticket_check_interval = 60
         self._helper_cookie = str(config.get("helper_cookie") or "").strip()
+        self._helper_refresh_token = str(config.get("helper_refresh_token") or "").strip()
         self._site_id = self._normalize_site_id(config.get("site_id"))
         self._bet_mode = config.get("bet_mode") or "smart"
         self._fixed_types = self._parse_fixed_types(config)
@@ -242,6 +251,7 @@ class HdskyDiceBetNatural(_PluginBase):
             if len(hdsky_sites) == 1:
                 self._site_id = int(hdsky_sites[0].get("id"))
                 config["site_id"] = self._site_id
+                self._config = dict(config)
                 self.update_config(config)
                 logger.info(f"{self.LOG_TAG}自动选中站点: {hdsky_sites[0].get('name')}#{self._site_id}")
 
@@ -265,6 +275,7 @@ class HdskyDiceBetNatural(_PluginBase):
             try:
                 if self.update_config(restored) is False:
                     raise RuntimeError("配置未保存")
+                self._config = dict(restored)
             except Exception as exc:
                 self._config_error = "立即运行开关复位失败，已取消执行"
                 logger.error(f"{self.LOG_TAG}{self._config_error}: {exc.__class__.__name__}")
@@ -353,7 +364,9 @@ class HdskyDiceBetNatural(_PluginBase):
 
     def _ticket_source_identity(self) -> Tuple[str, str]:
         if self._helper_cookie:
-            return "helper", hashlib.sha256(self._helper_cookie.encode("utf-8")).hexdigest()[:16]
+            identity = self._helper_user_id(self._helper_cookie)
+            key = f"user:{identity}" if identity else self._helper_cookie
+            return "helper", hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
         return "inbox", ""
 
     def _verified_ticket_count(self) -> Optional[int]:
@@ -1171,10 +1184,27 @@ class HdskyDiceBetNatural(_PluginBase):
                     "component": "VTextField",
                     "props": {
                         "model": "helper_cookie",
-                        "label": "Emby 订阅 Token",
+                        "label": "Emby 订阅 Access Token",
                         "placeholder": "粘贴辅助站 accessToken，不是主站 Cookie",
                         "type": "password",
-                        "hint": "辅助站 API 使用 Bearer accessToken，不接受主站 c_secure Cookie。请从已登录浏览器的本地存储复制 accessToken；留空则使用主站收件箱。Token 不会写入日志。",
+                        "hint": "有效期约15分钟；到期后插件会使用 Refresh Token 自动续期。请从辅助站本地存储复制 accessToken。",
+                        "persistent-hint": True,
+                    },
+                }],
+            }],
+        })
+        form_content.append({
+            "component": "VRow",
+            "content": [{
+                "component": "VCol", "props": {"cols": 12, "md": 6},
+                "content": [{
+                    "component": "VTextField",
+                    "props": {
+                        "model": "helper_refresh_token",
+                        "label": "Emby 订阅 Refresh Token",
+                        "placeholder": "粘贴辅助站 refreshToken",
+                        "type": "password",
+                        "hint": "与 Access Token 一起从辅助站 Local Storage 复制。刷新后服务端可能轮换两个 Token，插件会自动保存新值。",
                         "persistent-hint": True,
                     },
                 }],
@@ -1223,6 +1253,7 @@ class HdskyDiceBetNatural(_PluginBase):
             "max_daily_tickets": "",
             "ticket_check_interval": 60,
             "helper_cookie": "",
+            "helper_refresh_token": "",
             "stop_profit": "",
             "stop_loss": "",
             "smart_history_rounds": 50,
