@@ -107,7 +107,7 @@ LOGGER = SimpleNamespace(
 def _isolate(*names):
     """Create only selected source methods inside a fake class and fake imports."""
     method_names = list(names)
-    if any(name in method_names for name in ("_verified_ticket_count", "_daily_ticket_limit_reached", "_ticket_count_ready", "_refresh_today_tickets")) and "_ticket_source_identity" not in method_names:
+    if any(name in method_names for name in ("_verified_ticket_count", "_daily_ticket_limit_reached", "_ticket_count_ready", "_refresh_today_tickets", "get_service")) and "_ticket_source_identity" not in method_names:
         method_names.append("_ticket_source_identity")
     body = [copy.deepcopy(_method(name)) for name in method_names]
     node = ast.fix_missing_locations(
