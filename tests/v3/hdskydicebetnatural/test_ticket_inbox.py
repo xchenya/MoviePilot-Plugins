@@ -370,7 +370,7 @@ def test_changing_helper_cookie_invalidates_old_verified_count():
 
 def test_helper_parser_distinguishes_cookie_auth_from_markup_change():
     mod = _parser()
-    with pytest.raises(mod.TicketInboxError, match="Cookie 可能不完整、已过期"):
+    with pytest.raises(mod.TicketInboxError, match="Cookie 未通过认证或已过期"):
         mod.parse_helper_reward_count(
             "<html><title>HDSky Self Service</title><body><p>请先登录</p></body></html>"
         )
