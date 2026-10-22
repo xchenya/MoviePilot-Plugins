@@ -6,6 +6,7 @@ before any real HDSky login. The integration acceptance test is manual/opt-in.
 from __future__ import annotations
 
 import ast
+import base64
 import copy
 import hashlib
 import json
@@ -56,6 +57,8 @@ class FakeBase:
         self.config_saves = []
         self._site_id = None
         self._helper_cookie = ""
+        self._helper_refresh_token = ""
+        self._config = {}
 
     def get_data(self, key):
         return self.data.get(key)
@@ -107,8 +110,10 @@ LOGGER = SimpleNamespace(
 def _isolate(*names):
     """Create only selected source methods inside a fake class and fake imports."""
     method_names = list(names)
-    if any(name in method_names for name in ("_verified_ticket_count", "_daily_ticket_limit_reached", "_ticket_count_ready", "_refresh_today_tickets", "get_service")) and "_ticket_source_identity" not in method_names:
-        method_names.append("_ticket_source_identity")
+    if any(name in method_names for name in ("_verified_ticket_count", "_daily_ticket_limit_reached", "_ticket_count_ready", "_refresh_today_tickets", "get_service")):
+        for dep in ("_ticket_source_identity", "_helper_user_id", "_helper_jwt_payload"):
+            if dep not in method_names:
+                method_names.append(dep)
     body = [copy.deepcopy(_method(name)) for name in method_names]
     node = ast.fix_missing_locations(
         ast.Module(body=[
@@ -123,6 +128,7 @@ def _isolate(*names):
     )
     namespace = {
         "FakeBase": FakeBase, "threading": threading, "partial": partial, "hashlib": hashlib,
+        "base64": base64, "json": json,
         "settings": SimpleNamespace(TZ="UTC"),
         "pytz": SimpleNamespace(timezone=lambda name: timezone.utc),
         "CronTrigger": FakeCron, "DateTrigger": FakeDate,
@@ -156,7 +162,7 @@ def test_market_and_source_metadata():
     }
     package = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))
     entry = package["HdskyDiceBetNatural"]
-    assert entry["version"] == attrs["plugin_version"] == "2.3.0"
+    assert entry["version"] == attrs["plugin_version"] == "2.4.0"
     assert entry["system_version"] == ">=3.0.0"
     assert entry["release"] is False
     assert attrs["plugin_author"] == "Kuanghom"
@@ -471,7 +477,9 @@ def test_checker_skips_if_betting_has_lock():
 def test_helper_cookie_is_separate_from_main_site_cookie_and_not_exposed_as_url():
     source = _source()
     assert 'model": "helper_cookie"' in source
-    assert 'label": "Emby 订阅 Token"' in source
+    assert 'label": "Emby 订阅 Access Token"' in source
+    assert 'model": "helper_refresh_token"' in source
+    assert 'label": "Emby 订阅 Refresh Token"' in source
     assert 'HELPER_REWARD_URL = "https://helper.hdsky.me/api/user/emby"' in source
     assert "helper_cookie" in source
     # The UI label is the requested friendly name, not the actual hostname.
@@ -479,6 +487,7 @@ def test_helper_cookie_is_separate_from_main_site_cookie_and_not_exposed_as_url(
     assert "helper.hdsky.me" not in form
     assert 'type": "password"' in form
     assert "Bearer accessToken" in form
+    assert "Refresh Token" in source
 
 
 def test_helper_cookie_identity_invalidates_cached_count_and_daily_stop_marker():
