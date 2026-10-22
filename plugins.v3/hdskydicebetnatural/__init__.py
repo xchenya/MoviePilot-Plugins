@@ -1253,8 +1253,8 @@ class HdskyDiceBetNatural(_PluginBase):
         month_pl = self._summarize_pl(history, "month")
         all_pl = self._summarize_pl(history, "all")
         ticket_status = self.get_data("ticket_inbox_status") or {}
-        verified = ticket_status.get("date") == today and ticket_status.get("verified") is True
-        tickets_today = int((self.get_data("tickets_by_day") or {}).get(today, 0)) if verified else None
+        tickets_today = self._verified_ticket_count()
+        verified = tickets_today is not None
         bets_today = self._count_bets_on(history, today)
         pending_cnt = sum(1 for h in history if h.get("profit") is None)
         win_rate = (
@@ -1473,8 +1473,10 @@ class HdskyDiceBetNatural(_PluginBase):
                         "今日观影券",
                         (str(tickets_today) if tickets_today is not None else "待核验")
                         + (f" / {self._max_daily_tickets}" if self._max_daily_tickets else ""),
-                        ("收件箱已核实 · " + str(ticket_status.get("checked_at", ""))[-8:])
-                        if verified else "收件箱未核实，不按 0 次处理",
+                        (
+                            ("辅助页面已核实 · " if ticket_status.get("source") == "helper" else "收件箱已核实 · ")
+                            + str(ticket_status.get("checked_at", ""))[-8:]
+                        ) if verified else "奖励来源未核实，不按 0 次处理",
                         "warning",
                         "mdi-ticket-confirmation",
                     ),
@@ -1877,11 +1879,8 @@ class HdskyDiceBetNatural(_PluginBase):
         day_pl = self._summarize_pl(history, "day")
         bets_today = self._count_bets_on(history, today)
         ticket_status = self.get_data("ticket_inbox_status") or {}
-        tickets_today = (
-            str(int((self.get_data("tickets_by_day") or {}).get(today, 0)))
-            if ticket_status.get("date") == today and ticket_status.get("verified") is True
-            else "待核验"
-        )
+        verified_count = self._verified_ticket_count()
+        tickets_today = str(verified_count) if verified_count is not None else "待核验"
         mode_map = {"fixed": "固定", "random": "随机", "smart": "智能", "martingale": "倍投", "manual": "手动"}
         mode_text = mode_map.get(str(record.get("mode")), str(record.get("mode")))
         limit_bet = f" / {self._max_daily_bets}" if self._max_daily_bets else ""
@@ -3660,7 +3659,8 @@ class HdskyDiceBetNatural(_PluginBase):
                 "checked_at": stamp, "checked_ts": time.time(),
                 "boxes": box_names,
             })
-            logger.info(f"{self.LOG_TAG}今日观影券已按站内收件箱核实：{count} 次；扫描 {len(box_names)} 个短讯箱")
+            source_name = "辅助页面" if source == "helper" else "站内收件箱"
+            logger.info(f"{self.LOG_TAG}今日观影券已按{source_name}核实：{count} 次")
             if self._max_daily_tickets is not None and count >= self._max_daily_tickets:
                 self.save_data("ticket_limit_reached", {
                     "date": today, "count": count, "limit": self._max_daily_tickets,
