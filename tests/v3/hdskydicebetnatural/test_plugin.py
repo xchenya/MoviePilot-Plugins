@@ -486,7 +486,7 @@ def test_helper_cookie_is_separate_from_main_site_cookie_and_not_exposed_as_url(
     form = source[source.index('"model": "helper_cookie"') - 300:source.index('"model": "helper_cookie"') + 700]
     assert "helper.hdsky.me" not in form
     assert 'type": "password"' in form
-    assert "Bearer accessToken" in form
+    assert "有效期约15分钟" in form
     assert "Refresh Token" in source
 
 
