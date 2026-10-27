@@ -106,8 +106,8 @@ test('planting seed list keeps all crops and unlock status, separate steal Cron 
   const posts = []
   const api = {
     get: async url => {
-      if (url.endsWith('/steal-config')) return { auto_steal: true, steal_crops: ['萝卜'], steal_cron: '*/20 * * * *' }
-      if (url.endsWith('/config')) return { seed_id: '120', cron: '0 */4 * * *', ai_available: false, auto_steal: true, steal_crops: ['萝卜'], steal_cron: '*/20 * * * *' }
+      if (url.endsWith('/steal-config')) return { auto_steal: true, steal_crops: ['萝卜'], steal_cron: '*/20 * * * *', steal_refresh_count: 4 }
+      if (url.endsWith('/config')) return { seed_id: '120', cron: '0 */4 * * *', ai_available: false, auto_steal: true, steal_crops: ['萝卜'], steal_cron: '*/20 * * * *', steal_refresh_count: 4 }
       assert.ok(url.endsWith('/seeds'))
       return { success: true, seeds: [
         { id: 91, name: '萝卜', unlock_harvest: 0 },
@@ -117,9 +117,11 @@ test('planting seed list keeps all crops and unlock status, separate steal Cron 
     },
     post: async (url, data) => { posts.push([url, structuredClone(data)]); return { success: true, config: data } },
   }
-  const state = configHarness(api, { seed_id: '120', steal_crops: ['萝卜'], steal_cron: '*/30 * * * *' })
+  const state = configHarness(api, { seed_id: '120', steal_crops: ['萝卜'], steal_cron: '*/30 * * * *', steal_refresh_count: 2 })
   assert.equal('steal_cron' in state.config, false)
+  assert.equal('steal_refresh_count' in state.config, false)
   assert.equal(state.stealConfig.steal_cron, '*/30 * * * *')
+  assert.equal(state.stealConfig.steal_refresh_count, 2)
   await Promise.all([state.loadConfig(), state.loadSeeds(), state.loadStealConfig()])
   assert.deepEqual(state.seedOptions.value.map(s => [s.value, s.locked]),
     [['91', false], ['120', false], ['200', true]])
@@ -127,17 +129,20 @@ test('planting seed list keeps all crops and unlock status, separate steal Cron 
   assert.equal('steal_crops' in state.config, false)
   assert.equal('auto_steal' in state.config, false)
   assert.equal('steal_cron' in state.config, false)
+  assert.equal('steal_refresh_count' in state.config, false)
   assert.equal(state.stealConfig.steal_cron, '*/20 * * * *')
+  assert.equal(state.stealConfig.steal_refresh_count, 4)
   state.stealConfig.steal_crops = ['玉米', '樱桃']
   state.stealConfig.steal_cron = '*/10 * * * *'
+  state.stealConfig.steal_refresh_count = 5
   await state.saveStealConfig()
   state.stealConfig.steal_crops = []
   await state.saveStealConfig()
   await state.saveConfig()
   assert.equal(posts.length, 3)
   assert.deepEqual(posts.slice(0, 2), [
-    ['plugin/SiqiFram/steal-config', { auto_steal: true, steal_crops: ['玉米', '樱桃'], steal_cron: '*/10 * * * *' }],
-    ['plugin/SiqiFram/steal-config', { auto_steal: true, steal_crops: [], steal_cron: '*/10 * * * *' }],
+    ['plugin/SiqiFram/steal-config', { auto_steal: true, steal_crops: ['玉米', '樱桃'], steal_cron: '*/10 * * * *', steal_refresh_count: 5 }],
+    ['plugin/SiqiFram/steal-config', { auto_steal: true, steal_crops: [], steal_cron: '*/10 * * * *', steal_refresh_count: 5 }],
   ])
   assert.equal(posts[2][0], 'plugin/SiqiFram/config')
   assert.equal(posts[2][1].seed_id, '120')
@@ -145,22 +150,25 @@ test('planting seed list keeps all crops and unlock status, separate steal Cron 
   assert.equal('steal_crops' in posts[2][1], false)
   assert.equal('auto_steal' in posts[2][1], false)
   assert.equal('steal_cron' in posts[2][1], false)
+  assert.equal('steal_refresh_count' in posts[2][1], false)
   assert.equal(state.config.seed_id, '120')
   assert.equal(state.config.cron, '0 */4 * * *')
 })
 
-test('legacy steal configuration defaults to an independent fifteen minute Cron', async () => {
+test('legacy steal configuration defaults to a fifteen minute Cron and three target checks', async () => {
   const posts = []
   const state = configHarness({
     get: async () => ({ auto_steal: true, steal_crops: ['茄子'] }),
     post: async (url, data) => { posts.push([url, structuredClone(data)]); return { success: true, config: data } },
   })
   assert.equal(state.stealConfig.steal_cron, '*/15 * * * *')
+  assert.equal(state.stealConfig.steal_refresh_count, 3)
   await state.loadStealConfig()
   assert.equal(state.stealConfig.steal_cron, '*/15 * * * *')
+  assert.equal(state.stealConfig.steal_refresh_count, 3)
   await state.saveStealConfig()
   assert.deepEqual(posts, [
-    ['plugin/SiqiFram/steal-config', { auto_steal: true, steal_crops: ['茄子'], steal_cron: '*/15 * * * *' }],
+    ['plugin/SiqiFram/steal-config', { auto_steal: true, steal_crops: ['茄子'], steal_cron: '*/15 * * * *', steal_refresh_count: 3 }],
   ])
 })
 
@@ -169,7 +177,7 @@ test('save and run waits for saved steal settings, prevents duplicate clicks, an
   let finishSave
   let finishRun
   const state = configHarness({
-    get: async () => ({ auto_steal: false, steal_crops: ['茄子'], steal_cron: '*/15 * * * *' }),
+    get: async () => ({ auto_steal: false, steal_crops: ['茄子'], steal_cron: '*/15 * * * *', steal_refresh_count: 5 }),
     post: (url, data) => {
       posts.push([url, structuredClone(data)])
       return new Promise(resolve => {
@@ -186,7 +194,7 @@ test('save and run waits for saved steal settings, prevents duplicate clicks, an
   await state.saveStealConfig(true)
   await state.saveStealConfig()
   assert.deepEqual(posts, [
-    ['plugin/SiqiFram/steal-config', { auto_steal: false, steal_crops: ['茄子'], steal_cron: '*/15 * * * *' }],
+    ['plugin/SiqiFram/steal-config', { auto_steal: false, steal_crops: ['茄子'], steal_cron: '*/15 * * * *', steal_refresh_count: 5 }],
   ])
   finishSave({ success: true, config: posts[0][1] })
   await Promise.resolve()

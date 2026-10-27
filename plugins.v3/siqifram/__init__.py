@@ -100,6 +100,7 @@ class FarmConfig(BaseModel):
     auto_sell: bool = False
     auto_steal: bool = False
     steal_cron: str = "*/15 * * * *"
+    steal_refresh_count: int = 3
     steal_crops: List[str] = Field(default_factory=lambda: list(STEAL_CROPS))
     auto_like: bool = False
     use_proxy: bool = False
@@ -134,6 +135,7 @@ class ConfigResult(BaseModel):
 class StealConfig(BaseModel):
     auto_steal: bool = False
     steal_cron: str = "*/15 * * * *"
+    steal_refresh_count: int = 3
     steal_crops: List[str] = Field(default_factory=lambda: list(STEAL_CROPS))
 
 
@@ -190,7 +192,7 @@ class SiqiFram(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/KoWming/MoviePilot-Plugins/main/icons/siqi.png"
     # 插件版本
-    plugin_version = "2.2.2"
+    plugin_version = "2.2.3"
     # 插件作者
     plugin_author = "xchenya"
     # 作者主页
@@ -245,6 +247,7 @@ class SiqiFram(_PluginBase):
         self._stop_event = threading.Event()
         self._steal_crops = list(STEAL_CROPS)
         self._steal_cron = "*/15 * * * *"
+        self._steal_refresh_count = 3
         self._steal_target = {}
         self._resuming_steal = False
         self._steal_resumed_minute = None
@@ -308,6 +311,7 @@ class SiqiFram(_PluginBase):
                     self._auto_sell = self._to_bool(config.get("auto_sell", False))
                     self._auto_steal = self._to_bool(config.get("auto_steal", False))
                     self._steal_cron = self._normalize_cron(config.get("steal_cron"), "*/15 * * * *")
+                    self._steal_refresh_count = max(1, min(20, self._to_int(config.get("steal_refresh_count"), 3)))
                     self._auto_like = self._to_bool(config.get("auto_like", False))
                     self._use_proxy = self._to_bool(config.get("use_proxy", False))
                     self._use_ai_captcha = self._to_bool(config.get("use_ai_captcha", False))
@@ -490,6 +494,7 @@ class SiqiFram(_PluginBase):
             "auto_sell": self._auto_sell,
             "auto_steal": self._auto_steal,
             "steal_cron": self._steal_cron,
+            "steal_refresh_count": self._steal_refresh_count,
             "steal_crops": list(self._steal_crops),
             "auto_like": self._auto_like,
             "use_proxy": self._use_proxy,
@@ -508,6 +513,7 @@ class SiqiFram(_PluginBase):
         )
         config["cron"] = self._normalize_cron(config.get("cron"))
         config["steal_cron"] = self._normalize_cron(config.get("steal_cron"), "*/15 * * * *")
+        config["steal_refresh_count"] = max(1, min(20, self._to_int(config.get("steal_refresh_count"), 3)))
         config["harvest_delay_minutes"] = max(0, min(30, self._to_int(
             config.get("harvest_delay_minutes"), 2
         )))
@@ -523,6 +529,7 @@ class SiqiFram(_PluginBase):
 
     def _get_steal_config(self) -> Dict[str, Any]:
         return {"auto_steal": self._auto_steal, "steal_cron": self._steal_cron,
+                "steal_refresh_count": self._steal_refresh_count,
                 "steal_crops": list(self._steal_crops)}
 
     def _save_steal_config(self, config: dict = None) -> Dict[str, Any]:
@@ -1261,12 +1268,49 @@ class SiqiFram(_PluginBase):
         return result
 
     def _steal_once(self, payload: dict = None) -> Dict[str, Any]:
-        """自动寻找可偷作物，并按今日剩余可偷数量执行偷菜流程。"""
+        """无匹配作物时有限换目标，找到首个匹配即结束本轮。"""
+        attempts = []
+        limit = self._steal_refresh_count
+        result = {"success": False, "message": "农场插件已停止，本轮偷菜已中止"}
+        for _ in range(limit):
+            if self._stop_event.is_set():
+                result = {"success": False, "message": "农场插件已停止，本轮偷菜已中止"}
+                break
+            result = self._steal_one_target()
+            diagnostics = result.get("diagnostics")
+            summary = result.pop("diagnostic_summary", None)
+            if diagnostics:
+                attempts.append({**diagnostics, "summary": summary})
+            elif isinstance(result.get("victim"), dict) and result["victim"].get("victim_id"):
+                victim = result["victim"]
+                target_name = victim.get("victim_desc_name") or victim.get("victim_name") or "未提供名称"
+                attempts.append({"target_id": victim.get("victim_id"), "target_name": target_name,
+                                 "summary": f"目标：{target_name}（ID：{victim.get('victim_id')}）；尚未检查坑位"})
+            if not result.pop("no_matching_crops", False):
+                break
+            pause = self._get_steal_pause()
+            if pause and pause["resume_at"] > datetime.now(self._timezone()).timestamp():
+                break
+        message = result.get("msg") or result.get("message") or "偷菜检查完成"
+        message += f"；本轮已检查 {len(attempts)}/{limit} 个目标"
+        if attempts:
+            message += "\n" + "\n".join(f"第{index}个：{item['summary']}" for index, item in enumerate(attempts, 1))
+        if "msg" in result:
+            result["msg"] = message
+        return {**result, "message": message, "checked_targets": len(attempts),
+                "target_limit": limit, "attempts": attempts}
+
+    def _steal_one_target(self) -> Dict[str, Any]:
+        """每次使用新目标和实时额度；仅无匹配作物允许调用方续取目标。"""
         victim = self._get_steal_target()
         self._steal_target = {}  # 自动流程的快照不得在失败或超时后被手动重放。
         if not victim.get("success"):
             return victim
         victim_id = victim.get("victim_id")
+        if not victim_id:
+            return {"success": False, "message": "站点返回的偷菜目标无效，已停止本轮", "victim": victim}
+        if victim.get("can_steal") is not None and not self._to_bool(victim["can_steal"]):
+            return {"success": False, "message": "站点当前不允许偷菜，本轮跳过", "victim": victim}
         remaining = self._remaining_steals(victim)
         if remaining is None:
             return {"success": False, "message": "未能确认今日剩余可偷数量，已跳过偷菜", "victim": victim}
@@ -1315,7 +1359,8 @@ class SiqiFram(_PluginBase):
                    f"未成熟 {excluded['not_ready']}、已偷 {excluded['already_stolen']}")
         if not plots:
             return {"success": False,
-                    "message": f"本次目标农场未找到所选范围内的成熟作物，今日剩余可偷 {remaining} 个\n{details}",
+                    "message": f"本次目标农场未找到所选范围内的成熟作物，今日剩余可偷 {remaining} 个",
+                    "no_matching_crops": True, "diagnostic_summary": details,
                     "remaining_steals": remaining, "diagnostics": diagnostics, "victim": victim}
 
         logs = []
@@ -1345,10 +1390,10 @@ class SiqiFram(_PluginBase):
                 message += f"；结束会话失败：{finished.get('msg') or finished.get('message') or '站点未确认'}"
             return {"success": bool(finished.get("success")), "message": message, "logs": logs,
                     "stolen_count": success_count, "last_result": last_result,
-                    "diagnostics": diagnostics,
+                    "diagnostics": diagnostics, "diagnostic_summary": details,
                     "remaining_steals": self._remaining_steals(fresh) if fresh.get("success") else None}
         result = {"success": False, "message": last_result.get("msg") or last_result.get("message") or "偷菜失败",
-                  "logs": logs, "diagnostics": diagnostics, "victim": victim}
+                  "logs": logs, "diagnostics": diagnostics, "diagnostic_summary": details, "victim": victim}
         return result
 
     def _like_random(self, payload: dict = None) -> Dict[str, Any]:

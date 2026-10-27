@@ -6,7 +6,7 @@
           <v-icon icon="mdi-cog-outline" size="24" />
         </div>
         <div>
-          <div class="siqi-topbar__title">思齐农场 · 配置 · v2.2.2</div>
+          <div class="siqi-topbar__title">思齐农场 · 配置 · v2.2.3</div>
           <div class="siqi-topbar__sub">管理定时任务、自动化策略与站点 Cookie</div>
         </div>
       </div>
@@ -165,6 +165,15 @@
             class="siqi-input siqi-cron-field"
           />
         </div>
+        <v-text-field
+          v-model.number="stealConfig.steal_refresh_count"
+          label="每轮目标刷新次数"
+          type="number" min="1" max="20" step="1"
+          density="compact" variant="outlined"
+          hint="每轮最多检查的农场数量，包含首次获取；找到所选成熟作物后提前结束。此处刷新目标农场，不刷新网页。"
+          persistent-hint
+          class="siqi-input"
+        />
         <v-select
           v-model="stealConfig.steal_crops"
           :items="stealCropOptions"
@@ -190,9 +199,9 @@ import { reactive, ref, onMounted } from 'vue'
 const props = defineProps({ api: Object, pluginId: { type: String, default: 'SiqiFram' }, initialConfig: { type: Object, default: () => ({}) } })
 const emit = defineEmits(['switch', 'close', 'config-updated'])
 const stealCropOptions = ['萝卜', '西红柿', '玉米', '茄子', '蘑菇', '樱桃']
-const { auto_steal, steal_crops, steal_cron, ...initialPlantConfig } = props.initialConfig
+const { auto_steal, steal_crops, steal_cron, steal_refresh_count, ...initialPlantConfig } = props.initialConfig
 const config = reactive({ enabled: false, notify: true, cron: '5 */4 * * *', cookie: '', seed_id: '1', auto_plant: true, auto_harvest: true, auto_sell: false, auto_like: false, use_proxy: false, use_ai_captcha: false, harvest_delay_minutes: 2, retry_count: 2, retry_interval: 3, ...initialPlantConfig })
-const stealConfig = reactive({ auto_steal: !!auto_steal, steal_crops: Array.isArray(steal_crops) ? [...steal_crops] : [...stealCropOptions], steal_cron: steal_cron ?? '*/15 * * * *' })
+const stealConfig = reactive({ auto_steal: !!auto_steal, steal_crops: Array.isArray(steal_crops) ? [...steal_crops] : [...stealCropOptions], steal_cron: steal_cron ?? '*/15 * * * *', steal_refresh_count: steal_refresh_count ?? 3 })
 const loading = ref(false)
 const saving = ref(false)
 const configLoaded = ref(false)
@@ -228,7 +237,7 @@ async function loadConfig() {
   loading.value = true
   try {
     const res = await apiGet('/config')
-    const { auto_steal, steal_crops, steal_cron, ...plantConfig } = res
+    const { auto_steal, steal_crops, steal_cron, steal_refresh_count, ...plantConfig } = res
     Object.assign(config, plantConfig)
     config.seed_id = String(config.seed_id || '1')
     loadedCookie = config.cookie || ''
@@ -312,7 +321,7 @@ async function saveStealConfig(runOnce = false) {
   stealStatusType.value = 'info'
   let saved = false
   try {
-    const res = await apiPost('/steal-config', { auto_steal: stealConfig.auto_steal, steal_crops: [...stealConfig.steal_crops], steal_cron: stealConfig.steal_cron })
+    const res = await apiPost('/steal-config', { auto_steal: stealConfig.auto_steal, steal_crops: [...stealConfig.steal_crops], steal_cron: stealConfig.steal_cron, steal_refresh_count: stealConfig.steal_refresh_count })
     saved = !!res.success
     if (saved && res.config) Object.assign(stealConfig, res.config)
     stealStatus.value = res.message || (saved ? '偷菜配置已保存' : '偷菜配置保存失败')

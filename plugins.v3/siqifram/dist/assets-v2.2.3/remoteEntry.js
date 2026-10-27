@@ -60,11 +60,11 @@ const currentImports = {};
       const exportSet = new Set(['Module', '__esModule', 'default', '_export_sfc']);
       let moduleMap = {
 "./Page":()=>{
-      dynamicLoadingCss(["style-87aee409.css"], false, './Page');
+      dynamicLoadingCss(["style-74c1ec3f.css"], false, './Page');
       return __federation_import('./__federation_expose_Page-3c761bd7.js').then(module =>Object.keys(module).every(item => exportSet.has(item)) ? () => module.default : () => module)},
 "./Config":()=>{
-      dynamicLoadingCss(["style-87aee409.css"], false, './Config');
-      return __federation_import('./__federation_expose_Config-a3c0a188.js').then(module =>Object.keys(module).every(item => exportSet.has(item)) ? () => module.default : () => module)},};
+      dynamicLoadingCss(["style-74c1ec3f.css"], false, './Config');
+      return __federation_import('./__federation_expose_Config-ca74c273.js').then(module =>Object.keys(module).every(item => exportSet.has(item)) ? () => module.default : () => module)},};
       const seen = {};
       const dynamicLoadingCss = (cssFilePaths, dontAppendStylesToHead, exposeItemName) => {
         const metaUrl = import.meta.url;
@@ -75,7 +75,7 @@ const currentImports = {};
 
         const curUrl = metaUrl.substring(0, metaUrl.lastIndexOf('remoteEntry.js'));
         const base = '/';
-        'assets-v2.2.2';
+        'assets-v2.2.3';
 
         cssFilePaths.forEach(cssPath => {
          let href = '';
