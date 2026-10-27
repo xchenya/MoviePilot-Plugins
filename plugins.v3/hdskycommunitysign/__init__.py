@@ -1,0 +1,649 @@
+# SPDX-License-Identifier: GPL-3.0-only
+"""HDSky 社区客户端签到：认证、宿主管理的定时服务与持久化回执。"""
+import copy
+import json
+import math
+import uuid
+import re
+import threading
+import time
+from datetime import datetime
+from http.client import HTTPException
+from http.cookiejar import Cookie, CookieJar
+from urllib.error import HTTPError, URLError
+from urllib.request import (
+    HTTPCookieProcessor, HTTPRedirectHandler, ProxyHandler, Request, build_opener,
+)
+from zoneinfo import ZoneInfo
+
+from app.sdk.plugin import _PluginBase
+from app.sdk.config import settings
+from app.sdk.logging import logger
+from apscheduler.triggers.cron import CronTrigger
+try:
+    from app.schemas.types import MessageType
+except ImportError:
+    from app.schemas.types import NotificationType as MessageType
+
+ORIGIN = "https://hdsky.supertimi.de:8443"
+HOST = "hdsky.supertimi.de"
+PATHS = {
+    "send": "/api/portal/auth/start",
+    "login": "/api/portal/auth/verify",
+    "check": "/api/portal/session",
+    "sign": "/api/portal/daily-checkin",
+}
+DEFAULT_UA = "HDSkyWindows/0.6.0-rc.1"  # 官方 Windows 0.8.27 的主 API UA
+COOKIE_FIELDS = (
+    "version", "name", "value", "port", "port_specified", "domain",
+    "domain_specified", "domain_initial_dot", "path", "path_specified",
+    "secure", "expires", "discard", "comment", "comment_url", "rfc2109",
+)
+
+
+class AuthError(Exception):
+    def __init__(self, message, invalid=False, csrf=False, uncertain=False):
+        super().__init__(message)
+        self.invalid = invalid
+        self.csrf = csrf
+        self.uncertain = uncertain
+
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Cookie 和验证码不得跟随重定向转发。
+        return None
+
+
+class HdskyCommunitySign(_PluginBase):
+    plugin_name = "天空社区客户端签到"
+    plugin_desc = "HDSky 社区客户端每日签到，支持站内信登录、手动 Cookie、结果通知与历史记录。"
+    plugin_icon = "Moviepilot_A.png"
+    plugin_version = "1.0.0"
+    plugin_author = "xchenya"
+    author_url = "https://github.com/xchenya"
+    plugin_config_prefix = "hdskycommunitysign_"
+    plugin_order = 30
+    auth_level = 2
+
+    def __init__(self):
+        super().__init__()
+        self._lock = threading.RLock()
+        self._config = {}
+        self._auth = {}
+        self._status = {}
+        self._runtime = {}
+        self._trigger = None
+        self._generation = 0
+        self._stopped = False
+
+    @staticmethod
+    def _bool(value):
+        return value is True or value == 1 or str(value).lower() in {"true", "on", "yes"}
+
+    def init_plugin(self, config=None):
+        with self._lock:
+            values = config or {}
+            self._stopped = False
+            self._generation += 1
+            self._config = {
+                "enabled": self._bool(values.get("enabled", False)),
+                "uid": str(values.get("uid") or "").strip(),
+                "use_proxy": self._bool(values.get("use_proxy", False)),
+                "user_agent": str(values.get("user_agent") or DEFAULT_UA).strip(),
+                "action": "none", "cookie_input": "", "verify_code": "",
+                "auto_sign": self._bool(values.get("auto_sign", False)),
+                "notify": self._bool(values.get("notify", True)),
+                "cron": str(values.get("cron") or "0 8 * * *").strip(),
+            }
+            self._auth = copy.deepcopy(self.get_data("auth") or {})
+            self._status = copy.deepcopy(self.get_data("status") or {})
+            self._runtime = copy.deepcopy(self.get_data("checkins") or {})
+            self._trigger = None
+            action = str(values.get("action") or "none")
+            cookie = str(values.get("cookie_input") or "").strip()
+            code = str(values.get("verify_code") or "").strip()
+            # 先落盘清除一次性操作与输入，即使超时/重启也不会自动重放。
+            if self.update_config(dict(self._config)) is False:
+                self._config["enabled"] = False
+                self._record(False, "配置复位失败，未执行本次操作。")
+                return
+            try:
+                self._trigger = CronTrigger.from_crontab(
+                    self._config["cron"], timezone=getattr(settings, "TZ", "Asia/Shanghai"))
+            except (ValueError, TypeError):
+                self._record(False, "Cron 无效，定时签到未启用；请使用五段 Cron 表达式。")
+                return
+            if action == "none" and not cookie and not code:
+                return
+            if not self.get_state():
+                self._record(False, "请先启用插件；本次未发送任何请求。")
+                return
+            try:
+                if action not in {"none", "send", "login", "check", "sign"}:
+                    raise AuthError("未知操作，请重新选择。")
+                if cookie and action in {"send", "login"}:
+                    raise AuthError("手动 Cookie 与验证码登录请分开操作。")
+                if code and action != "login":
+                    raise AuthError("已填写验证码，请选择“提交验证码并登录”。")
+                if cookie:
+                    self._import_cookie(cookie)
+                elif action == "send":
+                    self._send_code()
+                elif action == "login":
+                    self._login(code)
+                elif action == "check":
+                    self._check_cookie()
+                if action == "sign":
+                    self.sign_in()
+            except AuthError as exc:
+                if exc.invalid:
+                    self._auth["verified"] = False
+                    self._save_auth()
+                self._record(False, str(exc))
+
+    def get_state(self):
+        return self._config.get("enabled", False) and not self._stopped
+
+    def get_command(self):
+        return []
+
+    def get_service(self):
+        if not self.get_state() or not self._config.get("auto_sign") or not self._trigger:
+            return []
+        from functools import partial
+        return [{"id": self.__class__.__name__ + ".daily",
+                 "name": "天空社区客户端签到", "trigger": self._trigger,
+                 "func": partial(self.sign_in, generation=self._generation),
+                 "kwargs": {"max_instances": 1, "coalesce": True, "misfire_grace_time": 300}}]
+
+    def get_api(self):
+        # 原生配置页通过保存配置执行一次，无额外凭据读取接口。
+        return []
+
+    def stop_service(self):
+        self._stopped = True  # 在途查询返回后、提交签到前可及时停止
+
+    def _save_auth(self):
+        self.save_data("auth", copy.deepcopy(self._auth))
+
+    def _record(self, success, message):
+        self._status = {"success": success, "message": message, "at": time.time()}
+        self.save_data("status", dict(self._status))
+
+    def _uid(self):
+        uid = self._config.get("uid", "")
+        if not re.fullmatch(r"[1-9][0-9]{0,11}", uid):
+            raise AuthError("请输入正确的 HDSky 数字 UID。")
+        return uid
+
+    @staticmethod
+    def _dump_cookies(jar):
+        jar.clear_expired_cookies()
+        rows = []
+        for cookie in jar:
+            row = {key: getattr(cookie, key) for key in COOKIE_FIELDS}
+            row["rest"] = dict(cookie._rest)
+            rows.append(row)
+        return rows
+
+    @staticmethod
+    def _load_cookies(rows):
+        jar = CookieJar()
+        try:
+            for row in rows or []:
+                cookie = Cookie(**row)
+                domain = cookie.domain.lstrip(".")
+                if HOST != domain and not HOST.endswith("." + domain):
+                    continue
+                if not cookie.is_expired():
+                    jar.set_cookie(cookie)
+        except (TypeError, ValueError, KeyError, AttributeError):
+            raise AuthError("已保存的 Cookie 数据无法读取，请重新登录或手动填写。") from None
+        return jar
+
+    @staticmethod
+    def _parse_cookie(value):
+        value = value.strip()
+        if value.lower().startswith("cookie:"):
+            value = value[7:].strip()
+        if not value or len(value) > 16384 or any(ord(c) < 32 or ord(c) > 126 for c in value):
+            raise AuthError("请粘贴单行 Cookie 请求头，不要包含换行或其它请求头。")
+        jar = CookieJar()
+        names = set()
+        for part in value.split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            name, sep, content = part.partition("=")
+            name = name.strip()
+            if not sep or not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name):
+                raise AuthError("Cookie 格式应为 name=value; name2=value2。")
+            if name in names:
+                raise AuthError("Cookie 名称重复，请复制 /api/portal/session 请求的 Cookie 请求头。")
+            if name.lower() in {"path", "domain", "expires", "max-age", "samesite", "secure", "httponly"}:
+                raise AuthError("请复制 Cookie 请求头，不要粘贴 Set-Cookie 响应头。")
+            names.add(name)
+            jar.set_cookie(Cookie(
+                version=0, name=name, value=content.strip(), port=None,
+                port_specified=False, domain=HOST, domain_specified=False,
+                domain_initial_dot=False, path="/", path_specified=True,
+                secure=True, expires=None, discard=True, comment=None,
+                comment_url=None, rest={}, rfc2109=False,
+            ))
+        if not names:
+            raise AuthError("Cookie 为空。")
+        return jar
+
+    def _request(self, action, jar, payload=None, csrf=""):
+        if action not in PATHS:
+            raise AuthError("不支持的请求。")
+        if time.time() < float(self._runtime.get("retry_after") or 0):
+            raise AuthError("社区请求处于限流冷却，请稍后再试。")
+        ua = self._config.get("user_agent") or DEFAULT_UA
+        if len(ua) > 512 or any(ord(c) < 32 or ord(c) > 126 for c in ua):
+            raise AuthError("User-Agent 格式不正确。")
+        proxies = {}
+        if self._config.get("use_proxy"):
+            proxies = getattr(settings, "PROXY", None)
+            if not isinstance(proxies, dict) or not proxies:
+                raise AuthError("MP 代理未配置，请先配置代理或关闭“使用 MP 代理”。")
+        opener = build_opener(ProxyHandler(proxies), NoRedirect(), HTTPCookieProcessor(jar))
+        headers = {
+            "Accept": "application/json", "User-Agent": ua,
+            "Referer": ORIGIN + "/portal", "Origin": ORIGIN,
+            "X-HDSky-Client": "app", "X-HDSky-Platform": "windows",
+        }
+        if action == "sign":
+            if not csrf or any(ord(c) < 32 or ord(c) > 126 for c in csrf):
+                raise AuthError("会话 CSRF Token 无效，请重新登录。")
+            headers["X-CSRF-Token"] = csrf
+        data = None
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+            data = json.dumps(payload).encode("utf-8")
+        request = Request(ORIGIN + PATHS[action], data=data, headers=headers,
+                          method="POST" if data is not None else "GET")
+        # 默认 TLS 证书验证；不重试 POST；所有请求仅发往固定社区 HTTPS 地址。
+        try:
+            with opener.open(request, timeout=35) as response:
+                raw = response.read(1024 * 1024 + 1)
+        except HTTPError as exc:
+            status = exc.code
+            # 只识别已知 CSRF 错误，不记录或转发服务器原文。
+            try:
+                error_data = json.loads(exc.read(65536))
+            except (ValueError, OSError, HTTPException):
+                error_data = {}
+            retry_header = exc.headers.get("Retry-After", "") if exc.headers else ""
+            exc.close()
+            if status == 429:
+                from email.utils import parsedate_to_datetime
+                try:
+                    delay = float(retry_header)
+                except (ValueError, TypeError):
+                    try:
+                        delay = parsedate_to_datetime(retry_header).timestamp() - time.time()
+                    except (ValueError, TypeError, OverflowError):
+                        delay = 300
+                delay = min(86400, max(60, delay)) if math.isfinite(delay) else 300
+                self._runtime["retry_after"] = time.time() + delay
+                self._save_runtime()
+                raise AuthError("社区限制了请求频率，请稍后再试；本次不会自动重试。") from None
+            if 300 <= status < 400:
+                raise AuthError("社区返回重定向，已停止；请在浏览器核对登录或验证页面。") from None
+            if status in (400, 401, 403) and action == "login":
+                raise AuthError("登录被拒绝，请核对 UID 和验证码是否正确、是否已过期。") from None
+            if status == 401 and action in {"check", "sign"}:
+                raise AuthError("Cookie 已失效或不属于此社区，请重新登录或重新填写。", invalid=True) from None
+            if (status == 403 and action == "sign" and isinstance(error_data, dict)
+                    and error_data.get("error") == "页面安全校验已失效，请刷新后重试"):
+                raise AuthError("页面安全校验已失效，正在刷新会话。", csrf=True)
+            if status == 403:
+                raise AuthError("社区拒绝访问（403），请检查防护验证、User-Agent 或网络。") from None
+            raise AuthError(f"社区返回 HTTP {status}；本次不会自动重试。",
+                            uncertain=action == "sign" and status >= 500) from None
+        except (URLError, TimeoutError, OSError, ValueError, HTTPException):
+            raise AuthError("请求未完成，请检查网络、代理和证书；本次不会自动重发。",
+                            uncertain=action == "sign") from None
+        if len(raw) > 1024 * 1024:
+            raise AuthError("社区响应过大，已停止解析。", uncertain=action == "sign")
+        try:
+            result = json.loads(raw)
+        except (ValueError, UnicodeError):
+            raise AuthError("社区未返回有效 JSON，可能是登录页或防护验证页。", uncertain=action == "sign") from None
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            # 不把服务端正文或任意异常字符串写入配置、日志和提示，避免泄露凭据。
+            message = {
+                "send": "社区未确认验证码已发送，请核对 UID 或稍后重试。",
+                "login": "社区未确认登录成功，请核对 UID 和验证码。",
+                "check": "社区未确认会话有效，请重新登录或填写 Cookie。",
+                "sign": "社区未确认签到成功，正在核对今日状态。",
+            }[action]
+            raise AuthError(message, uncertain=action == "sign")
+        return result
+
+    def _send_code(self):
+        uid = self._uid()
+        now = time.time()
+        if now < float(self._auth.get("send_after") or 0):
+            raise AuthError("发送间隔至少 60 秒，请稍后再试。")
+        # 即使超时也先保存冷却，避免重复触发站内信。
+        self._auth["send_after"] = now + 60
+        self._auth["pending"] = {"uid": uid, "at": now, "cookies": []}
+        self._save_auth()
+        jar = CookieJar()
+        self._request("send", jar, {"hdskyUid": uid})
+        self._auth["pending"] = {
+            "uid": uid, "at": now, "cookies": self._dump_cookies(jar),
+        }
+        self._save_auth()
+        self._record(True, "验证码已发送，请查看 HDSky 站内信；填写六位验证码，选择“提交验证码并登录”后保存。")
+
+    def _session_profile(self, result, expected_uid=""):
+        profile = result.get("profile")
+        if not isinstance(profile, dict) or not isinstance(profile.get("account"), dict):
+            raise AuthError("会话响应缺少账户信息，未保存新 Cookie。")
+        account = profile["account"]
+        uid = str(account.get("hdskyUid") or "")
+        if not re.fullmatch(r"[1-9][0-9]{0,11}", uid):
+            raise AuthError("当前社区会话未绑定有效的 HDSky UID。")
+        if expected_uid and uid != expected_uid:
+            raise AuthError("会话 UID 与填写的 UID 不一致，未覆盖原 Cookie。")
+        csrf = result.get("csrfToken")
+        if not isinstance(csrf, str) or not csrf:
+            raise AuthError("会话缺少 CSRF Token，未保存新 Cookie。")
+        return {"uid": uid, "display_name": str(account.get("displayName") or "")[:100]}, csrf
+
+    def _accept(self, jar, result, expected_uid="", source="login", clear_pending=True):
+        account, csrf = self._session_profile(result, expected_uid)
+        cookies = self._dump_cookies(jar)
+        if not cookies:
+            raise AuthError("社区未下发可保存的 Cookie，请在浏览器登录后手动填写。")
+        self._auth.update({
+            "cookies": cookies, "csrf_token": csrf, "account": account,
+            "source": source, "verified": True, "checked_at": time.time(),
+        })
+        if clear_pending:
+            self._auth.pop("pending", None)
+        self._save_auth()
+
+    def _login(self, code):
+        uid = self._uid()
+        if not re.fullmatch(r"[0-9]{6}", code):
+            raise AuthError("请输入六位数字验证码。")
+        pending = self._auth.get("pending") or {}
+        if pending.get("uid") != uid:
+            raise AuthError("请先为当前 UID 发送验证码，再提交验证码登录。")
+        now = time.time()
+        if now < float(self._auth.get("verify_after") or 0):
+            raise AuthError("验证操作过于频繁，请至少间隔 5 秒。")
+        self._auth["verify_after"] = now + 5
+        self._save_auth()
+        jar = self._load_cookies(pending.get("cookies"))
+        result = self._request("login", jar, {"hdskyUid": uid, "code": code})
+        # 按真实网页合同：verify 同时返回 profile/csrfToken，Cookie 从响应头提取。
+        self._accept(jar, result, expected_uid=uid)
+        self._record(True, "登录成功，社区 Cookie 已保存。可选择“检查已保存的 Cookie”再次验证。")
+
+    def _import_cookie(self, value):
+        jar = self._parse_cookie(value)
+        try:
+            result = self._request("check", jar)
+        except AuthError as exc:
+            # 新输入失败只否定候选 Cookie，不污染之前有效的已保存会话。
+            raise AuthError(str(exc)) from None
+        self._accept(jar, result, self._config.get("uid", ""), source="manual")
+        self._record(True, "手动 Cookie 验证成功并已保存；输入框已清空，原有凭据已替换。")
+
+    def _check_cookie(self):
+        jar = self._load_cookies(self._auth.get("cookies"))
+        if not list(jar):
+            raise AuthError("没有可用的 Cookie，请先登录或手动填写。", invalid=True)
+        result = self._request("check", jar)
+        self._accept(jar, result, self._config.get("uid", ""), self._auth.get("source", "login"),
+                     clear_pending=False)
+        self._record(True, "Cookie 有效，账户身份和 CSRF Token 已更新。")
+
+
+    def _save_runtime(self):
+        self.save_data("checkins", copy.deepcopy(self._runtime))
+
+    @staticmethod
+    def _day():
+        return datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
+
+    @staticmethod
+    def _number(value):
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+            return value
+        return None
+
+    def _daily(self, result, uid):
+        profile = result.get("profile")
+        if not isinstance(profile, dict):
+            raise AuthError("签到响应缺少账户状态。", uncertain=True)
+        account = profile.get("account") or {}
+        if not isinstance(account, dict) or str(account.get("hdskyUid") or "") != uid:
+            raise AuthError("签到响应账号不一致，已停止。", uncertain=True)
+        daily = profile.get("dailyCheckin")
+        if not isinstance(daily, dict) or not isinstance(daily.get("checkedIn"), bool):
+            raise AuthError("服务器未返回有效的今日签到状态，已停止提交。", uncertain=True)
+        wallet = profile.get("wallet")
+        return {"checked": daily["checkedIn"], "amount": self._number(daily.get("amount")),
+                "balance": self._number(wallet.get("balance")) if isinstance(wallet, dict) else None}
+
+    def _refresh_sign_session(self, jar, uid=""):
+        result = self._request("check", jar)
+        self._accept(jar, result, uid or self._config.get("uid", ""),
+                     self._auth.get("source", "login"), clear_pending=False)
+        uid = self._auth["account"]["uid"]
+        return uid, self._daily(result, uid)
+
+    def _finish_sign(self, status, message, uid="", daily=None, day=None):
+        day = day or self._day()
+        daily = daily or {}
+        row = {"time": time.time(), "day": day, "uid": uid, "status": status,
+               "message": message, "amount": daily.get("amount"), "balance": daily.get("balance")}
+        history = self._runtime.setdefault("history", [])
+        previous = history[0] if history else {}
+        # 同账号同日重复检查的“已签到”只更新一行，不刷通知。
+        duplicate = (status == "already" and previous.get("uid") == uid
+                     and previous.get("day") == day
+                     and previous.get("status") in {"success", "already", "confirmed"})
+        if not duplicate:
+            history.insert(0, row)
+            del history[60:]
+        self._runtime["last"] = row
+        self._save_runtime()
+        self._record(status in {"success", "already", "confirmed"}, message)
+        logger.info(f"天空社区签到：{message}")
+        if self._config.get("notify") and not duplicate:
+            lines = [message]
+            if uid:
+                lines.append("HDSky UID：" + uid)
+            if daily.get("amount") is not None:
+                lines.append(f"今日奖励：{daily['amount']:g} 银元")
+            if daily.get("balance") is not None:
+                lines.append(f"当前余额：{daily['balance']:g} 银元")
+            try:
+                self.post_message(mtype=MessageType.Plugin, title="【天空社区客户端签到】",
+                                  text="\n".join(lines))
+            except Exception:
+                logger.warning("天空社区签到结果已保存，但通知发送失败。")
+        return row
+
+    def sign_in(self, generation=None):
+        with self._lock:
+            if not self.get_state() or (generation is not None and generation != self._generation):
+                return None
+            uid, day, daily = "", self._day(), None
+            try:
+                jar = self._load_cookies(self._auth.get("cookies"))
+                if not list(jar):
+                    raise AuthError("请先完成站内信登录或手动填写社区 Cookie。", invalid=True)
+                uid, daily = self._refresh_sign_session(jar)
+                day = self._day()
+                attempts = self._runtime.setdefault("attempts", {})
+                key = uid + ":" + day
+                # 只保留近 60 个账号日意图。
+                for old in sorted(attempts)[:-59]:
+                    if old != key:
+                        attempts.pop(old, None)
+                attempt = attempts.get(key)
+                if daily["checked"]:
+                    if attempt:
+                        attempt["state"] = "done"
+                    return self._finish_sign("already", "今日已签到，已跳过提交。", uid, daily, day)
+                if attempt and attempt.get("state") in {"sent", "uncertain", "done"}:
+                    return self._finish_sign("uncertain",
+                        "今日已有提交记录但服务器尚未确认；暂停重复提交，请在客户端核对。", uid, daily, day)
+                if not self.get_state():
+                    return None
+                attempt = {"request_key": (attempt or {}).get("request_key") or uuid.uuid4().hex,
+                           "state": "sent", "day": day, "uid": uid}
+                attempts[key] = attempt
+                self._save_runtime()  # 发出写请求前持久化；崩溃后只查状态。
+                try:
+                    result = self._request("sign", jar, {"requestKey": attempt["request_key"]},
+                                           csrf=self._auth["csrf_token"])
+                except AuthError as exc:
+                    if not exc.csrf:
+                        raise
+                    # 服务端明确拒绝了 CSRF 才允许刷新后重试一次，复用同一请求键。
+                    uid, daily = self._refresh_sign_session(jar, uid)
+                    if daily["checked"]:
+                        attempt["state"] = "done"
+                        return self._finish_sign("confirmed", "已核实今日签到完成。", uid, daily, day)
+                    if not self.get_state():
+                        attempt["state"] = "rejected"
+                        self._save_runtime()
+                        return None
+                    result = self._request("sign", jar, {"requestKey": attempt["request_key"]},
+                                           csrf=self._auth["csrf_token"])
+                daily = self._daily(result, uid)
+                if not daily["checked"]:
+                    raise AuthError("签到返回后今日状态仍未确认。", uncertain=True)
+                self._auth["cookies"] = self._dump_cookies(jar)
+                self._save_auth()
+                attempt["state"] = "done"
+                return self._finish_sign("success", "签到成功。", uid, daily, day)
+            except AuthError as exc:
+                attempt = self._runtime.get("attempts", {}).get(uid + ":" + day)
+                if exc.invalid:
+                    self._auth["verified"] = False
+                    self._save_auth()
+                if attempt and attempt.get("state") == "sent":
+                    # 非明确拒绝都按未知写入处理；仅通过一次读请求核对。
+                    attempt["state"] = "uncertain" if exc.uncertain else "rejected"
+                    self._save_runtime()
+                    if exc.uncertain:
+                        try:
+                            _, verified = self._refresh_sign_session(jar, uid)
+                            if verified["checked"]:
+                                attempt["state"] = "done"
+                                return self._finish_sign("confirmed", "提交响应异常，已核实今日签到完成。",
+                                                         uid, verified, day)
+                        except AuthError:
+                            pass
+                        return self._finish_sign("uncertain", "签到结果待确认，已暂停今日重复提交。",
+                                                 uid, None, day)
+                return self._finish_sign("failed", str(exc), uid, None, day)
+
+    @staticmethod
+    def _time_label(value):
+        if not value:
+            return "尚未检查"
+        return datetime.fromtimestamp(float(value), ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S")
+
+    def _status_text(self):
+        account = self._auth.get("account") or {}
+        configured = bool(self._auth.get("cookies"))
+        parts = ["Cookie：" + ("已保存" if configured else "未配置")]
+        if account.get("uid"):
+            parts.append("HDSky UID：" + account["uid"])
+        parts.append("上次验证：" + ("通过" if self._auth.get("verified") else "未通过/未验证"))
+        parts.append("检查时间：" + self._time_label(self._auth.get("checked_at")))
+        return "；".join(parts)
+
+    def get_form(self):
+        def field(component, model, label, **props):
+            return {"component": component, "props": {"model": model, "label": label, **props}}
+        content = [
+            {"component": "VAlert", "props": {
+                "type": "info", "variant": "tonal", "class": "mb-4",
+                "text": "客户端签到：先完成登录，再启用每日签到或选择“立即签到”。一次性操作在保存后执行。",
+            }},
+            {"component": "VAlert", "props": {
+                "type": "success" if self._auth.get("verified") else "info",
+                "variant": "tonal", "class": "mb-4", "text": self._status_text(),
+            }},
+        ]
+        if self._status:
+            content.append({"component": "VAlert", "props": {
+                "type": "success" if self._status.get("success") else "warning",
+                "variant": "tonal", "class": "mb-4",
+                "text": self._time_label(self._status.get("at")) + " · " + self._status.get("message", ""),
+            }})
+        content.extend([
+            field("VSwitch", "enabled", "启用插件", color="primary"),
+            field("VSwitch", "auto_sign", "每日定时签到", color="primary"),
+            field("VTextField", "cron", "签到 Cron", hint="默认每天 08:00；时区跟随 MP。",
+                  persistent_hint=True),
+            field("VSwitch", "notify", "发送签到结果通知", color="primary"),
+            field("VTextField", "uid", "HDSky UID", hint="站内信登录必填；手动 Cookie 可留空，填写时会校验账号一致。",
+                  persistent_hint=True),
+            field("VSelect", "action", "本次保存后执行", items=[
+                {"title": "仅保存配置", "value": "none"},
+                {"title": "1. 发送站内信验证码", "value": "send"},
+                {"title": "2. 提交验证码并登录", "value": "login"},
+                {"title": "检查已保存的 Cookie", "value": "check"},
+                {"title": "立即签到（仅一次）", "value": "sign"},
+            ], **{"item-title": "title", "item-value": "value"}),
+            field("VTextField", "verify_code", "六位验证码", type="password", autocomplete="off",
+                  maxlength=6, hint="从 HDSky 站内信读取，仅用于本次登录；每次保存后清空。",
+                  persistent_hint=True),
+            field("VTextField", "cookie_input", "手动填写社区 Cookie（可选）", type="password",
+                  autocomplete="new-password", hint="来自 hdsky.supertimi.de；填入后保存即验证。留空保留已保存 Cookie。",
+                  persistent_hint=True),
+            field("VSwitch", "use_proxy", "使用 MP 代理", color="primary"),
+            field("VTextField", "user_agent", "User-Agent", hint="默认可用；若受站点防护限制，可填写浏览器 User-Agent。",
+                  persistent_hint=True),
+            {"component": "VAlert", "props": {
+                "type": "info", "variant": "tonal", "class": "mt-4",
+                "text": "保存后重新打开配置页或详情页查看结果。这里使用社区 Cookie，不是 hdsky.me 主站 Cookie。",
+            }},
+        ])
+        # Vuetify 的提示属性采用连字符。
+        for item in content:
+            props = item.get("props", {})
+            if "persistent_hint" in props:
+                props["persistent-hint"] = props.pop("persistent_hint")
+        return [{"component": "VForm", "content": content}], {
+            "enabled": False, "uid": "", "action": "none", "verify_code": "",
+            "cookie_input": "", "use_proxy": False, "user_agent": DEFAULT_UA,
+            "auto_sign": False, "notify": True, "cron": "0 8 * * *",
+        }
+
+    def get_page(self):
+        content = [{"component": "VAlert", "props": {
+            "type": "success" if self._auth.get("verified") else "info",
+            "variant": "tonal", "text": self._status_text(),
+        }}]
+        if self._status:
+            content.append({"component": "VAlert", "props": {
+                "type": "success" if self._status.get("success") else "warning",
+                "variant": "tonal", "class": "mt-3",
+                "text": self._time_label(self._status.get("at")) + " · " + self._status.get("message", ""),
+            }})
+        for row in self._runtime.get("history", [])[:30]:
+            details = [self._time_label(row.get("time")), "UID " + str(row.get("uid") or "—"),
+                       row.get("message", "")]
+            if row.get("amount") is not None:
+                details.append(f"今日奖励 {row['amount']:g} 银元")
+            if row.get("balance") is not None:
+                details.append(f"余额 {row['balance']:g} 银元")
+            content.append({"component": "VAlert", "props": {
+                "type": "success" if row.get("status") in {"success", "already", "confirmed"} else "warning",
+                "variant": "tonal", "class": "mt-3", "text": " · ".join(details)}})
+        return content

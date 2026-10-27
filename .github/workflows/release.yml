@@ -35,6 +35,7 @@ jobs:
       - name: Build and release changed plugins
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_BASE_SHA: ${{ github.event.before }}
         run: |
           set -euo pipefail
 
@@ -59,6 +60,17 @@ jobs:
               plugin_id="${entry%%|*}"
               plugin_version="${entry##*|}"
               plugin_id_lc="$(echo "$plugin_id" | tr '[:upper:]' '[:lower:]')"
+
+              # A push publishes only changed market entries; manual runs retain full scan.
+              # This avoids releasing unrelated plugins that were already pending in main.
+              if [ "$GITHUB_EVENT_NAME" = "push" ] && git cat-file -e "${RELEASE_BASE_SHA}^{commit}" 2>/dev/null; then
+                previous_entry="$(git show "${RELEASE_BASE_SHA}:${pkg_file}" 2>/dev/null | jq -cS --arg id "$plugin_id" '.[$id] // null')" || previous_entry=null
+                current_entry="$(jq -cS --arg id "$plugin_id" '.[$id] // null' "$pkg_file")"
+                if [ "$previous_entry" = "$current_entry" ]; then
+                  echo "Unchanged index entry for $plugin_id, skip."
+                  continue
+                fi
+              fi
 
               if ! plugin_dir="$(bash .github/scripts/select_plugin_release_dir.sh "$pkg_file" "$plugin_id_lc")"; then
                 echo "Missing plugin directory for $plugin_id in $pkg_file" >&2
