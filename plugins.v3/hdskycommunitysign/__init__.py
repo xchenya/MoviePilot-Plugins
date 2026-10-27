@@ -7,7 +7,7 @@ import uuid
 import re
 import threading
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from http.client import HTTPException
 from http.cookiejar import Cookie, CookieJar
 from urllib.error import HTTPError, URLError
@@ -16,9 +16,12 @@ from urllib.request import (
 )
 from zoneinfo import ZoneInfo
 
+from pydantic import BaseModel, ConfigDict, Field
+
 from app.sdk.plugin import _PluginBase
 from app.sdk.config import settings
 from app.sdk.logging import logger
+from app.sdk.scheduler import update_plugin_job
 from apscheduler.triggers.cron import CronTrigger
 try:
     from app.schemas.types import MessageType
@@ -39,6 +42,79 @@ COOKIE_FIELDS = (
     "domain_specified", "domain_initial_dot", "path", "path_specified",
     "secure", "expires", "discard", "comment", "comment_url", "rfc2109",
 )
+SIGNED = {"success", "already", "confirmed"}
+
+
+class PublicConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool = False
+    uid: str = ""
+    use_proxy: bool = False
+    user_agent: str = DEFAULT_UA
+    auto_sign: bool = False
+    notify: bool = True
+    cron: str = "0 8 * * *"
+
+
+class AuthRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    action: str
+    uid: str | None = None
+    use_proxy: bool | None = None
+    user_agent: str | None = None
+    code: str = Field(default="", max_length=6, repr=False)
+    cookie: str = Field(default="", max_length=16384, repr=False)
+
+
+class PublicAuth(BaseModel):
+    uid: str = ""
+    display_name: str = ""
+    cookie_configured: bool = False
+    verified: bool = False
+    checked_at: float = 0
+    pending_uid: str = ""
+    send_after: float = 0
+    verify_after: float = 0
+    retry_after: float = 0
+
+
+class StatusMessage(BaseModel):
+    success: bool = False
+    message: str = ""
+    at: float = 0
+
+
+class DailyRecord(BaseModel):
+    day: str
+    uid: str
+    status: str = "unrecorded"
+    message: str = "尚无记录"
+    time: float = 0
+    amount: float | None = None
+    balance: float | None = None
+
+
+class DailyStatistics(BaseModel):
+    uid: str = ""
+    today: DailyRecord | None = None
+    completed_days: int = 0
+    reward_total: float = 0
+    unknown_reward_days: int = 0
+    days: list[DailyRecord] = Field(default_factory=list)
+
+
+class PublicState(BaseModel):
+    config: PublicConfig
+    auth: PublicAuth
+    status: StatusMessage
+    statistics: DailyStatistics
+    history: list[DailyRecord] = Field(default_factory=list)
+
+
+class ActionResult(BaseModel):
+    success: bool
+    message: str
+    state: PublicState
 
 
 class AuthError(Exception):
@@ -57,9 +133,9 @@ class NoRedirect(HTTPRedirectHandler):
 
 class HdskyCommunitySign(_PluginBase):
     plugin_name = "天空社区客户端签到"
-    plugin_desc = "HDSky 社区客户端每日签到，支持站内信登录、手动 Cookie、结果通知与历史记录。"
+    plugin_desc = "HDSky 社区客户端每日签到，支持配置页直接登录、手动 Cookie、通知与每日统计。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_author = "xchenya"
     author_url = "https://github.com/xchenya"
     plugin_config_prefix = "hdskycommunitysign_"
@@ -99,6 +175,7 @@ class HdskyCommunitySign(_PluginBase):
             self._auth = copy.deepcopy(self.get_data("auth") or {})
             self._status = copy.deepcopy(self.get_data("status") or {})
             self._runtime = copy.deepcopy(self.get_data("checkins") or {})
+            self._backfill_daily()
             self._trigger = None
             action = str(values.get("action") or "none")
             cookie = str(values.get("cookie_input") or "").strip()
@@ -158,8 +235,124 @@ class HdskyCommunitySign(_PluginBase):
                  "kwargs": {"max_instances": 1, "coalesce": True, "misfire_grace_time": 300}}]
 
     def get_api(self):
-        # 原生配置页通过保存配置执行一次，无额外凭据读取接口。
-        return []
+        definitions = [
+            ("/state", "GET", self.api_state, PublicState, "读取登录状态与每日统计（不访问社区）"),
+            ("/config", "POST", self.api_save_config, ActionResult, "保存签到设置"),
+            ("/auth", "POST", self.api_auth, ActionResult, "发送验证码、登录或检查社区会话"),
+            ("/sign", "POST", self.api_sign, ActionResult, "立即签到一次"),
+        ]
+        return [{"path": path, "methods": [method], "endpoint": endpoint,
+                 "auth": "bear", "response_model": model, "summary": summary}
+                for path, method, endpoint, model, summary in definitions]
+
+    def get_render_mode(self):
+        return "vue", f"dist/assets-v{self.plugin_version}"
+
+    def api_state(self) -> PublicState:
+        with self._lock:
+            account = self._auth.get("account") or {}
+            auth = PublicAuth(
+                uid=account.get("uid", ""), display_name=account.get("display_name", ""),
+                cookie_configured=bool(self._auth.get("cookies")),
+                verified=bool(self._auth.get("verified")),
+                checked_at=self._auth.get("checked_at") or 0,
+                pending_uid=(self._auth.get("pending") or {}).get("uid", ""),
+                send_after=self._auth.get("send_after") or 0,
+                verify_after=self._auth.get("verify_after") or 0,
+                retry_after=self._runtime.get("retry_after") or 0,
+            )
+            # 只选取公开字段，凭据与一次性输入不进入 HTTP 响应。
+            return PublicState(
+                config=PublicConfig(**{key: self._config[key] for key in PublicConfig.model_fields
+                                       if key in self._config}),
+                auth=auth, status=StatusMessage(**self._status),
+                statistics=self._statistics(auth.uid),
+                history=[DailyRecord(**row) for row in self._runtime.get("history", [])[:30]],
+            )
+
+    def _api_result(self, success, message):
+        return ActionResult(success=success, message=message, state=self.api_state())
+
+    @staticmethod
+    def _validate_connection(config):
+        uid = config.get("uid", "")
+        if uid and not re.fullmatch(r"[1-9][0-9]{0,11}", uid):
+            raise AuthError("请输入正确的 HDSky 数字 UID。")
+        ua = config.get("user_agent", "")
+        if not ua or len(ua) > 512 or any(ord(c) < 32 or ord(c) > 126 for c in ua):
+            raise AuthError("User-Agent 格式不正确。")
+
+    def api_save_config(self, payload: PublicConfig) -> ActionResult:
+        with self._lock:
+            if self._stopped:
+                return self._api_result(False, "插件正在停止，请刷新页面后再试。")
+            config = {**self._config, **payload.model_dump(exclude_unset=True)}
+            config.update(action="none", cookie_input="", verify_code="")
+            for key in ("uid", "user_agent", "cron"):
+                config[key] = str(config.get(key) or "").strip()
+            config["user_agent"] = config["user_agent"] or DEFAULT_UA
+            try:
+                self._validate_connection(config)
+                trigger = CronTrigger.from_crontab(
+                    config["cron"], timezone=getattr(settings, "TZ", "Asia/Shanghai"))
+            except AuthError as exc:
+                return self._api_result(False, str(exc))
+            except (ValueError, TypeError):
+                return self._api_result(False, "Cron 无效，请使用五段 Cron 表达式。")
+            if self.update_config(dict(config)) is False:
+                return self._api_result(False, "配置保存失败，请稍后再试。")
+            self._config, self._trigger = config, trigger
+            self._generation += 1
+        # 更新宿主注册的任务，不自建调度器；按当前运行实例定位分身。
+        try:
+            update_plugin_job(self.__class__.__name__)
+        except Exception:
+            return self._api_result(False, "设置已保存，但定时任务刷新失败，请在 MP 服务页检查或重启 MP。")
+        return self._api_result(True, "签到设置已保存。")
+
+    def api_auth(self, payload: AuthRequest) -> ActionResult:
+        with self._lock:
+            if self._stopped:
+                return self._api_result(False, "插件正在停止，请刷新页面后再试。")
+            try:
+                if payload.action not in {"send", "login", "cookie", "check"}:
+                    raise AuthError("未知登录操作。")
+                if (payload.code and payload.action != "login"
+                        or payload.cookie and payload.action != "cookie"):
+                    raise AuthError("验证码与 Cookie 请分别提交。")
+                config = dict(self._config)
+                for key in ("uid", "use_proxy", "user_agent"):
+                    value = getattr(payload, key)
+                    if value is not None:
+                        config[key] = value.strip() if isinstance(value, str) else value
+                config["user_agent"] = config.get("user_agent") or DEFAULT_UA
+                self._validate_connection(config)
+                if payload.action in {"send", "login"} and not config.get("uid"):
+                    raise AuthError("请输入 HDSky 数字 UID。")
+                # 只应用本次登录的连接信息，不保存页面中尚未提交的调度设置。
+                if self.update_config(dict(config)) is False:
+                    raise AuthError("连接设置保存失败，未发送请求。")
+                self._config = config
+                if payload.action == "send":
+                    self._send_code()
+                elif payload.action == "login":
+                    self._login(payload.code)
+                elif payload.action == "cookie":
+                    self._import_cookie(payload.cookie)
+                else:
+                    self._check_cookie()
+            except AuthError as exc:
+                if exc.invalid:
+                    self._auth["verified"] = False
+                    self._save_auth()
+                self._record(False, str(exc))
+            return self._api_result(bool(self._status.get("success")), self._status.get("message", ""))
+
+    def api_sign(self) -> ActionResult:
+        row = self.sign_in()
+        if row is None:
+            return self._api_result(False, "请先启用插件并保存设置，再执行签到。")
+        return self._api_result(row["status"] in SIGNED, row["message"])
 
     def stop_service(self):
         self._stopped = True  # 在途查询返回后、提交签到前可及时停止
@@ -338,7 +531,7 @@ class HdskyCommunitySign(_PluginBase):
             "uid": uid, "at": now, "cookies": self._dump_cookies(jar),
         }
         self._save_auth()
-        self._record(True, "验证码已发送，请查看 HDSky 站内信；填写六位验证码，选择“提交验证码并登录”后保存。")
+        self._record(True, "验证码已发送，请查看 HDSky 站内信，在当前页面输入六位验证码并点击“登录”。")
 
     def _session_profile(self, result, expected_uid=""):
         profile = result.get("profile")
@@ -384,7 +577,7 @@ class HdskyCommunitySign(_PluginBase):
         result = self._request("login", jar, {"hdskyUid": uid, "code": code})
         # 按真实网页合同：verify 同时返回 profile/csrfToken，Cookie 从响应头提取。
         self._accept(jar, result, expected_uid=uid)
-        self._record(True, "登录成功，社区 Cookie 已保存。可选择“检查已保存的 Cookie”再次验证。")
+        self._record(True, "登录成功，社区会话已保存。")
 
     def _import_cookie(self, value):
         jar = self._parse_cookie(value)
@@ -408,6 +601,68 @@ class HdskyCommunitySign(_PluginBase):
 
     def _save_runtime(self):
         self.save_data("checkins", copy.deepcopy(self._runtime))
+
+    def _merge_daily(self, row):
+        uid, day = str(row.get("uid") or ""), row.get("day", "")
+        if not re.fullmatch(r"[1-9][0-9]{0,11}", uid):
+            return
+        try:
+            date.fromisoformat(day)
+        except (ValueError, TypeError):
+            return
+        records = self._runtime.setdefault("daily_stats", {})
+        key = uid + ":" + day
+        previous = records.get(key, {})
+        # 一旦确认已签到，之后的读取错误不能把当日统计降为失败。
+        if previous.get("status") in SIGNED and row.get("status") not in SIGNED:
+            return
+        if previous.get("time", 0) > row.get("time", 0):
+            return
+        merged = {name: row.get(name) for name in ("day", "uid", "status", "message", "time")}
+        for name in ("amount", "balance"):
+            value = self._number(row.get(name))
+            if value is None and previous.get("status") in SIGNED:
+                value = self._number(previous.get(name))
+            merged[name] = value
+        records[key] = merged
+
+    def _backfill_daily(self):
+        """从 1.0.0 保留的回执幂等迁移；每日聚合独立于 60 条操作历史。"""
+        before = copy.deepcopy(self._runtime.get("daily_stats", {}))
+        rows = list(self._runtime.get("history", []))
+        if self._runtime.get("last"):
+            rows.append(self._runtime["last"])
+        for row in sorted(rows, key=lambda item: item.get("time", 0)):
+            self._merge_daily(row)
+        self._prune_daily()
+        if before != self._runtime.get("daily_stats", {}):
+            self._save_runtime()
+
+    def _prune_daily(self):
+        cutoff = (date.fromisoformat(self._day()) - timedelta(days=89)).isoformat()
+        records = self._runtime.get("daily_stats", {})
+        for key in list(records):
+            if records[key].get("day", "") < cutoff:
+                del records[key]
+
+    def _statistics(self, uid):
+        result = DailyStatistics(uid=uid)
+        if not uid:
+            return result
+        today = date.fromisoformat(self._day())
+        records = self._runtime.get("daily_stats", {})
+        for offset in range(30):
+            day = (today - timedelta(days=offset)).isoformat()
+            row = DailyRecord(**records.get(uid + ":" + day, {"uid": uid, "day": day}))
+            result.days.append(row)
+            if row.status in SIGNED:
+                result.completed_days += 1
+                if row.amount is None:
+                    result.unknown_reward_days += 1
+                else:
+                    result.reward_total += row.amount
+        result.today = result.days[0]
+        return result
 
     @staticmethod
     def _day():
@@ -445,6 +700,8 @@ class HdskyCommunitySign(_PluginBase):
         daily = daily or {}
         row = {"time": time.time(), "day": day, "uid": uid, "status": status,
                "message": message, "amount": daily.get("amount"), "balance": daily.get("balance")}
+        self._merge_daily(row)
+        self._prune_daily()
         history = self._runtime.setdefault("history", [])
         previous = history[0] if history else {}
         # 同账号同日重复检查的“已签到”只更新一行，不刷通知。
@@ -548,102 +805,14 @@ class HdskyCommunitySign(_PluginBase):
                             pass
                         return self._finish_sign("uncertain", "签到结果待确认，已暂停今日重复提交。",
                                                  uid, None, day)
-                return self._finish_sign("failed", str(exc), uid, None, day)
-
-    @staticmethod
-    def _time_label(value):
-        if not value:
-            return "尚未检查"
-        return datetime.fromtimestamp(float(value), ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S")
-
-    def _status_text(self):
-        account = self._auth.get("account") or {}
-        configured = bool(self._auth.get("cookies"))
-        parts = ["Cookie：" + ("已保存" if configured else "未配置")]
-        if account.get("uid"):
-            parts.append("HDSky UID：" + account["uid"])
-        parts.append("上次验证：" + ("通过" if self._auth.get("verified") else "未通过/未验证"))
-        parts.append("检查时间：" + self._time_label(self._auth.get("checked_at")))
-        return "；".join(parts)
+                # 预查询失败时也为已保存账号记录当日结果，但不触碰旧提交意图。
+                recorded_uid = uid or str((self._auth.get("account") or {}).get("uid") or "")
+                return self._finish_sign("failed", str(exc), recorded_uid, None, day)
 
     def get_form(self):
-        def field(component, model, label, **props):
-            return {"component": component, "props": {"model": model, "label": label, **props}}
-        content = [
-            {"component": "VAlert", "props": {
-                "type": "info", "variant": "tonal", "class": "mb-4",
-                "text": "客户端签到：先完成登录，再启用每日签到或选择“立即签到”。一次性操作在保存后执行。",
-            }},
-            {"component": "VAlert", "props": {
-                "type": "success" if self._auth.get("verified") else "info",
-                "variant": "tonal", "class": "mb-4", "text": self._status_text(),
-            }},
-        ]
-        if self._status:
-            content.append({"component": "VAlert", "props": {
-                "type": "success" if self._status.get("success") else "warning",
-                "variant": "tonal", "class": "mb-4",
-                "text": self._time_label(self._status.get("at")) + " · " + self._status.get("message", ""),
-            }})
-        content.extend([
-            field("VSwitch", "enabled", "启用插件", color="primary"),
-            field("VSwitch", "auto_sign", "每日定时签到", color="primary"),
-            field("VTextField", "cron", "签到 Cron", hint="默认每天 08:00；时区跟随 MP。",
-                  persistent_hint=True),
-            field("VSwitch", "notify", "发送签到结果通知", color="primary"),
-            field("VTextField", "uid", "HDSky UID", hint="站内信登录必填；手动 Cookie 可留空，填写时会校验账号一致。",
-                  persistent_hint=True),
-            field("VSelect", "action", "本次保存后执行", items=[
-                {"title": "仅保存配置", "value": "none"},
-                {"title": "1. 发送站内信验证码", "value": "send"},
-                {"title": "2. 提交验证码并登录", "value": "login"},
-                {"title": "检查已保存的 Cookie", "value": "check"},
-                {"title": "立即签到（仅一次）", "value": "sign"},
-            ], **{"item-title": "title", "item-value": "value"}),
-            field("VTextField", "verify_code", "六位验证码", type="password", autocomplete="off",
-                  maxlength=6, hint="从 HDSky 站内信读取，仅用于本次登录；每次保存后清空。",
-                  persistent_hint=True),
-            field("VTextField", "cookie_input", "手动填写社区 Cookie（可选）", type="password",
-                  autocomplete="new-password", hint="来自 hdsky.supertimi.de；填入后保存即验证。留空保留已保存 Cookie。",
-                  persistent_hint=True),
-            field("VSwitch", "use_proxy", "使用 MP 代理", color="primary"),
-            field("VTextField", "user_agent", "User-Agent", hint="默认可用；若受站点防护限制，可填写浏览器 User-Agent。",
-                  persistent_hint=True),
-            {"component": "VAlert", "props": {
-                "type": "info", "variant": "tonal", "class": "mt-4",
-                "text": "保存后重新打开配置页或详情页查看结果。这里使用社区 Cookie，不是 hdsky.me 主站 Cookie。",
-            }},
-        ])
-        # Vuetify 的提示属性采用连字符。
-        for item in content:
-            props = item.get("props", {})
-            if "persistent_hint" in props:
-                props["persistent-hint"] = props.pop("persistent_hint")
-        return [{"component": "VForm", "content": content}], {
-            "enabled": False, "uid": "", "action": "none", "verify_code": "",
-            "cookie_input": "", "use_proxy": False, "user_agent": DEFAULT_UA,
-            "auto_sign": False, "notify": True, "cron": "0 8 * * *",
-        }
+        # Vue 配置组件自己调用已认证 API，模型不包含任何一次性凭据。
+        return None, PublicConfig(**{key: self._config[key] for key in PublicConfig.model_fields
+                                     if key in self._config}).model_dump()
 
     def get_page(self):
-        content = [{"component": "VAlert", "props": {
-            "type": "success" if self._auth.get("verified") else "info",
-            "variant": "tonal", "text": self._status_text(),
-        }}]
-        if self._status:
-            content.append({"component": "VAlert", "props": {
-                "type": "success" if self._status.get("success") else "warning",
-                "variant": "tonal", "class": "mt-3",
-                "text": self._time_label(self._status.get("at")) + " · " + self._status.get("message", ""),
-            }})
-        for row in self._runtime.get("history", [])[:30]:
-            details = [self._time_label(row.get("time")), "UID " + str(row.get("uid") or "—"),
-                       row.get("message", "")]
-            if row.get("amount") is not None:
-                details.append(f"今日奖励 {row['amount']:g} 银元")
-            if row.get("balance") is not None:
-                details.append(f"余额 {row['balance']:g} 银元")
-            content.append({"component": "VAlert", "props": {
-                "type": "success" if row.get("status") in {"success", "already", "confirmed"} else "warning",
-                "variant": "tonal", "class": "mt-3", "text": " · ".join(details)}})
-        return content
+        return []

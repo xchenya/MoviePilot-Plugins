@@ -187,15 +187,16 @@
   },
   "HdskyCommunitySign": {
     "name": "天空社区客户端签到",
-    "description": "HDSky 社区客户端每日签到，支持站内信登录、手动 Cookie、结果通知与历史记录。",
+    "description": "HDSky 社区客户端每日签到，支持配置页直接登录、手动 Cookie、通知与每日统计。",
     "labels": "签到,HDSky,客户端",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "icon": "Moviepilot_A.png",
     "author": "xchenya",
     "author_url": "https://github.com/xchenya",
     "level": 2,
     "system_version": ">=3.0.0",
     "history": {
+      "v1.1.0": "配置页直接发送验证码和登录，显示冷却与操作反馈；新增按账号、北京时间归档的每日统计、近30天签到天数与奖励汇总，兼容旧历史并避免重复计奖。1.0.0 验证码登录已获用户实测确认；新版界面与统计经离线验证，待宿主联调。",
       "v1.0.0": "首个正式版：接入 HDSky Windows 客户端每日签到接口，支持 UID/站内信登录、手动 Cookie、定时与手动签到、通知及历史记录；包含 CSRF 刷新、限流和重启防重。41 项离线回归通过，真实账号及 MP 宿主待联调。"
     },
     "release": true

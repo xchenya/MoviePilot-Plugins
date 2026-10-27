@@ -34,11 +34,12 @@ class PluginBase:
         self.messages.append(message)
 
 
-for name in ("app", "app.sdk", "app.sdk.plugin", "app.sdk.config", "app.sdk.logging", "app.schemas", "app.schemas.types"):
+for name in ("app", "app.sdk", "app.sdk.plugin", "app.sdk.config", "app.sdk.logging", "app.sdk.scheduler", "app.schemas", "app.schemas.types"):
     sys.modules[name] = types.ModuleType(name)
 sys.modules["app.sdk.plugin"]._PluginBase = PluginBase
 sys.modules["app.sdk.config"].settings = types.SimpleNamespace(PROXY={}, TZ="Asia/Shanghai")
 sys.modules["app.sdk.logging"].logger = logging.getLogger("hdsky-test")
+sys.modules["app.sdk.scheduler"].update_plugin_job = lambda plugin_id: None
 sys.modules["app.schemas.types"].MessageType = types.SimpleNamespace(Plugin="plugin")
 source = Path(__file__).resolve().parents[3] / "plugins.v3/hdskycommunitysign/__init__.py"
 spec = importlib.util.spec_from_file_location("hdskycommunitysign_test", source)
@@ -278,8 +279,11 @@ class LoginTests(unittest.TestCase):
             self.run_action("check")
         self.assertIn("pending", self.plugin.storage["auth"])
 
-    def test_no_extra_endpoints_or_scheduled_actions(self):
-        self.assertEqual(self.plugin.get_api(), [])
+    def test_authenticated_ui_endpoints_and_no_scheduled_login(self):
+        apis = self.plugin.get_api()
+        self.assertEqual({api["path"] for api in apis}, {"/state", "/config", "/auth", "/sign"})
+        self.assertTrue(all(api["auth"] == "bear" and api["response_model"] for api in apis))
+        self.assertTrue(all(api["methods"] == ["POST"] for api in apis if api["path"] != "/state"))
         self.assertEqual(self.plugin.get_service(), [])
         self.assertEqual(self.plugin.get_command(), [])
         self.assertEqual(set(module.PATHS), {"send", "login", "check", "sign"})
@@ -530,6 +534,222 @@ class SignTests(unittest.TestCase):
             row, net = self.invoke((daily(), []), (daily(True), []))
         self.assertEqual(row["status"], "success")
         self.assertEqual(len(net.requests), 2)
+
+
+class InteractiveApiTests(unittest.TestCase):
+    setUp = LoginTests.setUp
+    seed_active = LoginTests.seed_active
+
+    def test_direct_send_login_without_enabling_or_resaving_form(self):
+        self.plugin.init_plugin({"enabled": False, "auto_sign": True, "notify": False})
+        net = Network(
+            ({"ok": True}, ["challenge=pre-private; Path=/; Secure"]),
+            (GOOD, ["session=login-private; Path=/; Secure; HttpOnly"]),
+        )
+        with patch.object(module, "build_opener", side_effect=net.build):
+            sent = self.plugin.api_auth(module.AuthRequest(action="send", uid="123"))
+            logged = self.plugin.api_auth(module.AuthRequest(action="login", uid="123", code="012345"))
+            rejected_sign = self.plugin.api_sign()
+        self.assertTrue(sent.success)
+        self.assertTrue(logged.success)
+        self.assertFalse(rejected_sign.success)
+        self.assertEqual(len(net.requests), 2)
+        self.assertEqual(self.plugin.config["uid"], "123")
+        self.assertFalse(self.plugin.config["enabled"])
+        self.assertTrue(self.plugin.config["auto_sign"])
+        self.assertFalse(self.plugin.config["notify"])
+        self.assertNotIn("012345", str(self.plugin.config))
+        self.assertEqual(logged.state.auth.uid, "123")
+        self.assertTrue(logged.state.auth.verified)
+
+    def test_direct_send_cooldown_and_pending_survive_restart(self):
+        net = Network(({"ok": True}, ["challenge=pre-private; Path=/; Secure"]))
+        with patch.object(module, "build_opener", side_effect=net.build):
+            first = self.plugin.api_auth(module.AuthRequest(action="send"))
+            replacement = module.HdskyCommunitySign()
+            replacement.storage = copy.deepcopy(self.plugin.storage)
+            replacement.init_plugin(self.plugin.config)
+            second = replacement.api_auth(module.AuthRequest(action="send"))
+        self.assertTrue(first.success)
+        self.assertFalse(second.success)
+        self.assertGreater(second.state.auth.send_after, time.time())
+        self.assertEqual(second.state.auth.pending_uid, "123")
+        self.assertEqual(len(net.requests), 1)
+
+    def test_public_state_is_local_and_excludes_all_secrets(self):
+        self.seed_active()
+        self.plugin._auth["pending"] = {"uid": "123", "cookies": [{"value": "private-challenge"}]}
+        with patch.object(module, "build_opener", side_effect=AssertionError("network")):
+            state = self.plugin.api_state()
+        text = state.model_dump_json() + json.dumps(self.plugin.get_form())
+        for secret in ("old-private", "test-csrf-private", "private-challenge", "csrf_token", "cookies"):
+            self.assertNotIn(secret, text)
+        self.assertTrue(state.auth.cookie_configured)
+        self.assertEqual(state.auth.pending_uid, "123")
+        self.assertEqual(self.plugin.get_render_mode(), ("vue", "dist/assets-v1.1.0"))
+
+    def test_bad_candidate_cookie_via_api_keeps_active_session(self):
+        self.seed_active()
+        old = copy.deepcopy(self.plugin.storage["auth"])
+        with patch.object(module, "build_opener", side_effect=Network(http_error(401)).build):
+            result = self.plugin.api_auth(module.AuthRequest(action="cookie", cookie="session=bad-private"))
+        self.assertFalse(result.success)
+        self.assertEqual(self.plugin.storage["auth"], old)
+        self.assertNotIn("bad-private", result.model_dump_json())
+
+    def test_config_save_updates_instance_schedule_without_network(self):
+        self.plugin.init_plugin({"enabled": True, "auto_sign": True, "uid": "123"})
+        stale = self.plugin.get_service()[0]["func"]
+        with patch.object(module, "build_opener", side_effect=AssertionError("network")), \
+                patch.object(module, "update_plugin_job") as update:
+            result = self.plugin.api_save_config(module.PublicConfig(cron="0 9 * * *", notify=False))
+            self.assertIsNone(stale())
+        update.assert_called_once_with(self.plugin.__class__.__name__)
+        self.assertTrue(result.success)
+        self.assertTrue(result.state.config.auto_sign)
+        self.assertEqual(result.state.config.uid, "123")
+        self.assertEqual(self.plugin.config["cron"], "0 9 * * *")
+        self.assertFalse(self.plugin.config["notify"])
+
+    def test_invalid_config_or_failed_save_preserves_active_schedule(self):
+        old = copy.deepcopy(self.plugin.config)
+        for payload in (module.PublicConfig(cron="bad"), module.PublicConfig(uid="abc")):
+            result = self.plugin.api_save_config(payload)
+            self.assertFalse(result.success)
+            self.assertEqual(self.plugin.config, old)
+        with patch.object(self.plugin, "update_config", return_value=False):
+            failed = self.plugin.api_save_config(module.PublicConfig(notify=False))
+            auth_failed = self.plugin.api_auth(module.AuthRequest(action="send"))
+        self.assertFalse(failed.success)
+        self.assertFalse(auth_failed.success)
+        self.assertEqual(self.plugin._config, old)
+
+    def test_bad_api_inputs_never_send_or_persist_secrets(self):
+        with patch.object(module, "build_opener", side_effect=AssertionError("network")):
+            for payload in (
+                module.AuthRequest(action="send", uid="bad"),
+                module.AuthRequest(action="send", uid=""),
+                module.AuthRequest(action="sign"),
+                module.AuthRequest(action="send", code="012345"),
+                module.AuthRequest(action="send", cookie="session=private-cookie"),
+                module.AuthRequest(action="send", user_agent="bad\nheader"),
+            ):
+                self.assertFalse(self.plugin.api_auth(payload).success)
+        self.assertNotIn("012345", str(self.plugin.storage))
+        self.assertNotIn("private-cookie", str(self.plugin.storage))
+
+    def test_api_rate_limit_exposes_cooldown_without_retry(self):
+        with patch.object(module, "build_opener", side_effect=Network(http_error(429)).build):
+            result = self.plugin.api_auth(module.AuthRequest(action="send"))
+        self.assertFalse(result.success)
+        self.assertGreater(result.state.auth.retry_after, time.time() + 250)
+
+
+class DailyStatisticsTests(unittest.TestCase):
+    setUp = SignTests.setUp
+    invoke = SignTests.invoke
+    restart = SignTests.restart
+
+    def test_repeated_checks_count_reward_once_and_preserve_known_values(self):
+        self.invoke((daily(), []), (daily(True), []))
+        missing_amount = daily(True)
+        missing_amount["profile"]["dailyCheckin"].pop("amount")
+        missing_amount["profile"].pop("wallet")
+        for _ in range(3):
+            self.invoke((missing_amount, []))
+        stats = self.plugin.api_state().statistics
+        self.assertEqual(stats.completed_days, 1)
+        self.assertEqual(stats.reward_total, 20)
+        self.assertEqual(stats.today.balance, 100.5)
+        self.assertEqual(len(self.plugin.storage["checkins"]["history"]), 1)
+        self.assertEqual(len(stats.days), 30)
+
+    def test_upgrade_backfills_history_and_last_idempotently_per_account(self):
+        from datetime import date, timedelta
+        today = self.plugin._day()
+        yesterday = (date.fromisoformat(today) - timedelta(days=1)).isoformat()
+        self.plugin._runtime = {"history": [
+            {"day": today, "uid": "123", "status": "already", "amount": None, "time": 3},
+            {"day": today, "uid": "123", "status": "success", "amount": 20, "time": 2},
+            {"day": yesterday, "uid": "123", "status": "confirmed", "time": 1},
+            {"day": today, "uid": "456", "status": "success", "amount": 999, "time": 1},
+        ]}
+        # v1.0.0 的真实历史行始终包含 message/balance。
+        for row in self.plugin._runtime["history"]:
+            row.update(message="fixture", balance=None)
+        self.plugin._runtime["last"] = {**self.plugin._runtime["history"][0], "time": 4, "balance": 120}
+        self.plugin._save_runtime()
+        self.restart()
+        self.restart()
+        stats = self.plugin.api_state().statistics
+        self.assertEqual(stats.completed_days, 2)
+        self.assertEqual(stats.reward_total, 20)
+        self.assertEqual(stats.unknown_reward_days, 1)
+        self.assertEqual(stats.today.balance, 120)
+        self.assertEqual(len(self.plugin.storage["checkins"]["daily_stats"]), 3)
+        self.plugin._auth["account"]["uid"] = "456"
+        stats = self.plugin.api_state().statistics
+        self.assertEqual(stats.completed_days, 1)
+        self.assertEqual(stats.reward_total, 999)
+
+    def test_confirmed_day_survives_later_errors_history_trim_and_restart(self):
+        self.invoke((daily(), []), (daily(True), []))
+        for _ in range(65):
+            self.plugin._finish_sign("failed", "读取失败", "123")
+        self.assertEqual(len(self.plugin.storage["checkins"]["history"]), 60)
+        self.restart()
+        stats = self.plugin.api_state().statistics
+        self.assertEqual(stats.completed_days, 1)
+        self.assertEqual(stats.reward_total, 20)
+        self.assertEqual(stats.today.status, "success")
+
+    def test_uncertain_and_failed_days_do_not_count_as_completed_or_reward(self):
+        self.invoke((daily(), []), TimeoutError(), (daily(), []))
+        stats = self.plugin.api_state().statistics
+        self.assertEqual(stats.completed_days, 0)
+        self.assertEqual(stats.reward_total, 0)
+        self.assertEqual(stats.today.status, "uncertain")
+        self.assertEqual(stats.days[1].status, "unrecorded")
+        self.invoke((daily(True), []))
+        self.assertEqual(self.plugin.api_state().statistics.completed_days, 1)
+
+    def test_query_failure_records_account_without_releasing_old_submission_intent(self):
+        key = "123:" + self.plugin._day()
+        self.plugin._runtime["attempts"] = {key: {"state": "sent", "request_key": "a" * 32}}
+        self.plugin._save_runtime()
+        self.invoke(http_error(500))
+        state = self.plugin.api_state()
+        self.assertEqual(state.statistics.today.status, "failed")
+        self.assertEqual(state.statistics.completed_days, 0)
+        self.assertEqual(self.plugin._runtime["attempts"][key]["state"], "sent")
+        _, net = self.invoke((daily(), []))
+        self.assertEqual(len(net.requests), 1)
+
+    def test_thirty_day_window_and_ninety_day_retention(self):
+        from datetime import date, timedelta
+        today = date.fromisoformat(self.plugin._day())
+        for offset in (0, 29, 30, 89, 90):
+            day = (today - timedelta(days=offset)).isoformat()
+            self.plugin._merge_daily({"uid": "123", "day": day, "status": "success",
+                                      "amount": 20, "time": 1, "message": "fixture"})
+        self.plugin._prune_daily()
+        stats = self.plugin.api_state().statistics
+        self.assertEqual(stats.completed_days, 2)
+        self.assertEqual(stats.reward_total, 40)
+        self.assertEqual(len(self.plugin._runtime["daily_stats"]), 4)
+        self.assertEqual(stats.days[0].day, today.isoformat())
+        self.assertEqual(stats.days[-1].day, (today - timedelta(days=29)).isoformat())
+
+    def test_sign_api_uses_existing_checkin_protection(self):
+        net = Network((daily(), []), (daily(True), []), (daily(True), []))
+        with patch.object(module, "build_opener", side_effect=net.build):
+            first = self.plugin.api_sign()
+            second = self.plugin.api_sign()
+        self.assertTrue(first.success)
+        self.assertTrue(second.success)
+        self.assertEqual(second.state.statistics.completed_days, 1)
+        self.assertEqual(second.state.statistics.reward_total, 20)
+        self.assertEqual(len([r for r in net.requests if r.method == "POST"]), 1)
 
 
 if __name__ == "__main__":
