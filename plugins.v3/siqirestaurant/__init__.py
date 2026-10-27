@@ -67,6 +67,12 @@ class RestaurantError(Exception):
     pass
 
 
+class RestaurantReadError(RestaurantError):
+    def __init__(self, message, retryable=False):
+        super().__init__(message)
+        self.retryable = retryable
+
+
 def serialized(func):
     @wraps(func)
     def call(self, *args, **kwargs):
@@ -82,7 +88,7 @@ class SiqiRestaurant(_PluginBase):
     plugin_name = "思齐餐厅"
     plugin_desc = "思齐餐厅后台自动经营：每日开业、并行烹饪、及时上菜、限额补货及原生管理面板。"
     plugin_icon = "https://si-qi.xyz/favicon.ico"
-    plugin_version = "1.4.0"
+    plugin_version = "1.4.1"
     plugin_author = "xchenya"
     author_url = "https://github.com/xchenya"
     plugin_config_prefix = "siqirestaurant_"
@@ -319,9 +325,22 @@ class SiqiRestaurant(_PluginBase):
 
     def _request(self, action, payload=None, read=False):
         cookie, ua = self._credentials()
+        label = {"fetch": "读取餐厅状态", "inspect_restaurant_target": "查询下馆子目标",
+                 "list_visitable_restaurants": "读取随机餐馆",
+                 "purchase_ingredient": "购买食材", "start_session": "开始营业",
+                 "serve_customer": "上菜", "customer_left": "顾客离席",
+                 "discard_dish": "丢弃菜品", "visit_restaurant": "下馆子"}.get(action, "餐厅操作")
+        cookie_source = "插件覆盖" if self._config.get("cookie") else "MP 站点"
+        route = "MP 代理" if self._config.get("use_proxy") else "系统网络（含环境代理）"
+        # 空闲查询允许较慢线路；营业、在制订单及开业结果待确认时保持短超时。
+        live = (self._snapshot.get("state", {}).get("session_status") == "open"
+                or self._runtime.get("run", {}).get("live")
+                or (self._runtime.get("pending") or {}).get("action") == "start_session"
+                or any(s.get("status") != "idle" for s in self._runtime.get("kitchen", [])))
+        timeout = (5, 15) if read and not live else (3, 5)
         headers = {"Cookie": cookie, "User-Agent": ua, "Referer": "https://si-qi.xyz/siqi_restaurant.php",
                    "Accept": "application/json", "Origin": "https://si-qi.xyz"}
-        options = dict(headers=headers, timeout=(3, 5), allow_redirects=False,
+        options = dict(headers=headers, timeout=timeout, allow_redirects=False,
                        proxies=settings.PROXY if self._config.get("use_proxy") else None)
         try:
             if action == "fetch":
@@ -332,22 +351,49 @@ class SiqiRestaurant(_PluginBase):
                 data = {"action": action, **(payload or {})}
                 response = requests.post("https://si-qi.xyz/siqi_restaurant.php",
                                          files={key: (None, str(value)) for key, value in data.items()}, **options)
-            if response.status_code != 200:
-                raise RestaurantError(f"站点 HTTP {response.status_code}，请检查登录状态或代理")
-            result = response.json()
+            status = response.status_code
+            if 300 <= status < 400:
+                raise RestaurantReadError(f"站点 HTTP {status} 重定向，请核对 Cookie 或站点登录/验证页面")
+            if status in (401, 403):
+                raise RestaurantReadError(f"站点 HTTP {status} 拒绝访问，请核对 Cookie、User-Agent 和站点防护")
+            if status == 429:
+                raise RestaurantReadError("站点 HTTP 429 请求过于频繁，请稍后再试", retryable=True)
+            if status != 200:
+                raise RestaurantReadError(f"站点 HTTP {status}", retryable=500 <= status < 600)
+            try:
+                result = response.json()
+            except ValueError:
+                # 只识别响应类型，不记录正文、跳转地址或第三方异常文本。
+                html = ("text/html" in response.headers.get("Content-Type", "").lower()
+                        or response.content.lstrip().startswith(b"<"))
+                reason = ("站点返回 HTML 页面，可能是登录或验证页面，请核对 Cookie 和 User-Agent"
+                          if html else "站点返回非 JSON 数据，请稍后刷新并核对站点响应")
+                raise RestaurantReadError(reason) from None
             if not isinstance(result, dict) or not isinstance(result.get("success"), bool):
-                raise RestaurantError("站点返回格式异常，请检查 Cookie 或站点验证页面")
+                raise RestaurantReadError("站点 JSON 格式异常，缺少有效 success 字段")
             return result
-        except (requests.RequestException, ValueError, RestaurantError) as exc:
+        except (requests.RequestException, RestaurantReadError) as exc:
+            retryable = False
+            if isinstance(exc, RestaurantReadError):
+                reason, retryable = str(exc), exc.retryable
+            elif isinstance(exc, requests.exceptions.ProxyError):
+                reason, retryable = "代理连接失败，请检查代理地址和连通性", True
+            elif isinstance(exc, requests.exceptions.SSLError):
+                reason = "TLS 证书校验或握手失败，请检查证书、系统时间和代理"
+            elif isinstance(exc, requests.exceptions.ConnectTimeout):
+                reason, retryable = f"连接超时（{timeout[0]} 秒）", True
+            elif isinstance(exc, requests.exceptions.ReadTimeout):
+                reason, retryable = f"响应读取超时（{timeout[1]} 秒）", True
+            elif isinstance(exc, requests.Timeout):
+                reason, retryable = "请求超时", True
+            elif isinstance(exc, requests.ConnectionError):
+                reason, retryable = "连接失败，请检查 DNS、网络或环境代理", True
+            else:
+                reason = "请求发送失败，请检查 Cookie、User-Agent 和代理配置格式"
+            message = f"{label}失败：{reason}；Cookie 来源：{cookie_source}；网络：{route}"
             if not read:
-                # 不抄录响应内容、请求头或异常 URL，避免泄漏 Cookie。
-                reason = (str(exc) if isinstance(exc, RestaurantError) else
-                          "连接超时" if isinstance(exc, requests.Timeout) else
-                          "连接异常" if isinstance(exc, requests.RequestException) else "响应格式异常")
-                raise RestaurantError(f"{reason}，写入结果不明；正在读回核对，原请求不会重发") from exc
-            if isinstance(exc, RestaurantError):
-                raise
-            raise RestaurantError("读取站点失败，请检查网络、Cookie 和代理") from exc
+                raise RestaurantError(f"{message}；写入结果不明，正在读回核对，原请求不会重发") from None
+            raise RestaurantReadError(message, retryable=retryable) from None
 
     @staticmethod
     def _empty(index):
@@ -775,7 +821,7 @@ class SiqiRestaurant(_PluginBase):
         changed = auto.get("phase") != phase or auto.get("message") != message
         auto.update(phase=phase, message=message, last_check=time.time())
         if changed:
-            self._event("automation", message, phase not in {"blocked", "error", "uncertain"})
+            self._event("automation", message, phase not in {"blocked", "error", "uncertain", "retrying"})
         self._save()
         if phase in {"blocked", "error", "uncertain"}:
             self._notify_once(f"alert:{phase}", "需要处理", message)
@@ -1032,9 +1078,24 @@ class SiqiRestaurant(_PluginBase):
             run["failures"] = run.get("failures", 0) + 1
             live = (run.get("live") or self._snapshot.get("state", {}).get("session_status") == "open" or
                     (self._runtime.get("pending") or {}).get("action") == "start_session")
-            self._auto_status("uncertain" if self._runtime.get("pending") else "blocked", str(exc))
-            self._next_auto = time.time() + (min(5, run["failures"] * 2) if live else 60)
-            if not live and run["failures"] >= 3:
+            pending = bool(self._runtime.get("pending"))
+            transient = isinstance(exc, RestaurantReadError) and exc.retryable and not pending
+            delay = min(5, run["failures"] * 2) if live else 60
+            # 被限流时同样退避，不能在营业中每 2 秒继续触发 429。
+            if isinstance(exc, RestaurantReadError) and "HTTP 429" in str(exc):
+                delay = 60
+            stopped = not live and run["failures"] >= 3
+            self._next_auto = time.time() + delay
+            if transient:
+                suffix = ("本次已停止，等待下次 Cron 或保存后运行一次" if stopped
+                          else f"{delay} 秒后自动重查")
+                message = f"{exc}；连续失败 {run['failures']} 次，{suffix}"
+            else:
+                message = str(exc)
+            phase = ("uncertain" if pending else
+                     "retrying" if transient and run["failures"] < 3 else "blocked")
+            self._auto_status(phase, message)
+            if stopped:
                 run["active"] = False
                 self._save()
         except Exception:

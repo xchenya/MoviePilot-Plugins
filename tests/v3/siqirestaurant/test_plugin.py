@@ -894,3 +894,170 @@ def test_cron_default_migration_multiple_times_and_init_run_once(module):
     second = trigger.get_next_fire_time(first, first)
     third = trigger.get_next_fire_time(second, second)
     assert [d.hour for d in [first, second, third]] == [8, 12, 18]
+
+
+@pytest.mark.parametrize("cookie,username", [("uid=101; token=alpha", "FirstUser"),
+                                             ("uid=902; token=beta", "SecondUser")])
+def test_connection_uses_each_mp_account(module, monkeypatch, cookie, username):
+    module.site.cookie, module.site.ua = cookie, "other-browser-UA"
+    p = module.SiqiRestaurant()
+    p.init_plugin({"enabled": True})
+    data = snapshot()
+    data["user"].update(id=902, username=username, magic=4321)
+    get = Mock(return_value=Mock(status_code=200, json=lambda: copy.deepcopy(data)))
+    monkeypatch.setattr(requests, "get", get)
+    result = p.api_state()
+    assert result["success"] and result["restaurant"]["user"]["username"] == username
+    assert result["restaurant"]["user"]["magic"] == 4321
+    assert get.call_args.kwargs["headers"]["Cookie"] == cookie
+    assert get.call_args.kwargs["headers"]["User-Agent"] == "other-browser-UA"
+    assert get.call_args.kwargs["params"] == {"action": "fetch"}
+    assert cookie not in json.dumps(result)
+
+
+@pytest.mark.parametrize("exception,expected,retryable", [
+    (requests.exceptions.ConnectTimeout, "连接超时（5 秒）", True),
+    (requests.exceptions.ReadTimeout, "响应读取超时（15 秒）", True),
+    (requests.exceptions.ProxyError, "代理连接失败", True),
+    (requests.exceptions.SSLError, "TLS 证书", False),
+    (requests.ConnectionError, "DNS", True),
+    (requests.exceptions.InvalidHeader, "配置格式", False),
+])
+def test_read_failure_diagnostics_redact_secrets(module, monkeypatch, exception, expected, retryable):
+    p = module.SiqiRestaurant()
+    p.init_plugin({"enabled": True, "cookie": "override=secret", "use_proxy": True})
+    module.settings.PROXY = {"https": "http://user:password@proxy.invalid:7890"}
+    get = Mock(side_effect=exception("override=secret http://user:password@proxy.invalid"))
+    monkeypatch.setattr(requests, "get", get)
+    with pytest.raises(module.RestaurantReadError) as raised:
+        p._request("fetch", read=True)
+    message = str(raised.value)
+    assert "读取餐厅状态失败" in message and expected in message
+    assert "Cookie 来源：插件覆盖" in message and "网络：MP 代理" in message
+    assert raised.value.retryable is retryable
+    assert all(value not in message for value in ("secret", "password", "proxy.invalid"))
+    assert get.call_count == 1
+    assert get.call_args.kwargs["proxies"] == module.settings.PROXY
+
+
+@pytest.mark.parametrize("status,body,expected,retryable", [
+    (302, b"", "重定向", False),
+    (401, b"", "HTTP 401", False),
+    (403, b"", "HTTP 403", False),
+    (429, b"", "请求过于频繁", True),
+    (503, b"", "HTTP 503", True),
+    (200, b"<html>secret login</html>", "HTML", False),
+    (200, b"bad-secret-response", "非 JSON", False),
+    (200, b'{"success":"yes"}', "success", False),
+])
+def test_read_http_and_response_diagnostics(module, monkeypatch, status, body, expected, retryable):
+    p = module.SiqiRestaurant()
+    p.init_plugin({"enabled": True})
+    response = requests.Response()
+    response.status_code, response._content = status, body
+    response.headers["Location"] = "https://other.invalid/?token=secret"
+    get = Mock(return_value=response)
+    monkeypatch.setattr(requests, "get", get)
+    with pytest.raises(module.RestaurantReadError) as raised:
+        p._request("fetch", read=True)
+    assert expected in str(raised.value) and "secret" not in str(raised.value)
+    assert raised.value.retryable is retryable
+    assert get.call_count == 1 and get.call_args.kwargs["allow_redirects"] is False
+
+
+@pytest.mark.parametrize("live_source", ["open", "pending", "kitchen", "restart"])
+def test_live_read_keeps_short_timeout(module, monkeypatch, live_source):
+    p = module.SiqiRestaurant()
+    p.init_plugin({"enabled": True})
+    if live_source == "open":
+        p._snapshot = {"state": {"session_status": "open"}}
+    elif live_source == "pending":
+        p._runtime["pending"] = {"action": "start_session"}
+    elif live_source == "kitchen":
+        p._runtime["kitchen"] = [{"status": "cooking"}]
+    else:
+        p._runtime["run"] = {"live": True}
+    get = Mock(side_effect=requests.exceptions.ReadTimeout("secret"))
+    monkeypatch.setattr(requests, "get", get)
+    with pytest.raises(module.RestaurantReadError, match="5 秒"):
+        p._request("fetch", read=True)
+    assert get.call_args.kwargs["timeout"] == (3, 5)
+
+
+@pytest.mark.parametrize("targets,label", [([], "读取随机餐馆"), (["Alice"], "查询下馆子目标")])
+def test_status_success_then_visit_read_failure_is_not_account_failure(module, monkeypatch, targets, label):
+    p = module.SiqiRestaurant()
+    p.init_plugin({"enabled": True, "auto_visit": True, "notify": True, "visit_targets": targets})
+    data = snapshot()
+    data["state"]["session_status"] = "closed"
+    data["user"].update(username="OtherUser", magic=54321)
+    get = Mock(return_value=Mock(status_code=200, json=lambda: copy.deepcopy(data)))
+    post = Mock(side_effect=requests.exceptions.ReadTimeout("secret"))
+    monkeypatch.setattr(requests, "get", get)
+    monkeypatch.setattr(requests, "post", post)
+    p.start_automation()
+    p.run_automation()
+    assert p._snapshot["user"]["magic"] == 54321
+    assert p._runtime["automation"]["phase"] == "retrying"
+    assert label in p._runtime["automation"]["message"]
+    assert p._runtime["run"]["active"] and not p._runtime.get("pending")
+    assert not p.notifications and post.call_count == 1
+    assert get.call_args.kwargs["headers"]["Cookie"] == post.call_args.kwargs["headers"]["Cookie"]
+
+
+def test_transient_reads_notify_only_after_three_and_stop_when_idle(plugin, module, monkeypatch):
+    clock = [time.time()]
+    monkeypatch.setattr(module.time, "time", lambda: clock[0])
+    enable_auto(plugin, notify=True)
+    plugin._request = Mock(side_effect=module.RestaurantReadError("读取餐厅状态失败：响应读取超时", retryable=True))
+    for failure in range(1, 4):
+        plugin.run_automation()
+        assert plugin._runtime["run"]["failures"] == failure
+        assert len(plugin.notifications) == (1 if failure == 3 else 0)
+        assert plugin._next_auto == clock[0] + 60
+        clock[0] += 61
+    assert not plugin._runtime["run"]["active"]
+    assert "连续失败 3 次" in plugin.notifications[0]["text"]
+    assert "等待下次 Cron" in plugin.notifications[0]["text"]
+    plugin.run_automation()
+    assert plugin._request.call_count == 3 and not plugin._runtime.get("pending")
+
+
+def test_transient_read_recovers_without_alert_or_stale_write(plugin, module, monkeypatch):
+    clock = [time.time()]
+    monkeypatch.setattr(module.time, "time", lambda: clock[0])
+    enable_auto(plugin, notify=True)
+    data = snapshot()
+    data["state"].update(session_status="closed", customers_total=0, customers_served=0)
+    plugin._request = Mock(side_effect=[
+        module.RestaurantReadError("读取餐厅状态失败：连接超时", retryable=True), data])
+    plugin.run_automation()
+    assert not plugin.notifications and plugin._runtime["automation"]["phase"] == "retrying"
+    clock[0] += 61
+    plugin.run_automation()
+    assert plugin._runtime["run"]["failures"] == 0
+    assert not plugin._runtime["run"]["active"]
+    assert not any("需要处理" in notice["title"] for notice in plugin.notifications)
+    assert all(call.args[0] == "fetch" for call in plugin._request.call_args_list)
+
+
+def test_nontransient_read_failure_still_notifies_immediately(plugin, module):
+    enable_auto(plugin, notify=True)
+    plugin._request = Mock(side_effect=module.RestaurantReadError("站点 HTTP 403 拒绝访问"))
+    plugin.run_automation()
+    assert plugin._runtime["automation"]["phase"] == "blocked"
+    assert len(plugin.notifications) == 1 and "HTTP 403" in plugin.notifications[0]["text"]
+
+
+@pytest.mark.parametrize("reason,delay", [("HTTP 429", 60), ("响应读取超时", 2)])
+def test_live_read_backoff_respects_rate_limit(plugin, module, monkeypatch, reason, delay):
+    clock = [time.time()]
+    monkeypatch.setattr(module.time, "time", lambda: clock[0])
+    enable_auto(plugin, notify=True)
+    plugin._ensure_fresh(force=True)
+    plugin._last_fetch = 0
+    plugin._request = Mock(side_effect=module.RestaurantReadError(reason, retryable=True))
+    plugin.run_automation()
+    assert plugin._next_auto == clock[0] + delay
+    assert plugin._runtime["run"]["active"] and not plugin.notifications
+    assert plugin._request.call_count == 1 and not plugin._runtime.get("pending")
