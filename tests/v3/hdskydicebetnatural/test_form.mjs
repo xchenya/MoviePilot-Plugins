@@ -90,3 +90,30 @@ test('missing frontend client restores the form without reading browser credenti
   const form = model(); await invoke(handlers['登录'], form, null)
   assert.equal(form.helper_busy, false); assert.equal(form.helper_code, ''); assert.equal(form.helper_login_type, 'warning')
 })
+
+test('immediate check reads rewards without submitting settings or credentials', async () => {
+  const form = model(), calls = []
+  assert.ok(handlers['立即检查观影券'])
+  await invoke(handlers['立即检查观影券'], form, { async post(path, body) {
+    calls.push({ path, body })
+    return { success: true, message: '今日观影券已核实：2 次' }
+  } })
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].body.action, 'check_tickets')
+  assert.ok(calls[0].path.endsWith('/helper/auth'))
+  for (const key of ['code', 'access_token', 'refresh_token', 'bet_amount', 'onlyonce']) {
+    assert.equal(calls[0].body[key], undefined)
+  }
+  assert.equal(form.helper_login_message, '今日观影券已核实：2 次')
+  assert.equal(form.helper_login_type, 'success')
+  assert.equal(form.helper_busy, false)
+})
+
+test('failed reward check is shown as a warning', async () => {
+  const form = model()
+  await invoke(handlers['立即检查观影券'], form, { async post() {
+    return { success: false, message: '观影券检查失败：Token 已失效' }
+  } })
+  assert.equal(form.helper_login_type, 'warning')
+  assert.match(form.helper_login_message, /Token 已失效/)
+})

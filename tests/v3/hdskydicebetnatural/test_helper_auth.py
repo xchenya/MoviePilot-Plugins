@@ -323,3 +323,140 @@ def test_manual_import_is_saved_immediately_and_status_is_readonly(host):
     assert r.success and r.state.configured and p._helper_cookie == "access-private"
     assert action(p, m, "status").success
     p._helper_login_post.assert_not_called()
+
+
+def reward_response(count):
+    return Response({"success": True, "data": {"todayRandomRewardCount": count}})
+
+
+def test_scheduler_reloads_tokens_saved_by_another_instance(host):
+    api, m = host
+    worker = m.HdskyDiceBetNatural()
+    worker.data = api.data  # The same plugin instance's persistent store.
+    worker._list_hdsky_sites = api._list_hdsky_sites
+    worker.init_plugin({"enabled": True, "site_id": 49, "max_daily_tickets": 3})
+    assert not worker._helper_cookie
+    action(api, m, "import", access_token=jwt(), refresh_token="saved-refresh")
+    worker._load_site_auth = Mock(side_effect=AssertionError("must not scan PMs"))
+    worker._scan_ticket_mailboxes = Mock(side_effect=AssertionError("must not scan PMs"))
+    worker._helper_reward_api_get = Mock(return_value=reward_response(2))
+    success, message = worker.run_ticket_check()
+    assert success and "2 次" in message
+    worker._helper_reward_api_get.assert_called_once_with(jwt())
+    assert worker._helper_refresh_token == "saved-refresh"
+    assert worker._ticket_count_ready()
+    assert worker.data["ticket_inbox_status"]["source"] == "helper"
+    worker._load_site_auth.assert_not_called()
+    worker._scan_ticket_mailboxes.assert_not_called()
+
+
+def test_manual_check_runs_disabled_bypasses_cache_and_does_not_bet(host):
+    p, m = host
+    login(p, m)
+    assert not p._enabled
+    p._helper_reward_api_get = Mock(side_effect=[reward_response(1), reward_response(2)])
+    first = action(p, m, "check_tickets")
+    second = action(p, m, "check_tickets")
+    assert first.success and "1 次" in first.message
+    assert second.success and "2 次" in second.message
+    assert p._helper_reward_api_get.call_count == 2
+    assert p.data["ticket_inbox_status"]["verified"] is True
+    p.run_once.assert_not_called()
+    p._run_internal.assert_not_called()
+    assert not p._run_lock.locked()
+
+
+def test_manual_check_error_does_not_claim_token_valid_or_replace_count(host):
+    p, m = host
+    login(p, m)
+    p._helper_reward_api_get = Mock(return_value=reward_response(2))
+    assert action(p, m, "check_tickets").success
+    p._helper_reward_api_get.return_value = Response(status=403)
+    result = action(p, m, "check_tickets")
+    assert not result.success and "403" in result.message
+    assert p.data["tickets_by_day"][p._today_str()] == 2
+    assert not p.data["ticket_inbox_status"]["verified"]
+    assert "refresh-private" not in result.model_dump_json()
+    assert jwt() not in result.model_dump_json()
+
+
+def test_manual_check_can_refresh_after_cap_but_cannot_clear_stop_marker(host):
+    p, m = host
+    login(p, m)
+    p._max_daily_tickets = 3
+    p._notify_daily_limit_stop = Mock()
+    p._helper_reward_api_get = Mock(return_value=reward_response(3))
+    assert action(p, m, "check_tickets").success
+    assert p._daily_ticket_limit_reached()
+    p._enabled = True
+    p.run_ticket_check()  # Automatic checks still stop without network.
+    assert p._helper_reward_api_get.call_count == 1
+    p._helper_reward_api_get.return_value = Response(status=403)
+    assert not action(p, m, "check_tickets").success
+    assert p._helper_reward_api_get.call_count == 2
+    assert p._daily_ticket_limit_reached()
+    p._continue_on_ticket_failure = True
+    assert "已达上限" in m.HdskyDiceBetNatural._run_internal(p)
+
+
+def test_manual_check_busy_returns_without_network_or_bets(host):
+    p, m = host
+    p._helper_reward_api_get = Mock(side_effect=AssertionError("no HTTP"))
+    p._run_lock.acquire()
+    try:
+        result = action(p, m, "check_tickets")
+        assert not result.success and "正在运行" in result.message
+    finally:
+        p._run_lock.release()
+    p._helper_reward_api_get.assert_not_called()
+    p.run_once.assert_not_called()
+
+
+@pytest.mark.parametrize("state", ["missing", "failed", "stale"])
+@pytest.mark.parametrize("allow", [False, True])
+def test_unknown_count_switch_controls_betting_without_trusting_legacy_count(host, state, allow):
+    p, m = host
+    p.init_plugin({"enabled": True, "site_id": 49, "max_daily_tickets": 3,
+                   "continue_on_ticket_failure": allow, "humanize": False,
+                   "cleanup_rating_pm": False})
+    p.data["tickets_by_day"] = {p._today_str(): 99}  # Legacy count must not block.
+    if state != "missing":
+        p.data["ticket_inbox_status"] = {
+            "date": p._today_str(), "verified": state == "stale", "count": 2,
+            "source": "inbox", "source_identity": "", "checked_ts": time.time() - 7200,
+        }
+    p._load_site_auth = Mock(return_value=(True, "ok"))
+    p._ensure_username = Mock(return_value=True)
+    p._sync_pending_results = Mock()
+    p._human_pause = Mock()
+    p._check_pl_stop = Mock(return_value=None)
+    p._list_forum_topics = Mock(return_value=[])
+    p._refresh_draw_history = Mock()
+    message = m.HdskyDiceBetNatural._run_internal(p)
+    if allow:
+        assert "当前没有可下注帖子" in message
+        p._list_forum_topics.assert_called_once()
+    else:
+        assert "暂停本轮下注" in message
+        p._load_site_auth.assert_not_called()
+
+
+def test_switch_defaults_off_and_survives_config_save(host):
+    p, _ = host
+    form, defaults = p.get_form()
+    assert defaults["continue_on_ticket_failure"] is False
+    assert "无法获取观影券时继续执行" in json.dumps(form, ensure_ascii=False)
+    p.init_plugin({**p._config, "continue_on_ticket_failure": True})
+    assert p._continue_on_ticket_failure
+    p.init_plugin(p._config)
+    assert p._continue_on_ticket_failure
+
+
+def test_persisted_rotated_tokens_are_used_by_old_worker(host):
+    p, m = host
+    login(p, m)
+    p.data["helper_credentials"].update(access_token="new-access", refresh_token="new-refresh")
+    p._helper_reward_api_get = Mock(return_value=reward_response(2))
+    assert action(p, m, "check_tickets").success
+    p._helper_reward_api_get.assert_called_once_with("new-access")
+    assert p._helper_refresh_token == "new-refresh"

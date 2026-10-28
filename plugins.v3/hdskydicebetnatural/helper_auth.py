@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class HelperAuthRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    action: Literal["send", "login", "status", "import"]
+    action: Literal["send", "login", "status", "import", "check_tickets"]
     uid: str = Field(default="", max_length=12)
     email: str = Field(default="", max_length=254)
     code: str = Field(default="", max_length=6, repr=False)
@@ -71,6 +71,18 @@ class HelperLogin:
     def credentials(self):
         value = self.host.get_data("helper_credentials")
         return copy.deepcopy(value) if isinstance(value, dict) else {}
+
+    def sync_credentials(self):
+        """API handlers and scheduler callbacks may retain different instances.
+
+        Read the persisted pair before selecting a source or refreshing a token;
+        updating the instance that handled login alone does not update other jobs.
+        """
+        with self.lock:
+            credentials = self.credentials()
+            if credentials:
+                self.host._helper_cookie = credentials.get("access_token", "")
+                self.host._helper_refresh_token = credentials.get("refresh_token", "")
 
     def write(self, key, value):
         if self.host.save_data(key, copy.deepcopy(value)) is False:
@@ -166,7 +178,7 @@ class HelperLogin:
             return self.result(False, "正在处理认证请求，请稍后再试。")
         try:
             if request.action == "status":
-                return self.result(True, "Token 已保存，独立观影券检查会核验有效性并自动续期。"
+                return self.result(True, "Token 已保存；此按钮只读取保存状态，点击“立即检查观影券”可联网验证并读取今日数量。"
                                    if self.state().configured else "尚未保存辅助站凭据。")
             meta, now = self.metadata(), time.time()
             if now < meta.get("retry_after", 0):
@@ -247,7 +259,9 @@ def click_handler(action):
         model.helper_login_type = result.success ? 'success' : 'warning';
       } catch (_) {
         model.helper_login_type = 'warning';
-        model.helper_login_message = '请求未完成，请检查连接。验证码发送或登录不会自动重发；可点击“刷新登录状态”核对已保存状态。';
+        model.helper_login_message = 'ACTION' === 'check_tickets'
+          ? '观影券检查请求未完成，请查看插件日志或稍后重试。'
+          : '请求未完成，请检查连接。验证码发送或登录不会自动重发；可点击“刷新登录状态”核对已保存状态。';
       } finally { model.helper_busy = false; }
     }""".replace("ACTION", action)
 
@@ -282,6 +296,7 @@ def login_form(plugin_id, state):
             button("send", "发送验证码", "{{ helper_busy || !helper_uid || !helper_email }}"),
             button("login", "登录", "{{ helper_busy || !helper_uid || !helper_email || !/^[0-9]{6}$/.test(helper_code) }}"),
             button("status", "刷新登录状态", "{{ helper_busy }}"),
+            button("check_tickets", "立即检查观影券", "{{ helper_busy }}"),
             {"component": "VAlert", "props": {"type": "info", "variant": "text",
              "text": "发送与登录直接生效，无需保存配置。登录只用于辅助站观影券核验；主站 Cookie 仍从上方选择的 MP 站点读取。其他设置修改后按原方式保存。"}},
         ]},
