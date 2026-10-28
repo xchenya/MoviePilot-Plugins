@@ -101,7 +101,9 @@ class LoginTests(unittest.TestCase):
         with patch.object(module, "build_opener", side_effect=AssertionError("network")):
             self.run_action()
             self.plugin.init_plugin(self.plugin.config)
-        self.assertEqual(self.plugin.get_service(), [])
+        self.assertEqual([job["id"] for job in self.plugin.get_service()], ["HdskyCommunitySign.retry"])
+        with patch.object(module, "build_opener", side_effect=AssertionError("network")):
+            self.assertIsNone(self.plugin.get_service()[0]["func"]())
 
     def test_send_login_capture_httponly_and_check_after_restart(self):
         net = Network(
@@ -284,7 +286,7 @@ class LoginTests(unittest.TestCase):
         self.assertEqual({api["path"] for api in apis}, {"/state", "/config", "/auth", "/sign"})
         self.assertTrue(all(api["auth"] == "bear" and api["response_model"] for api in apis))
         self.assertTrue(all(api["methods"] == ["POST"] for api in apis if api["path"] != "/state"))
-        self.assertEqual(self.plugin.get_service(), [])
+        self.assertTrue(all(job["id"].endswith(".retry") for job in self.plugin.get_service()))
         self.assertEqual(self.plugin.get_command(), [])
         self.assertEqual(set(module.PATHS), {"send", "login", "check", "sign"})
         self.plugin.stop_service()
@@ -586,7 +588,7 @@ class InteractiveApiTests(unittest.TestCase):
             self.assertNotIn(secret, text)
         self.assertTrue(state.auth.cookie_configured)
         self.assertEqual(state.auth.pending_uid, "123")
-        self.assertEqual(self.plugin.get_render_mode(), ("vue", "dist/assets-v1.1.0"))
+        self.assertEqual(self.plugin.get_render_mode(), ("vue", "dist/assets-v1.2.0"))
 
     def test_bad_candidate_cookie_via_api_keeps_active_session(self):
         self.seed_active()
@@ -750,6 +752,249 @@ class DailyStatisticsTests(unittest.TestCase):
         self.assertEqual(second.state.statistics.completed_days, 1)
         self.assertEqual(second.state.statistics.reward_total, 20)
         self.assertEqual(len([r for r in net.requests if r.method == "POST"]), 1)
+
+
+class WalletAndConnectionTests(unittest.TestCase):
+    setUp = SignTests.setUp
+
+    def check(self, *steps):
+        net = Network(*steps)
+        with patch.object(module, "build_opener", side_effect=net.build):
+            result = self.plugin.api_auth(module.AuthRequest(action="check"))
+        self.assertEqual(net.steps, [])
+        self.assertTrue(all(r.method == "GET" for r in net.requests))
+        return result, net
+
+    def test_balance_without_signing_even_when_plugin_disabled(self):
+        self.plugin.init_plugin({**self.plugin.config, "enabled": False})
+        result, net = self.check((daily(False), []))
+        self.assertTrue(result.success)
+        self.assertEqual(result.state.auth.balance, 100.5)
+        self.assertEqual(result.state.auth.connection_status, "ok")
+        self.assertEqual(result.state.statistics.completed_days, 0)
+        self.assertEqual(result.state.statistics.reward_total, 0)
+        self.assertEqual(result.state.statistics.today.status, "not_signed")
+        self.assertIsNone(result.state.statistics.today.amount)
+        self.assertEqual(len(net.requests), 1)
+        self.assertNotIn("attempts", self.plugin._runtime)
+        self.assertEqual(self.plugin.messages, [])
+        self.assertNotIn("private-cookie", result.model_dump_json())
+
+    def test_zero_balance_and_readonly_signed_statistics(self):
+        reply = daily(True)
+        reply["profile"]["wallet"]["balance"] = 0
+        result, _ = self.check((reply, []))
+        self.assertEqual(result.state.auth.balance, 0)
+        self.assertEqual(result.state.statistics.completed_days, 1)
+        self.assertEqual(result.state.statistics.reward_total, 20)
+        self.assertEqual(self.plugin.messages, [])
+
+    def test_missing_wallet_clears_snapshot_without_breaking_cookie_check(self):
+        self.check((daily(), []))
+        result, _ = self.check((GOOD, []))
+        self.assertTrue(result.success)
+        self.assertIsNone(result.state.auth.balance)
+
+    def test_connection_failure_differs_from_invalid_cookie(self):
+        self.check((daily(), []))
+        result, _ = self.check(URLError("private-cookie"))
+        self.assertFalse(result.success)
+        self.assertEqual(result.state.auth.connection_status, "error")
+        self.assertTrue(result.state.auth.verified)
+        self.assertEqual(result.state.auth.balance, 100.5)  # 带上次获取时间的缓存值
+        self.assertNotIn("private-cookie", result.model_dump_json())
+        result, _ = self.check(http_error(401))
+        self.assertFalse(result.state.auth.verified)
+        self.assertEqual(result.state.auth.connection_status, "invalid")
+
+    def test_new_account_does_not_inherit_previous_balance(self):
+        self.check((daily(), []))
+        jar = self.plugin._parse_cookie("session=other-private")
+        other = copy.deepcopy(GOOD)
+        other["profile"]["account"]["hdskyUid"] = 456
+        self.plugin._accept(jar, other)
+        self.assertEqual(self.plugin.api_state().auth.uid, "456")
+        self.assertIsNone(self.plugin.api_state().auth.balance)
+
+
+class RetryTests(unittest.TestCase):
+    setUp = SignTests.setUp
+    invoke = SignTests.invoke
+    restart = SignTests.restart
+
+    def due(self, *steps):
+        self.plugin._runtime["sign_retry"]["next_at"] = time.time() - 1
+        net = Network(*steps)
+        with patch.object(module, "build_opener", side_effect=net.build):
+            result = self.plugin.retry_sign_in()
+        self.assertEqual(net.steps, [])
+        return result, net
+
+    def test_preflight_failure_retries_and_succeeds(self):
+        self.plugin.init_plugin({**self.plugin.config, "retry_count": 2, "retry_interval": 120})
+        before = time.time()
+        self.invoke(URLError("private"))
+        plan = self.plugin.api_state().retry
+        self.assertTrue(plan.pending)
+        self.assertEqual(plan.used, 0)
+        self.assertGreaterEqual(plan.next_at, before + 120)
+        with patch.object(module, "build_opener", side_effect=AssertionError("too early")):
+            self.assertIsNone(self.plugin.retry_sign_in())
+        row, net = self.due((daily(), []), (daily(True), []))
+        self.assertEqual(row["status"], "success")
+        self.assertEqual(len([r for r in net.requests if r.method == "POST"]), 1)
+        self.assertFalse(self.plugin.api_state().retry.pending)
+        self.assertNotIn("sign_retry", self.plugin.storage["checkins"])
+
+    def test_retry_limit_and_restart_preserve_consumed_budget(self):
+        self.plugin.init_plugin({**self.plugin.config, "retry_count": 2})
+        self.invoke(http_error(500))
+        self.due(http_error(500))
+        self.restart()
+        self.assertEqual(self.plugin.api_state().retry.used, 1)
+        self.due(http_error(500))
+        self.assertFalse(self.plugin.api_state().retry.pending)
+        self.assertEqual(self.plugin.api_state().retry.used, 2)
+        self.restart()
+        self.assertEqual(self.plugin.api_state().retry.used, 2)
+        with patch.object(module, "build_opener", side_effect=AssertionError("exhausted")):
+            self.assertIsNone(self.plugin.retry_sign_in())
+
+    def test_uncertain_post_only_rechecks_even_after_restart(self):
+        self.invoke((daily(), []), TimeoutError(), (daily(), []))
+        self.restart()
+        row, net = self.due((daily(), []))
+        self.assertEqual(row["status"], "uncertain")
+        self.assertTrue(all(r.method == "GET" for r in net.requests))
+        row, net = self.due((daily(True), []))
+        self.assertEqual(row["status"], "already")
+        self.assertTrue(all(r.method == "GET" for r in net.requests))
+        self.assertFalse(self.plugin.api_state().retry.pending)
+
+    def test_rate_limit_delays_retry_beyond_configured_interval(self):
+        self.invoke((daily(), []), http_error(429, **{"Retry-After": "900"}))
+        self.assertGreaterEqual(self.plugin.api_state().retry.next_at, self.plugin._runtime["retry_after"])
+        self.plugin._runtime["sign_retry"]["next_at"] = time.time() - 1
+        with patch.object(module, "build_opener", side_effect=AssertionError("cooldown")):
+            self.assertIsNone(self.plugin.retry_sign_in())
+        self.assertEqual(self.plugin.api_state().retry.used, 0)
+
+    def test_cookie_invalid_during_uncertain_readback_stops_retries(self):
+        row, _ = self.invoke((daily(), []), TimeoutError(), http_error(401))
+        self.assertEqual(row["status"], "uncertain")
+        self.assertFalse(self.plugin.api_state().auth.verified)
+        self.assertFalse(self.plugin.api_state().retry.pending)
+
+    def test_duplicate_retry_callback_cannot_run_before_next_interval(self):
+        self.invoke(http_error(500))
+        self.due(http_error(500))
+        with patch.object(module, "build_opener", side_effect=AssertionError("duplicate callback")):
+            self.assertIsNone(self.plugin.retry_sign_in())
+        self.assertEqual(self.plugin.api_state().retry.used, 1)
+
+    def test_diagnostics_invalid_cookie_cancels_pending_retry(self):
+        self.invoke(http_error(500))
+        with patch.object(module, "build_opener", side_effect=Network(http_error(401)).build):
+            result = self.plugin.api_auth(module.AuthRequest(action="check"))
+        self.assertFalse(result.state.retry.pending)
+        self.assertNotIn("sign_retry", self.plugin.storage["checkins"])
+
+    def test_invalid_cookie_and_forbidden_do_not_retry(self):
+        for failure in (http_error(401), http_error(403)):
+            self.setUp()
+            self.invoke(failure)
+            self.assertFalse(self.plugin.api_state().retry.pending)
+
+    def test_disabled_retries_register_no_worker_and_make_no_plan(self):
+        self.plugin.init_plugin({**self.plugin.config, "retry_count": 0})
+        self.assertEqual(self.plugin.get_service(), [])
+        self.invoke(http_error(500))
+        self.assertFalse(self.plugin.api_state().retry.pending)
+
+    def test_stopped_stale_generation_account_and_date_do_not_retry(self):
+        self.invoke(http_error(500))
+        stale = self.plugin.get_service()[0]["func"]
+        self.plugin.init_plugin(self.plugin.config)
+        with patch.object(module, "build_opener", side_effect=AssertionError("stale")):
+            self.assertIsNone(stale())
+            self.plugin._runtime["sign_retry"]["next_at"] = time.time() - 1
+            with patch.object(self.plugin, "_day", return_value="2099-01-01"):
+                self.assertIsNone(self.plugin.retry_sign_in())
+            self.plugin._auth["account"]["uid"] = "456"
+            self.assertIsNone(self.plugin.retry_sign_in())
+            self.plugin._auth["account"]["uid"] = "123"
+            self.plugin.stop_service()
+            self.assertIsNone(self.plugin.retry_sign_in())
+
+    def test_account_change_or_midnight_during_retry_query_never_posts(self):
+        for change in ("account", "midnight"):
+            self.setUp()
+            self.invoke(http_error(500))
+            original = self.plugin._refresh_sign_session
+            def refresh(*args, **kwargs):
+                uid, state = original(*args, **kwargs)
+                if change == "account": return "456", state
+                self.plugin._day = lambda: "2099-01-01"
+                return uid, state
+            with patch.object(self.plugin, "_refresh_sign_session", side_effect=refresh):
+                row, net = self.due((daily(), []))
+            self.assertIsNone(row)
+            self.assertTrue(all(r.method == "GET" for r in net.requests))
+
+    def test_disable_and_reenable_does_not_restore_old_retry_plan(self):
+        self.invoke(http_error(500))
+        self.plugin.init_plugin({**self.plugin.config, "enabled": False})
+        self.assertNotIn("sign_retry", self.plugin.storage["checkins"])
+        self.plugin.init_plugin({**self.plugin.config, "enabled": True})
+        self.assertFalse(self.plugin.api_state().retry.pending)
+
+    def test_switch_account_and_back_does_not_restore_old_retry_plan(self):
+        self.invoke(http_error(500))
+        jar = self.plugin._parse_cookie("session=other-private")
+        other = copy.deepcopy(GOOD)
+        other["profile"]["account"]["hdskyUid"] = 456
+        self.plugin._accept(jar, other)
+        self.plugin._accept(jar, GOOD)
+        self.assertFalse(self.plugin.api_state().retry.pending)
+
+    def test_midnight_during_csrf_refresh_stops_second_post(self):
+        original = self.plugin._refresh_sign_session
+        queries = []
+        def refresh(*args, **kwargs):
+            result = original(*args, **kwargs)
+            queries.append(True)
+            if len(queries) == 2: self.plugin._day = lambda: "2099-01-01"
+            return result
+        with patch.object(self.plugin, "_refresh_sign_session", side_effect=refresh):
+            row, net = self.invoke((daily(), []), http_error(403, "页面安全校验已失效，请刷新后重试"),
+                                   (daily(), []))
+        self.assertIsNone(row)
+        self.assertEqual(len([r for r in net.requests if r.method == "POST"]), 1)
+
+    def test_updated_interval_reschedules_pending_retry_without_resetting_count(self):
+        self.invoke(http_error(500))
+        self.due(http_error(500))
+        before = time.time()
+        result = self.plugin.api_save_config(module.PublicConfig(retry_interval=900))
+        self.assertTrue(result.success)
+        self.assertEqual(result.state.retry.used, 1)
+        self.assertGreaterEqual(result.state.retry.next_at, before + 900)
+
+    def test_bad_saved_retry_config_keeps_public_state_readable_and_schedules_nothing(self):
+        self.plugin.init_plugin({**self.plugin.config, "retry_count": "bad"})
+        self.assertEqual(self.plugin.get_service(), [])
+        self.assertEqual(self.plugin.api_state().config.retry_count, 3)
+
+    def test_retry_config_limits_and_save_cancels_pending_plan(self):
+        for fields in ({"retry_count": -1}, {"retry_count": 11},
+                       {"retry_interval": 59}, {"retry_interval": 86401}):
+            with self.assertRaises(ValueError): module.PublicConfig(**fields)
+        self.invoke(http_error(500))
+        self.assertTrue(self.plugin.api_state().retry.pending)
+        result = self.plugin.api_save_config(module.PublicConfig(retry_count=0))
+        self.assertTrue(result.success)
+        self.assertFalse(result.state.retry.pending)
+        self.assertEqual(self.plugin.get_service(), [])
 
 
 if __name__ == "__main__":

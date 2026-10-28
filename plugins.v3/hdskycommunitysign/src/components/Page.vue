@@ -1,6 +1,6 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
-import { number, statusColor, statusLabel, time } from '../format.js'
+import { connectionLabel, number, statusColor, statusLabel, time } from '../format.js'
 import '../style.css'
 
 const props = defineProps({ api: { type: Object, required: true }, pluginId: { type: String, required: true } })
@@ -13,7 +13,15 @@ const rows = computed(() => (stats.value.days || []).slice(0, period.value))
 async function load() {
   if (busy.value) return
   busy.value = 'load'
-  try { view.value = await props.api.get(`plugin/${props.pluginId}/state`); message.value = '' }
+  try {
+    view.value = await props.api.get(`plugin/${props.pluginId}/state`)
+    message.value = ''
+    if (view.value.auth.cookie_configured) {
+      const result = await props.api.post(`plugin/${props.pluginId}/auth`, { action: 'check' })
+      view.value = result.state
+      if (!result.success) { message.value = result.message; messageType.value = 'warning' }
+    }
+  }
   catch { message.value = '读取统计失败，请点击刷新重试。'; messageType.value = 'error' }
   finally { busy.value = '' }
 }
@@ -40,17 +48,20 @@ onMounted(load)
     <header class="hcs-header">
       <div><h2>每日签到统计</h2><p>天空社区 · {{ stats.uid ? `UID ${stats.uid}` : '请先登录社区账号' }}</p></div>
       <div class="hcs-actions">
-        <v-btn color="primary" variant="tonal" :disabled="!!busy" :loading="busy === 'load'" @click="load">刷新统计</v-btn>
+        <v-btn color="primary" variant="tonal" :disabled="!!busy" :loading="busy === 'load'" @click="load">刷新余额与统计</v-btn>
         <v-btn color="primary" variant="tonal" :disabled="!!busy" @click="emit('switch')">配置</v-btn>
         <v-btn variant="text" @click="emit('close')">关闭</v-btn>
       </div>
     </header>
     <v-alert v-if="message" :type="messageType" variant="tonal" role="status">{{ message }}</v-alert>
     <v-alert v-if="view?.status.message" :type="view.status.success ? 'success' : 'info'" variant="tonal">{{ view.status.message }}</v-alert>
+    <p v-if="view" class="hcs-hint">{{ connectionLabel(view.auth.connection_status) }} · {{ time(view.auth.connection_at) }}；上次查询余额 {{ number(view.auth.balance) }} 银元 · {{ time(view.auth.balance_at) }}</p>
+    <v-alert v-if="view?.retry.pending" type="info" variant="tonal">已安排签到重试：已用 {{ view.retry.used }} / {{ view.retry.limit }} 次，下次 {{ time(view.retry.next_at) }}。结果未知时仅查询确认。</v-alert>
+    <v-alert v-else-if="view?.retry.limit && view.retry.used >= view.retry.limit" type="warning" variant="tonal">自动重试次数已用完，请检查连接或重新登录后手动签到。</v-alert>
 
     <div class="hcs-summary">
       <article class="hcs-card"><p>今日签到 · {{ today.day || '北京时间' }}</p><strong>{{ statusLabel(today.status) }}</strong><v-chip v-if="view" :color="view.config.enabled ? 'success' : 'default'" size="small" variant="tonal">{{ view.config.enabled ? '插件已启用' : '插件未启用' }}</v-chip></article>
-      <article class="hcs-card"><p>今日奖励</p><strong>{{ number(today.amount) }} <small>银元</small></strong><p>今日余额 {{ number(today.balance) }} 银元</p></article>
+      <article class="hcs-card"><p>今日奖励</p><strong>{{ number(today.amount) }} <small>银元</small></strong><p>当前余额 {{ number(view?.auth.balance) }} 银元（只读查询，无需签到）</p></article>
       <article class="hcs-card"><p>近 30 天已签到</p><strong>{{ number(stats.completed_days) }} <small>天</small></strong><p>同一账号每天计一次</p></article>
       <article class="hcs-card"><p>近 30 天奖励合计</p><strong>{{ number(stats.reward_total) }} <small>银元</small></strong><p>{{ stats.unknown_reward_days ? `另有 ${stats.unknown_reward_days} 天奖励数值未知` : '按已确认的每日奖励汇总' }}</p></article>
     </div>
@@ -67,7 +78,7 @@ onMounted(load)
           <tr v-for="row in rows" :key="row.day"><td>{{ row.day }}</td><td><v-chip :color="statusColor(row.status)" size="small" variant="tonal">{{ statusLabel(row.status) }}</v-chip></td><td>{{ number(row.amount) }}</td><td>{{ number(row.balance) }}</td><td>{{ row.time ? time(row.time) : '—' }}</td></tr>
         </tbody></table>
       </div>
-      <p v-else class="hcs-hint">登录并执行一次签到后，这里会显示每日记录。</p>
+      <p v-else class="hcs-hint">登录后刷新即可查询余额与每日状态，无需先签到。</p>
     </section>
     <v-expansion-panels v-if="view?.history.length" variant="accordion"><v-expansion-panel elevation="0"><v-expansion-panel-title>最近操作记录</v-expansion-panel-title><v-expansion-panel-text><div class="hcs-stack"><p v-for="(row, index) in view.history" :key="index" class="hcs-hint">{{ time(row.time) }} · UID {{ row.uid || '—' }} · {{ row.message }}</p></div></v-expansion-panel-text></v-expansion-panel></v-expansion-panels>
   </section>

@@ -23,6 +23,7 @@ from app.sdk.config import settings
 from app.sdk.logging import logger
 from app.sdk.scheduler import update_plugin_job
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 try:
     from app.schemas.types import MessageType
 except ImportError:
@@ -54,6 +55,8 @@ class PublicConfig(BaseModel):
     auto_sign: bool = False
     notify: bool = True
     cron: str = "0 8 * * *"
+    retry_count: int = Field(default=3, ge=0, le=10)
+    retry_interval: int = Field(default=300, ge=60, le=86400)
 
 
 class AuthRequest(BaseModel):
@@ -76,6 +79,17 @@ class PublicAuth(BaseModel):
     send_after: float = 0
     verify_after: float = 0
     retry_after: float = 0
+    balance: float | None = None
+    balance_at: float = 0
+    connection_status: str = "unknown"
+    connection_at: float = 0
+
+
+class RetryStatus(BaseModel):
+    pending: bool = False
+    used: int = 0
+    limit: int = 0
+    next_at: float = 0
 
 
 class StatusMessage(BaseModel):
@@ -109,6 +123,7 @@ class PublicState(BaseModel):
     status: StatusMessage
     statistics: DailyStatistics
     history: list[DailyRecord] = Field(default_factory=list)
+    retry: RetryStatus = Field(default_factory=RetryStatus)
 
 
 class ActionResult(BaseModel):
@@ -118,11 +133,12 @@ class ActionResult(BaseModel):
 
 
 class AuthError(Exception):
-    def __init__(self, message, invalid=False, csrf=False, uncertain=False):
+    def __init__(self, message, invalid=False, csrf=False, uncertain=False, retryable=False):
         super().__init__(message)
         self.invalid = invalid
         self.csrf = csrf
         self.uncertain = uncertain
+        self.retryable = retryable
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -133,9 +149,9 @@ class NoRedirect(HTTPRedirectHandler):
 
 class HdskyCommunitySign(_PluginBase):
     plugin_name = "天空社区客户端签到"
-    plugin_desc = "HDSky 社区客户端每日签到，支持配置页直接登录、手动 Cookie、通知与每日统计。"
+    plugin_desc = "HDSky 社区客户端每日签到，支持直接登录、余额查询、Cookie 连通性检测及自定义签到重试。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     plugin_author = "xchenya"
     author_url = "https://github.com/xchenya"
     plugin_config_prefix = "hdskycommunitysign_"
@@ -171,6 +187,8 @@ class HdskyCommunitySign(_PluginBase):
                 "auto_sign": self._bool(values.get("auto_sign", False)),
                 "notify": self._bool(values.get("notify", True)),
                 "cron": str(values.get("cron") or "0 8 * * *").strip(),
+                "retry_count": values.get("retry_count", 3),
+                "retry_interval": values.get("retry_interval", 300),
             }
             self._auth = copy.deepcopy(self.get_data("auth") or {})
             self._status = copy.deepcopy(self.get_data("status") or {})
@@ -186,11 +204,23 @@ class HdskyCommunitySign(_PluginBase):
                 self._record(False, "配置复位失败，未执行本次操作。")
                 return
             try:
+                retries = PublicConfig(retry_count=self._config["retry_count"],
+                                       retry_interval=self._config["retry_interval"])
+                self._config.update(retry_count=retries.retry_count, retry_interval=retries.retry_interval)
                 self._trigger = CronTrigger.from_crontab(
                     self._config["cron"], timezone=getattr(settings, "TZ", "Asia/Shanghai"))
             except (ValueError, TypeError):
-                self._record(False, "Cron 无效，定时签到未启用；请使用五段 Cron 表达式。")
+                self._record(False, "Cron 或重试设置无效，定时任务未启用；请检查配置。")
+                # 避免无效旧配置使公开状态接口无法序列化。
+                self._config.update(retry_count=3, retry_interval=300)
                 return
+            plan = self._runtime.get("sign_retry")
+            account_uid = str((self._auth.get("account") or {}).get("uid") or "")
+            if plan and (not self.get_state() or not self._config["retry_count"]
+                         or (plan.get("uid"), plan.get("day")) != (account_uid, self._day())
+                         or (self._config["uid"] and self._config["uid"] != account_uid)):
+                self._runtime.pop("sign_retry", None)
+                self._save_runtime()
             if action == "none" and not cookie and not code:
                 return
             if not self.get_state():
@@ -216,6 +246,8 @@ class HdskyCommunitySign(_PluginBase):
             except AuthError as exc:
                 if exc.invalid:
                     self._auth["verified"] = False
+                    self._runtime.pop("sign_retry", None)
+                    self._save_runtime()
                     self._save_auth()
                 self._record(False, str(exc))
 
@@ -226,13 +258,21 @@ class HdskyCommunitySign(_PluginBase):
         return []
 
     def get_service(self):
-        if not self.get_state() or not self._config.get("auto_sign") or not self._trigger:
+        if not self.get_state() or not self._trigger:
             return []
         from functools import partial
-        return [{"id": self.__class__.__name__ + ".daily",
+        services = []
+        if self._config.get("auto_sign"):
+            services.append({"id": self.__class__.__name__ + ".daily",
                  "name": "天空社区客户端签到", "trigger": self._trigger,
                  "func": partial(self.sign_in, generation=self._generation),
-                 "kwargs": {"max_instances": 1, "coalesce": True, "misfire_grace_time": 300}}]
+                 "kwargs": {"max_instances": 1, "coalesce": True, "misfire_grace_time": 300}})
+        if self._config.get("retry_count"):
+            services.append({"id": self.__class__.__name__ + ".retry",
+                 "name": "天空社区签到重试检查", "trigger": IntervalTrigger(seconds=30),
+                 "func": partial(self.retry_sign_in, generation=self._generation),
+                 "kwargs": {"max_instances": 1, "coalesce": True, "misfire_grace_time": 60}})
+        return services
 
     def get_api(self):
         definitions = [
@@ -260,6 +300,10 @@ class HdskyCommunitySign(_PluginBase):
                 send_after=self._auth.get("send_after") or 0,
                 verify_after=self._auth.get("verify_after") or 0,
                 retry_after=self._runtime.get("retry_after") or 0,
+                balance=self._number(self._auth.get("balance")),
+                balance_at=self._auth.get("balance_at") or 0,
+                connection_status=self._auth.get("connection_status", "unknown"),
+                connection_at=self._auth.get("connection_at") or 0,
             )
             # 只选取公开字段，凭据与一次性输入不进入 HTTP 响应。
             return PublicState(
@@ -268,6 +312,7 @@ class HdskyCommunitySign(_PluginBase):
                 auth=auth, status=StatusMessage(**self._status),
                 statistics=self._statistics(auth.uid),
                 history=[DailyRecord(**row) for row in self._runtime.get("history", [])[:30]],
+                retry=self._retry_status(),
             )
 
     def _api_result(self, success, message):
@@ -301,8 +346,17 @@ class HdskyCommunitySign(_PluginBase):
                 return self._api_result(False, "Cron 无效，请使用五段 Cron 表达式。")
             if self.update_config(dict(config)) is False:
                 return self._api_result(False, "配置保存失败，请稍后再试。")
+            account_changed = config["uid"] != self._config.get("uid", "")
+            interval_changed = config["retry_interval"] != self._config.get("retry_interval")
             self._config, self._trigger = config, trigger
             self._generation += 1
+            if account_changed or not config["enabled"] or not config["retry_count"]:
+                self._runtime.pop("sign_retry", None)
+                self._save_runtime()
+            elif interval_changed and self._retry_status().pending:
+                self._runtime["sign_retry"]["next_at"] = max(
+                    time.time() + config["retry_interval"], self._runtime.get("retry_after", 0))
+                self._save_runtime()
         # 更新宿主注册的任务，不自建调度器；按当前运行实例定位分身。
         try:
             update_plugin_job(self.__class__.__name__)
@@ -332,6 +386,9 @@ class HdskyCommunitySign(_PluginBase):
                 # 只应用本次登录的连接信息，不保存页面中尚未提交的调度设置。
                 if self.update_config(dict(config)) is False:
                     raise AuthError("连接设置保存失败，未发送请求。")
+                if config.get("uid") != self._config.get("uid"):
+                    self._runtime.pop("sign_retry", None)
+                    self._save_runtime()
                 self._config = config
                 if payload.action == "send":
                     self._send_code()
@@ -342,8 +399,14 @@ class HdskyCommunitySign(_PluginBase):
                 else:
                     self._check_cookie()
             except AuthError as exc:
+                if payload.action == "check":
+                    self._auth.update(connection_status="invalid" if exc.invalid else "error",
+                                      connection_at=time.time())
+                    self._save_auth()
                 if exc.invalid:
                     self._auth["verified"] = False
+                    self._runtime.pop("sign_retry", None)
+                    self._save_runtime()
                     self._save_auth()
                 self._record(False, str(exc))
             return self._api_result(bool(self._status.get("success")), self._status.get("message", ""))
@@ -432,7 +495,7 @@ class HdskyCommunitySign(_PluginBase):
         if action not in PATHS:
             raise AuthError("不支持的请求。")
         if time.time() < float(self._runtime.get("retry_after") or 0):
-            raise AuthError("社区请求处于限流冷却，请稍后再试。")
+            raise AuthError("社区请求处于限流冷却，请稍后再试。", retryable=True)
         ua = self._config.get("user_agent") or DEFAULT_UA
         if len(ua) > 512 or any(ord(c) < 32 or ord(c) > 126 for c in ua):
             raise AuthError("User-Agent 格式不正确。")
@@ -482,7 +545,7 @@ class HdskyCommunitySign(_PluginBase):
                 delay = min(86400, max(60, delay)) if math.isfinite(delay) else 300
                 self._runtime["retry_after"] = time.time() + delay
                 self._save_runtime()
-                raise AuthError("社区限制了请求频率，请稍后再试；本次不会自动重试。") from None
+                raise AuthError("社区限制了请求频率，请等待冷却结束。", retryable=True) from None
             if 300 <= status < 400:
                 raise AuthError("社区返回重定向，已停止；请在浏览器核对登录或验证页面。") from None
             if status in (400, 401, 403) and action == "login":
@@ -494,11 +557,12 @@ class HdskyCommunitySign(_PluginBase):
                 raise AuthError("页面安全校验已失效，正在刷新会话。", csrf=True)
             if status == 403:
                 raise AuthError("社区拒绝访问（403），请检查防护验证、User-Agent 或网络。") from None
-            raise AuthError(f"社区返回 HTTP {status}；本次不会自动重试。",
-                            uncertain=action == "sign" and status >= 500) from None
+            raise AuthError(f"社区返回 HTTP {status}。",
+                            uncertain=action == "sign" and status >= 500,
+                            retryable=status >= 500) from None
         except (URLError, TimeoutError, OSError, ValueError, HTTPException):
-            raise AuthError("请求未完成，请检查网络、代理和证书；本次不会自动重发。",
-                            uncertain=action == "sign") from None
+            raise AuthError("请求未完成，请检查网络、代理和证书。",
+                            uncertain=action == "sign", retryable=True) from None
         if len(raw) > 1024 * 1024:
             raise AuthError("社区响应过大，已停止解析。", uncertain=action == "sign")
         try:
@@ -553,9 +617,16 @@ class HdskyCommunitySign(_PluginBase):
         cookies = self._dump_cookies(jar)
         if not cookies:
             raise AuthError("社区未下发可保存的 Cookie，请在浏览器登录后手动填写。")
+        if (self._auth.get("account") or {}).get("uid") != account["uid"]:
+            self._runtime.pop("sign_retry", None)
+            self._save_runtime()
         self._auth.update({
             "cookies": cookies, "csrf_token": csrf, "account": account,
             "source": source, "verified": True, "checked_at": time.time(),
+            "connection_status": "ok", "connection_at": time.time(),
+            "balance": self._number((result["profile"].get("wallet") or {}).get("balance"))
+                       if isinstance(result["profile"].get("wallet"), dict) else None,
+            "balance_at": time.time(),
         })
         if clear_pending:
             self._auth.pop("pending", None)
@@ -596,7 +667,60 @@ class HdskyCommunitySign(_PluginBase):
         result = self._request("check", jar)
         self._accept(jar, result, self._config.get("uid", ""), self._auth.get("source", "login"),
                      clear_pending=False)
-        self._record(True, "Cookie 有效，账户身份和 CSRF Token 已更新。")
+        daily = (result.get("profile") or {}).get("dailyCheckin")
+        if isinstance(daily, dict) and isinstance(daily.get("checkedIn"), bool):
+            self._merge_daily({"uid": self._auth["account"]["uid"], "day": self._day(),
+                "status": "already" if daily["checkedIn"] else "not_signed",
+                "message": "只读查询：今日已签到。" if daily["checkedIn"] else "只读查询：今日尚未签到。",
+                "time": time.time(), "balance": self._auth["balance"],
+                "amount": self._number(daily.get("amount")) if daily["checkedIn"] else None})
+            self._prune_daily()
+            self._save_runtime()
+        self._record(True, "站点连接正常，Cookie 有效；已查询余额，未执行签到。")
+
+    def _retry_status(self):
+        plan = self._runtime.get("sign_retry") or {}
+        uid = str((self._auth.get("account") or {}).get("uid") or "")
+        limit = self._config.get("retry_count", 0)
+        valid = (self.get_state() and self._trigger and limit and plan.get("uid") == uid
+                 and plan.get("day") == self._day()
+                 and (not self._config.get("uid") or self._config["uid"] == uid))
+        if not valid:
+            return RetryStatus(limit=limit)
+        return RetryStatus(pending=bool(plan.get("next_at")) and plan.get("used", 0) < limit,
+                           used=plan.get("used", 0), limit=limit, next_at=plan.get("next_at", 0))
+
+    def _plan_retry(self, status, uid, day, retryable):
+        if status in SIGNED or not retryable or not self.get_state() or not self._config.get("retry_count"):
+            self._runtime.pop("sign_retry", None)
+            return
+        if not uid or day != self._day():
+            self._runtime.pop("sign_retry", None)
+            return
+        plan = self._runtime.get("sign_retry") or {}
+        used = plan.get("used", 0) if (plan.get("uid"), plan.get("day")) == (uid, day) else 0
+        self._runtime["sign_retry"] = {
+            "uid": uid, "day": day, "used": used,
+            "next_at": max(time.time() + self._config["retry_interval"],
+                           self._runtime.get("retry_after", 0))
+                       if used < self._config["retry_count"] else 0,
+        }
+
+    def retry_sign_in(self, generation=None):
+        with self._lock:
+            if generation is not None and generation != self._generation:
+                return None
+            status = self._retry_status()
+            if not status.pending:
+                return None
+            plan = self._runtime["sign_retry"]
+            if time.time() < max(plan["next_at"], self._runtime.get("retry_after", 0)):
+                return None
+            # 先保存已使用次数，崩溃或重启不会恢复已消耗的重试额度。
+            plan["used"] += 1
+            plan["next_at"] = time.time() + self._config["retry_interval"]
+            self._save_runtime()
+            return self.sign_in(generation=generation, expected=(plan["uid"], plan["day"]))
 
 
     def _save_runtime(self):
@@ -695,7 +819,7 @@ class HdskyCommunitySign(_PluginBase):
         uid = self._auth["account"]["uid"]
         return uid, self._daily(result, uid)
 
-    def _finish_sign(self, status, message, uid="", daily=None, day=None):
+    def _finish_sign(self, status, message, uid="", daily=None, day=None, retryable=False):
         day = day or self._day()
         daily = daily or {}
         row = {"time": time.time(), "day": day, "uid": uid, "status": status,
@@ -712,6 +836,7 @@ class HdskyCommunitySign(_PluginBase):
             history.insert(0, row)
             del history[60:]
         self._runtime["last"] = row
+        self._plan_retry(status, uid, day, retryable)
         self._save_runtime()
         self._record(status in {"success", "already", "confirmed"}, message)
         logger.info(f"天空社区签到：{message}")
@@ -730,7 +855,7 @@ class HdskyCommunitySign(_PluginBase):
                 logger.warning("天空社区签到结果已保存，但通知发送失败。")
         return row
 
-    def sign_in(self, generation=None):
+    def sign_in(self, generation=None, expected=None):
         with self._lock:
             if not self.get_state() or (generation is not None and generation != self._generation):
                 return None
@@ -741,6 +866,10 @@ class HdskyCommunitySign(_PluginBase):
                     raise AuthError("请先完成站内信登录或手动填写社区 Cookie。", invalid=True)
                 uid, daily = self._refresh_sign_session(jar)
                 day = self._day()
+                if expected is not None and expected != (uid, day):
+                    self._runtime.pop("sign_retry", None)
+                    self._save_runtime()
+                    return None
                 attempts = self._runtime.setdefault("attempts", {})
                 key = uid + ":" + day
                 # 只保留近 60 个账号日意图。
@@ -754,7 +883,8 @@ class HdskyCommunitySign(_PluginBase):
                     return self._finish_sign("already", "今日已签到，已跳过提交。", uid, daily, day)
                 if attempt and attempt.get("state") in {"sent", "uncertain", "done"}:
                     return self._finish_sign("uncertain",
-                        "今日已有提交记录但服务器尚未确认；暂停重复提交，请在客户端核对。", uid, daily, day)
+                        "今日已有提交记录但服务器尚未确认；仅重试查询，不重复提交。", uid, daily, day,
+                        retryable=True)
                 if not self.get_state():
                     return None
                 attempt = {"request_key": (attempt or {}).get("request_key") or uuid.uuid4().hex,
@@ -776,12 +906,18 @@ class HdskyCommunitySign(_PluginBase):
                         attempt["state"] = "rejected"
                         self._save_runtime()
                         return None
+                    if self._day() != day:
+                        attempt["state"] = "rejected"
+                        self._runtime.pop("sign_retry", None)
+                        self._save_runtime()
+                        return None
                     result = self._request("sign", jar, {"requestKey": attempt["request_key"]},
                                            csrf=self._auth["csrf_token"])
                 daily = self._daily(result, uid)
                 if not daily["checked"]:
                     raise AuthError("签到返回后今日状态仍未确认。", uncertain=True)
                 self._auth["cookies"] = self._dump_cookies(jar)
+                self._auth.update(balance=daily["balance"], balance_at=time.time())
                 self._save_auth()
                 attempt["state"] = "done"
                 return self._finish_sign("success", "签到成功。", uid, daily, day)
@@ -789,25 +925,32 @@ class HdskyCommunitySign(_PluginBase):
                 attempt = self._runtime.get("attempts", {}).get(uid + ":" + day)
                 if exc.invalid:
                     self._auth["verified"] = False
+                    self._auth.update(connection_status="invalid", connection_at=time.time())
                     self._save_auth()
                 if attempt and attempt.get("state") == "sent":
                     # 非明确拒绝都按未知写入处理；仅通过一次读请求核对。
                     attempt["state"] = "uncertain" if exc.uncertain else "rejected"
                     self._save_runtime()
                     if exc.uncertain:
+                        can_recheck = True
                         try:
                             _, verified = self._refresh_sign_session(jar, uid)
                             if verified["checked"]:
                                 attempt["state"] = "done"
                                 return self._finish_sign("confirmed", "提交响应异常，已核实今日签到完成。",
                                                          uid, verified, day)
-                        except AuthError:
-                            pass
+                        except AuthError as check_error:
+                            if check_error.invalid:
+                                can_recheck = False
+                                self._auth.update(verified=False, connection_status="invalid",
+                                                  connection_at=time.time())
+                                self._save_auth()
                         return self._finish_sign("uncertain", "签到结果待确认，已暂停今日重复提交。",
-                                                 uid, None, day)
+                                                 uid, None, day, retryable=can_recheck)
                 # 预查询失败时也为已保存账号记录当日结果，但不触碰旧提交意图。
                 recorded_uid = uid or str((self._auth.get("account") or {}).get("uid") or "")
-                return self._finish_sign("failed", str(exc), recorded_uid, None, day)
+                return self._finish_sign("failed", str(exc), recorded_uid, None, day,
+                                         retryable=exc.retryable or exc.uncertain)
 
     def get_form(self):
         # Vue 配置组件自己调用已认证 API，模型不包含任何一次性凭据。

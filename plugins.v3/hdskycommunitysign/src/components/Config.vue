@@ -1,11 +1,11 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { time } from '../format.js'
+import { connectionLabel, number, time } from '../format.js'
 import '../style.css'
 
 const props = defineProps({ api: { type: Object, required: true }, pluginId: { type: String, required: true } })
 const emit = defineEmits(['switch', 'close'])
-const config = reactive({ enabled: false, uid: '', use_proxy: false, user_agent: '', auto_sign: false, notify: true, cron: '0 8 * * *' })
+const config = reactive({ enabled: false, uid: '', use_proxy: false, user_agent: '', auto_sign: false, notify: true, cron: '0 8 * * *', retry_count: 3, retry_interval: 300 })
 const view = ref(null), loaded = ref(false), busy = ref(''), message = ref(''), messageType = ref('info')
 const code = ref(''), cookie = ref(''), now = ref(Date.now() / 1000)
 const auth = computed(() => view.value?.auth || {})
@@ -14,6 +14,8 @@ const cooldown = after => Math.max(0, Math.ceil((after || 0) - now.value))
 const sendWait = computed(() => cooldown(Math.max(auth.value.send_after || 0, auth.value.retry_after || 0)))
 const loginWait = computed(() => cooldown(Math.max(auth.value.verify_after || 0, auth.value.retry_after || 0)))
 const blocked = computed(() => !loaded.value || !!busy.value)
+const retryValid = computed(() => Number.isInteger(config.retry_count) && config.retry_count >= 0 && config.retry_count <= 10
+  && Number.isInteger(config.retry_interval) && config.retry_interval >= 60 && config.retry_interval <= 86400)
 const defaults = { VTextField: { variant: 'outlined', density: 'compact', hideDetails: 'auto' }, VBtn: { variant: 'tonal', color: 'primary' } }
 let timer
 
@@ -69,7 +71,7 @@ onBeforeUnmount(() => { clearInterval(timer); code.value = ''; cookie.value = ''
         <div><h2>天空社区客户端签到</h2><p>登录与自动签到设置</p></div>
         <div class="hcs-actions">
           <v-btn :disabled="!!busy" @click="emit('switch')">每日统计</v-btn>
-          <v-btn :disabled="blocked" :loading="busy === 'save'" @click="perform('save')">保存设置</v-btn>
+          <v-btn :disabled="blocked || !retryValid" :loading="busy === 'save'" @click="perform('save')">保存设置</v-btn>
           <v-btn variant="text" @click="emit('close')">关闭</v-btn>
         </div>
       </header>
@@ -89,7 +91,8 @@ onBeforeUnmount(() => { clearInterval(timer); code.value = ''; cookie.value = ''
           <v-text-field v-model="code" label="站内信六位验证码" aria-label="站内信六位验证码" type="password" inputmode="numeric" maxlength="6" autocomplete="one-time-code" :disabled="blocked" @keydown.enter="!blocked && uidValid && /^\d{6}$/.test(code) && auth.pending_uid === config.uid.trim() && !loginWait && perform('login')" />
           <v-btn :disabled="blocked || !uidValid || !/^\d{6}$/.test(code) || auth.pending_uid !== config.uid.trim() || loginWait > 0" :loading="busy === 'login'" @click="perform('login')">{{ loginWait ? `${loginWait} 秒后可登录` : '登录' }}</v-btn>
         </div>
-        <div class="hcs-actions"><v-btn :disabled="blocked || !auth.cookie_configured || cooldown(auth.retry_after) > 0" :loading="busy === 'check'" @click="perform('check')">检查登录状态</v-btn><span class="hcs-hint">发送验证码后，请查看 HDSky 站内信。</span></div>
+        <div class="hcs-actions"><v-btn :disabled="blocked || !auth.cookie_configured || cooldown(auth.retry_after) > 0" :loading="busy === 'check'" @click="perform('check')">检测 Cookie 与站点连通性</v-btn><span class="hcs-hint">检测已保存的 Cookie，只读查询，不执行签到。</span></div>
+        <p class="hcs-hint">{{ connectionLabel(auth.connection_status) }} · {{ time(auth.connection_at) }}<br>上次查询余额 {{ number(auth.balance) }} 银元 · {{ time(auth.balance_at) }}</p>
       </section>
 
       <section class="hcs-card">
@@ -100,6 +103,12 @@ onBeforeUnmount(() => { clearInterval(timer); code.value = ''; cookie.value = ''
           <v-switch v-model="config.notify" label="发送结果通知" aria-label="发送结果通知" color="primary" hide-details :disabled="blocked" />
         </div>
         <v-text-field v-model="config.cron" label="签到 Cron" aria-label="签到 Cron" hint="默认每天 08:00，执行时区跟随 MP。" persistent-hint :disabled="blocked" />
+        <div class="hcs-login-row">
+          <v-text-field v-model.number="config.retry_count" type="number" min="0" max="10" step="1" label="签到重试次数" aria-label="签到重试次数" hint="0 关闭，最多 10 次；不含首次签到。" persistent-hint :disabled="blocked" />
+          <v-text-field v-model.number="config.retry_interval" type="number" min="60" max="86400" step="1" label="重试间隔（秒）" aria-label="重试间隔（秒）" hint="60–86400 秒；遇到限流会等待冷却结束。" persistent-hint :disabled="blocked" />
+        </div>
+        <p class="hcs-hint">失败后按间隔自动重试，手动签到同样适用。结果未知时只查询状态；Cookie 失效停止重试。任务由 MP 管理，每 30 秒检查一次到期计划。</p>
+        <v-alert v-if="loaded && !retryValid" type="warning" variant="tonal">重试次数须为 0–10 的整数，间隔须为 60–86400 秒的整数。</v-alert>
         <p class="hcs-hint">自动签到设置在点击“保存设置”后生效。</p>
       </section>
 

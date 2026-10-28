@@ -58,13 +58,14 @@ async function mount(name, api) {
   await settle()
 }
 const state = () => ({
-  config: { enabled: false, uid: '123', use_proxy: false, user_agent: 'HDSkyWindows/0.6.0-rc.1', auto_sign: false, notify: true, cron: '0 8 * * *' },
-  auth: { uid: '', pending_uid: '', cookie_configured: false, verified: false, send_after: 0, verify_after: 0, retry_after: 0 },
+  config: { enabled: false, uid: '123', use_proxy: false, user_agent: 'HDSkyWindows/0.6.0-rc.1', auto_sign: false, notify: true, cron: '0 8 * * *', retry_count: 3, retry_interval: 300 },
+  auth: { uid: '', pending_uid: '', cookie_configured: false, verified: false, send_after: 0, verify_after: 0, retry_after: 0, balance: 120, balance_at: 123, connection_status: 'ok', connection_at: 123 },
   status: { success: false, message: '' },
   statistics: { uid: '123', completed_days: 2, reward_total: 40, unknown_reward_days: 1,
     today: { day: '2026-10-27', status: 'success', amount: 20, balance: 120 },
     days: Array.from({ length: 30 }, (_, i) => ({ day: `fixture-${i}`, status: i ? 'unrecorded' : 'success', amount: i ? null : 20, balance: i ? null : 120 })) },
   history: [],
+  retry: { pending: false, used: 0, limit: 3, next_at: 0 },
 })
 try {
   let current = state(), calls = []
@@ -97,10 +98,31 @@ try {
   assert.equal(document.querySelector('input[aria-label="签到 Cron"]').value, '0 9 * * *', 'login must preserve unsaved settings')
   assert.equal(calls.filter(c => c.method === 'post').length, 2)
   checks++
+  await input('签到重试次数', '5')
+  await input('重试间隔（秒）', '600')
   await click('保存设置')
   assert.equal(calls.at(-1).url, 'plugin/HdskyCommunitySign_clone/config')
   assert.equal(calls.at(-1).payload.cron, '0 9 * * *')
   assert(!('code' in calls.at(-1).payload))
+  assert.equal(calls.at(-1).payload.retry_count, 5)
+  assert.equal(calls.at(-1).payload.retry_interval, 600)
+  checks++
+
+  await click('检测 Cookie 与站点连通性')
+  assert.equal(calls.at(-1).payload.action, 'check')
+  assert.equal(calls.at(-1).url, 'plugin/HdskyCommunitySign_clone/auth')
+  assert(!calls.some(c => c.url.endsWith('/sign')))
+  assert(document.body.textContent.includes('Cookie 有效'))
+  assert(document.body.textContent.includes('上次查询余额 120'))
+  checks++
+
+  await input('签到重试次数', '11')
+  assert(button('保存设置').disabled)
+  await input('签到重试次数', '0')
+  await input('重试间隔（秒）', '59')
+  assert(button('保存设置').disabled)
+  await input('重试间隔（秒）', '600')
+  assert(!button('保存设置').disabled)
   checks++
 
   api.post = async () => ({ success: false, message: 'Cron 无效', state: structuredClone(current) })
@@ -149,7 +171,7 @@ try {
   current = state(); current.config.enabled = true; current.auth.cookie_configured = true; calls = []
   api = {
     get: async url => { calls.push({ url, method: 'get' }); return structuredClone(current) },
-    post: async url => { calls.push({ url, method: 'post' }); return { success: true, message: '今日已签到', state: structuredClone(current) } },
+    post: async (url, payload) => { calls.push({ url, payload, method: 'post' }); return { success: true, message: '查询完成', state: structuredClone(current) } },
   }
   await mount('Page', api)
   assert(document.body.textContent.includes('另有 1 天奖励数值未知'))
@@ -159,17 +181,44 @@ try {
   assert.equal(document.querySelectorAll('tbody tr').length, 30)
   assert(document.querySelector('tbody').textContent.includes('尚无记录'))
   checks++
-  await click('刷新统计')
-  assert(!calls.some(c => c.method === 'post'))
+  await click('刷新余额与统计')
+  assert(calls.some(c => c.payload?.action === 'check'))
+  assert(!calls.some(c => c.url.endsWith('/sign')))
   await click('立即签到')
   assert.equal(calls.at(-1).url, 'plugin/HdskyCommunitySign_clone/sign')
-  assert.equal(calls.filter(c => c.method === 'post').length, 1)
+  assert.equal(calls.filter(c => c.url.endsWith('/sign')).length, 1)
   checks++
 
   current.config.enabled = false
   await mount('Page', api)
   assert(button('立即签到').disabled)
   assert(document.body.textContent.includes('启用插件并保存'))
+  checks++
+
+  current.statistics.today = { day: '2026-10-28', status: 'unrecorded', amount: null, balance: null }
+  current.auth.balance = 321.5
+  calls = []
+  await mount('Page', api)
+  assert(document.body.textContent.includes('当前余额 321.5'))
+  assert(calls.some(c => c.payload?.action === 'check'))
+  assert(!calls.some(c => c.url.endsWith('/sign')))
+  checks++
+
+  current.retry = { pending: true, used: 1, limit: 5, next_at: Date.now() / 1000 + 600 }
+  await mount('Page', api)
+  assert(document.body.textContent.includes('已安排签到重试'))
+  assert(document.body.textContent.includes('已用 1 / 5 次'))
+  checks++
+
+  current.auth.connection_status = 'invalid'
+  api.post = async (url, payload) => {
+    calls.push({ url, payload })
+    return { success: false, message: 'Cookie 已失效，请重新登录。', state: structuredClone(current) }
+  }
+  calls = []
+  await mount('Page', api)
+  assert(document.body.textContent.includes('Cookie 已失效'))
+  assert.equal(calls.filter(c => c.url.endsWith('/auth')).length, 1, 'failed diagnostics must not automatically replay')
   checks++
   console.log(`PASS: ${checks} frontend interaction scenarios (direct login, cooldown, duplicate clicks, errors, secrets, unsaved settings, account statistics, clone API, sign enablement)`)
 } finally {
