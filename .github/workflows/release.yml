@@ -8,6 +8,11 @@ on:
       - 'package.v2.json'
       - 'package.v3.json'
   workflow_dispatch:
+    inputs:
+      plugin_id:
+        description: 'Optional plugin ID to package (for example HdskyCommunitySign)'
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -36,6 +41,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_BASE_SHA: ${{ github.event.before }}
+          SELECTED_PLUGIN_ID: ${{ inputs.plugin_id }}
         run: |
           set -euo pipefail
 
@@ -60,6 +66,9 @@ jobs:
               plugin_id="${entry%%|*}"
               plugin_version="${entry##*|}"
               plugin_id_lc="$(echo "$plugin_id" | tr '[:upper:]' '[:lower:]')"
+              if [ -n "${SELECTED_PLUGIN_ID:-}" ] && [ "$plugin_id" != "$SELECTED_PLUGIN_ID" ]; then
+                continue
+              fi
 
               # A push publishes only changed market entries; manual runs retain full scan.
               # This avoids releasing unrelated plugins that were already pending in main.
@@ -91,7 +100,8 @@ jobs:
 
               changed=1
               if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
-                if git diff --quiet "$tag" -- "$plugin_dir"; then
+                if git diff --quiet "$tag" -- "$plugin_dir" &&
+                   gh release view "$tag" --json assets --jq '.assets[].name' | grep -qxF "$asset"; then
                   changed=0
                 fi
               fi
@@ -107,13 +117,14 @@ jobs:
 
               echo "Packing $plugin_id from $plugin_dir -> $asset"
               rm -f "$asset"
-              (cd "$(dirname "$plugin_dir")" && zip -r "$GITHUB_WORKSPACE/$asset" "$(basename "$plugin_dir")" -x "*/__pycache__/*" -x "*.pyc") >/dev/null
+              (cd "$(dirname "$plugin_dir")" && zip -r "$GITHUB_WORKSPACE/$asset" "$(basename "$plugin_dir")" -x "*/__pycache__/*" -x "*.pyc" -x "*/node_modules/*") >/dev/null
 
-              # Re-running a version replaces the release asset for that plugin.
+              # Repair missing assets without deleting an existing release or tag.
               if gh release view "$tag" >/dev/null 2>&1; then
-                echo "Release $tag exists, deleting..."
-                gh release delete "$tag" -y
-                git push origin :refs/tags/"$tag" || true
+                gh release upload "$tag" "$asset" --clobber
+                gh release edit "$tag" --notes "$release_notes"
+                echo "$tag" >> processed_tags.txt
+                continue
               fi
 
               git tag -d "$tag" >/dev/null 2>&1 || true
