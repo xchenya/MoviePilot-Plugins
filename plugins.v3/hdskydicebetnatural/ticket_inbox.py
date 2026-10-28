@@ -96,24 +96,32 @@ def parse_mailbox(html: str, *, box: int, page: int, today: str) -> InboxPage:
     soup = BeautifulSoup(html or "", "html.parser")
     entries: list[InboxEntry] = []
     seen: set[str] = set()
-    for tr in soup.select("tr"):
-        link = next(
-            (a for a in tr.select("a[href]")
-             if _query(a.get("href", ""))[1].get("action") == ["viewmessage"]),
-            None,
-        )
-        if not link:
+    for link in soup.select("a[href]"):
+        path, args = _query(link.get("href", ""))
+        if not path.endswith("messages.php") or args.get("action") != ["viewmessage"]:
             continue
-        _, args = _query(link.get("href", ""))
+        # NexusPHP wraps the listing in layout tables. An ancestor layout row
+        # also contains the first link, but has no reception-date cell.
+        tr = link.find_parent("tr")
+        if tr is None:
+            continue
         msg_id = (args.get("id") or [""])[0]
         if not msg_id.isdigit() or msg_id in seen:
             continue
         cells = tr.find_all("td", recursive=False)
         # An incomplete row cannot supply the trusted reception date.
-        date_text = cells[3].get_text(" ", strip=True) if len(cells) >= 4 else ""
+        date_cell = cells[3] if len(cells) >= 4 else None
+        date_text = date_cell.get_text(" ", strip=True) if date_cell else ""
+        # Relative display text often keeps the absolute reception time in
+        # a tooltip. Only inspect metadata inside the date cell.
+        date_metadata = " ".join(
+            str(node.get(attr) or "")
+            for node in ([date_cell] + date_cell.find_all(True) if date_cell else [])
+            for attr in ("title", "datetime")
+        )
         entries.append(InboxEntry(
             mid=msg_id,
-            day=_day(date_text, today),
+            day=_day(date_metadata, today) or _day(date_text, today),
             subject=link.get_text(" ", strip=True),
         ))
         seen.add(msg_id)

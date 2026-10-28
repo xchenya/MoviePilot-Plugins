@@ -72,6 +72,7 @@ class FakeBase:
         self._helper_cookie = ""
         self._helper_refresh_token = ""
         self._config = {}
+        self._helper_auth = _auth_module().HelperLogin(self)
 
     def get_data(self, key):
         return self.data.get(key)
@@ -176,7 +177,7 @@ def test_market_and_source_metadata():
     }
     package = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))
     entry = package["HdskyDiceBetNatural"]
-    assert entry["version"] == attrs["plugin_version"] == "2.5.0"
+    assert entry["version"] == attrs["plugin_version"] == "2.6.0"
     assert entry["system_version"] == ">=3.0.0"
     assert entry["release"] is False
     assert attrs["plugin_author"] == "Kuanghom"

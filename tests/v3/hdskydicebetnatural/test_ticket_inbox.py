@@ -268,6 +268,7 @@ def test_run_internal_quota_fails_closed_on_unverified_inbox():
         _humanize=False, _sync_pending_results=lambda: None,
         _daily_ticket_limit_reached=lambda: False,
         _ticket_count_ready=lambda: False, _max_daily_tickets=3,
+        _continue_on_ticket_failure=False,
     )
     # logger belongs to the compiled function's globals.
     namespace["logger"] = SimpleNamespace(info=Mock())
@@ -492,3 +493,22 @@ def test_helper_parser_reads_counter_when_dashboard_layout_changes():
       <section><h2>Emby 订阅</h2><div class="stat"><span>今日随机奖励</span><strong>3</strong></div></section>
     </body></html>"""
     assert mod.parse_helper_reward_count(page) == 3
+
+
+def test_nested_layout_rows_do_not_hide_first_messages_reception_date():
+    # Same five-cell mailbox inside NexusPHP's outer layout tables.
+    html = '<table><tr><td><table><tr><td>' + listing(row(1001) + row(1002)) + '</td></tr></table></td></tr></table>'
+    parsed = _parser().parse_mailbox(html, box=1, page=0, today=TODAY)
+    assert [(entry.mid, entry.day) for entry in parsed.entries] == [("1001", TODAY), ("1002", TODAY)]
+
+
+def test_absolute_date_tooltip_wins_over_relative_label():
+    html = listing(row(1001, '<span title="2026-10-20 23:59:00">刚刚</span>'))
+    parsed = _parser().parse_mailbox(html, box=1, page=0, today=TODAY)
+    assert parsed.entries[0].day == "2026-10-20"
+
+
+def test_date_is_not_taken_from_subject_or_site_footer():
+    html = listing(row(1001, '未知日期')).replace('评分通知', TODAY) + '<footer>' + TODAY + '</footer>'
+    parsed = _parser().parse_mailbox(html, box=1, page=0, today=TODAY)
+    assert parsed.entries[0].day is None

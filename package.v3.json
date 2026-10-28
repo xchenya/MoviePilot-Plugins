@@ -164,7 +164,7 @@
     "name": "空论坛掷骰子（拟人）",
     "description": "HDSky 拟人化骰子下注；观影奖励使用辅助站 API，支持 accessToken/refreshToken 自动续期。",
     "labels": "HDSky,论坛,下注,自动化,拟人",
-    "version": "2.5.0",
+    "version": "2.6.0",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/random.png",
     "author": "Kuanghom",
     "author_url": "https://github.com/Kuanghom/MoviePilot-Plugins/tree/main/plugins.v2/hdskydicebetnatural",
@@ -172,6 +172,7 @@
     "system_version": ">=3.0.0",
     "release": false,
     "history": {
+      "v2.6.0": "修复已保存 Token 与后台任务状态不同步、嵌套短讯表格收件日期误判；新增无法获取观影券时继续执行开关和立即联网检查按钮，保留已核实每日上限保护。",
       "v2.5.0": "配置页直接完成 UID、主站邮箱与站内信验证码登录；按钮发送/登录无需反复保存，Token 独立持久化、自动续期及旧配置迁移，保留主站站点认证与原有策略。",
       "v2.4.0": "修复辅助站 accessToken 仅15分钟有效的问题；新增 Refresh Token 配置，401/临近过期时自动刷新并重试，持久化轮换后的 Token；缓存身份按稳定账号 ID 计算。",
       "v2.3.0": "修复辅助奖励读取认证方式：改用 /api/user/emby JSON API 与 Bearer accessToken；主站 Cookie 会给出明确提示；配置项改名为“Emby 订阅 Token”。",
