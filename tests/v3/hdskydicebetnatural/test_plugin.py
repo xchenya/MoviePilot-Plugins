@@ -10,6 +10,8 @@ import base64
 import copy
 import hashlib
 import json
+import importlib.util
+import sys
 import re
 import threading
 import time
@@ -24,6 +26,17 @@ from urllib.parse import urljoin, urlsplit
 
 ROOT = Path(__file__).resolve().parents[3]
 SOURCE = ROOT / "plugins.v3/hdskydicebetnatural/__init__.py"
+
+
+
+def _auth_module():
+    name = "dice_helper_auth_contract"
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, ROOT / "plugins.v3/hdskydicebetnatural/helper_auth.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return sys.modules[name]
 
 
 def _source() -> str:
@@ -127,6 +140,7 @@ def _isolate(*names):
         ], type_ignores=[]),
     )
     namespace = {
+        "HelperLogin": _auth_module().HelperLogin, "HelperLoginError": _auth_module().HelperLoginError,
         "FakeBase": FakeBase, "threading": threading, "partial": partial, "hashlib": hashlib,
         "base64": base64, "json": json,
         "settings": SimpleNamespace(TZ="UTC"),
@@ -162,7 +176,7 @@ def test_market_and_source_metadata():
     }
     package = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))
     entry = package["HdskyDiceBetNatural"]
-    assert entry["version"] == attrs["plugin_version"] == "2.4.0"
+    assert entry["version"] == attrs["plugin_version"] == "2.5.0"
     assert entry["system_version"] == ">=3.0.0"
     assert entry["release"] is False
     assert attrs["plugin_author"] == "Kuanghom"

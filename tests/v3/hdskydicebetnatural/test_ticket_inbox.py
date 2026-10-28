@@ -8,6 +8,7 @@ import importlib.util
 import json
 import re
 import sys
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -21,6 +22,17 @@ import pytest
 ROOT = Path(__file__).resolve().parents[3]
 SOURCE = ROOT / "plugins.v3/hdskydicebetnatural/__init__.py"
 PARSER = ROOT / "plugins.v3/hdskydicebetnatural/ticket_inbox.py"
+
+
+
+def _auth_module():
+    name = "dice_helper_auth_contract"
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, ROOT / "plugins.v3/hdskydicebetnatural/helper_auth.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return sys.modules[name]
 
 
 def _parser():
@@ -63,6 +75,7 @@ def _methods(*names, extra=None):
         "parse_helper_reward_count": parser.parse_helper_reward_count,
         "parse_helper_reward_response": parser.parse_helper_reward_response,
         "TicketInboxError": parser.TicketInboxError,
+        "HelperLoginError": _auth_module().HelperLoginError,
         "hashlib": hashlib, "base64": base64, "json": json, "re": re,
         "time": time, "datetime": datetime, "timedelta": timedelta,
         "Dict": Dict, "List": List, "Any": Any, "Optional": Optional, "Tuple": Tuple,
@@ -70,7 +83,15 @@ def _methods(*names, extra=None):
     }
     namespace.update(extra or {})
     exec(compile(module, "<ticket-inbox-methods>", "exec"), namespace)
-    return namespace["HdskyTicketUnderTest"]
+    result = namespace["HdskyTicketUnderTest"]
+    def initialize(self):
+        self.data = {}
+        self._config = {}
+        self.get_data = lambda key: self.data.get(key)
+        self.save_data = lambda key, value: self.data.__setitem__(key, value)
+        self._helper_auth = _auth_module().HelperLogin(self)
+    result.__init__ = initialize
+    return result
 
 
 TODAY = "2026-10-21"
@@ -382,8 +403,11 @@ def test_expired_access_token_refreshes_and_persists_rotated_tokens():
     get = next(args for kind, args in calls if kind == "get")
     assert p._helper_cookie == new_access
     assert p._helper_refresh_token == "rotated-refresh-token"
-    assert p.config_saves[-1]["helper_cookie"] == new_access
-    assert p.config_saves[-1]["helper_refresh_token"] == "rotated-refresh-token"
+    assert p.data["helper_credentials"]["access_token"] == new_access
+    assert p.data["helper_credentials"]["refresh_token"] == "rotated-refresh-token"
+    assert not p._config["helper_cookie"]
+    assert not p._config["helper_refresh_token"]
+    assert not p.config_saves
     # The account identity remains stable when the access token rotates.
     assert p._ticket_source_identity()[1] == __import__("hashlib").sha256(b"user:109798").hexdigest()[:16]
 

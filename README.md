@@ -11,7 +11,7 @@ xchenya 的 [MoviePilot](https://github.com/jxxghp/MoviePilot) 第三方插件�
 | [天空社区客户端签到](./plugins.v3/hdskycommunitysign/README.md) | `plugins.v3/hdskycommunitysign` | `1.2.0` | 直接登录、只读余额与 Cookie 检测、自定义签到重试及每日统计；已离线验证，待真实联调 |
 | [不可躺自动抽奖](./plugins.v3/tangptlottery/README.md) | `plugins.v3/tangptlottery` | `1.1.1` | 每日定时、魔力保护、奖品通知；手动凭据、连接诊断与分区表单；待宿主及站点联调 |
 | [PTLGS 幸运大转盘](./plugins.v3/ptlgsluckywheel/README.md) | `plugins.v3/ptlgsluckywheel` | `1.2.0` | 每日统计、合并通知、重复奖品折算；已离线验证，待宿主联调 |
-| [空论坛掷骰子（拟人）V3](./plugins.v3/hdskydicebetnatural/README.md) | `plugins.v3/hdskydicebetnatural` | `2.4.0` | 辅助站 Access/Refresh Token 自动续期；独立核验，达上限当日停注停查 |
+| [空论坛掷骰子（拟人）V3](./plugins.v3/hdskydicebetnatural/README.md) | `plugins.v3/hdskydicebetnatural` | `2.5.0` | 配置页 UID/邮箱/验证码直接登录；Token 自动续期；独立观影券核验 |
 | [癫影自动签到](./plugins.v3/dian115sign/README.md) | `plugins.v3/dian115sign` | `2.0.6` | V3 测试版；普通签已实测 |
 | [憨憨保种区管家 V3](./plugins.v3/hhclubbutler/README.md) | `plugins.v3/hhclubbutler` | `3.0.13` | 自定义标签、上传/下载单任务限速及 MP 代理开关；待真实联调 |
 | [思齐自动收垃圾 V3](./plugins.v3/siqicleanbeach/README.md) | `plugins.v3/siqicleanbeach` | `2.0.0` | V3 移植测试版；未进行思齐站点联调 |

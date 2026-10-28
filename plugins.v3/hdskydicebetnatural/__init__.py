@@ -19,6 +19,8 @@ from datetime import datetime, timedelta, date
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, quote, urlsplit
 
+from .helper_auth import HelperAuthRequest, HelperAuthResult, HelperLogin, HelperLoginError, click_handler, login_form
+
 from .ticket_inbox import (TicketInboxError, parse_award_message, parse_boxes, parse_mailbox, parse_helper_reward_count, parse_helper_reward_response)
 
 import pytz
@@ -41,7 +43,7 @@ class HdskyDiceBetNatural(_PluginBase):
     plugin_desc = "拟人化自动下注：抖动调度、开奖时间窗、进帖停顿、假浏览与短讯解耦"
     # 插件市场使用绝对地址，避免本仓库没有对应图标导致加载失败。
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/random.png"
-    plugin_version = "2.4.0"
+    plugin_version = "2.5.0"
     plugin_author = "Kuanghom"
     author_url = "https://github.com/Kuanghom"
     plugin_config_prefix = "hdskydicebetnatural_"
@@ -138,6 +140,7 @@ class HdskyDiceBetNatural(_PluginBase):
         super().__init__()
         # V3 插件分身独立运行，运行锁和配置状态不能被其他实例共享。
         self._run_lock = threading.Lock()
+        self._helper_auth = HelperLogin(self)
         self._thread_ctx = threading.local()
         self._cancel = threading.Event()
         self._generation = 0
@@ -162,126 +165,134 @@ class HdskyDiceBetNatural(_PluginBase):
         self.BASE_URL = "https://hdsky.me"
 
     def init_plugin(self, config: dict = None):
-        self.stop_service()
-        self._cancel = threading.Event()
-        self._generation += 1
-        self._trigger = None
-        self._ticket_trigger = None
-        self._helper_cookie = ""
-        self._helper_refresh_token = ""
-        self._config = {}
-        self._config_error = ""
-        self._once_pending = False
-        self._auth_failed = False
-        self._last_referer = None
-        config = dict(config or {})
-        self._config = dict(config)
-        self._enabled = bool(config.get("enabled"))
-        self._notify = bool(config.get("notify"))
-        self._onlyonce = bool(config.get("onlyonce"))
-        self._cron = (config.get("cron") or "*/5 * * * *").strip()
-        try:
-            self._ticket_check_interval = max(10, min(1440, int(config.get("ticket_check_interval", 60) or 60)))
-        except (TypeError, ValueError):
-            self._ticket_check_interval = 60
-        self._helper_cookie = str(config.get("helper_cookie") or "").strip()
-        self._helper_refresh_token = str(config.get("helper_refresh_token") or "").strip()
-        self._site_id = self._normalize_site_id(config.get("site_id"))
-        self._bet_mode = config.get("bet_mode") or "smart"
-        self._fixed_types = self._parse_fixed_types(config)
-        self._bet_amount = self._clamp_amount(config.get("bet_amount", 100))
-        self._amount_by_type = self._parse_amount_by_type(config)
-        self._reply_interval = self._clamp_interval(config.get("reply_interval", 30))
-        self._max_daily_bets = self._to_optional_int(config.get("max_daily_bets"))
-        self._max_daily_tickets = self._to_optional_int(config.get("max_daily_tickets"))
-        self._stop_profit = self._to_optional_int(config.get("stop_profit"))
-        self._stop_loss = self._to_optional_int(config.get("stop_loss"))
-        self._smart_history_rounds = max(10, int(config.get("smart_history_rounds") or 50))
-        self._smart_allow_shunzi = bool(config.get("smart_allow_shunzi"))
-        self._smart_allow_baozi = bool(config.get("smart_allow_baozi"))
-        side = (config.get("martingale_start_side") or "大").strip()
-        self._martingale_start_side = side if side in ("大", "小") else "大"
-        self._cleanup_rating_pm = bool(config.get("cleanup_rating_pm", True))
-        self._history_days = max(7, int(config.get("history_days") or 90))
-        self._humanize = bool(config.get("humanize", True))
-        self._scan_jitter_sec = max(0, int(config.get("scan_jitter_sec") or 90))
-        self._bet_before_draw_min = max(0, int(config.get("bet_before_draw_min") or 8))
-        self._bet_before_draw_max = max(
-            self._bet_before_draw_min,
-            int(config.get("bet_before_draw_max") or 25),
-        )
-        self._pre_bet_delay_min = max(0, int(config.get("pre_bet_delay_min") or 8))
-        self._pre_bet_delay_max = max(
-            self._pre_bet_delay_min,
-            int(config.get("pre_bet_delay_max") or 45),
-        )
-        try:
-            self._reply_jitter_ratio = min(
-                0.9, max(0.0, float(config.get("reply_jitter_ratio") or 0.4))
-            )
-        except (TypeError, ValueError):
-            self._reply_jitter_ratio = 0.4
-        try:
-            self._skip_bet_prob = min(
-                0.8, max(0.0, float(config.get("skip_bet_prob") or 0.15))
-            )
-        except (TypeError, ValueError):
-            self._skip_bet_prob = 0.15
-        try:
-            self._amount_jitter_pct = min(
-                0.3, max(0.0, float(config.get("amount_jitter_pct") or 0.05))
-            )
-        except (TypeError, ValueError):
-            self._amount_jitter_pct = 0.05
-        try:
-            self._smart_epsilon = min(
-                0.5, max(0.0, float(config.get("smart_epsilon") or 0.1))
-            )
-        except (TypeError, ValueError):
-            self._smart_epsilon = 0.1
-        self._idle_hours = (config.get("idle_hours") or "2-7").strip()
-        self._pm_cleanup_every_n = max(1, int(config.get("pm_cleanup_every_n") or 5))
-        self._fake_browse_max = max(0, int(config.get("fake_browse_max") or 2))
-        self._one_topic_per_run = bool(config.get("one_topic_per_run", True))
-        self._username = (self.get_data("username") or "").strip()
-
-        # 未配置时，若站点管理里只有一个天空站，则自动选中
-        if not self._site_id:
-            hdsky_sites = self._list_hdsky_sites()
-            if len(hdsky_sites) == 1:
-                self._site_id = int(hdsky_sites[0].get("id"))
-                config["site_id"] = self._site_id
-                self._config = dict(config)
-                self.update_config(config)
-                logger.info(f"{self.LOG_TAG}自动选中站点: {hdsky_sites[0].get('name')}#{self._site_id}")
-
-        # 过滤已删除站点
-        if self._site_id:
-            valid_ids = {int(s.get("id")) for s in self._list_hdsky_sites() if s.get("id") is not None}
-            if valid_ids and self._site_id not in valid_ids:
-                logger.warning(f"{self.LOG_TAG}已选站点 {self._site_id} 不在可用天空站列表中，请重新选择")
-
-
-        # V3 定时全部注册到 MP 宿主，避免私有调度器重复运行。
-        try:
-            self._trigger = CronTrigger.from_crontab(self._cron, timezone=settings.TZ)
-            self._ticket_trigger = IntervalTrigger(minutes=self._ticket_check_interval, timezone=settings.TZ)
-        except (TypeError, ValueError) as exc:
-            self._config_error = "Cron 表达式无效，请填写五段表达式"
-            logger.warning(f"{self.LOG_TAG}{self._config_error}: {exc.__class__.__name__}")
-        if self._onlyonce and self._enabled and not self._config_error:
-            restored = dict(config)
-            restored["onlyonce"] = False
+        with self._helper_auth.lock:
+            self.stop_service()
+            self._cancel = threading.Event()
+            self._generation += 1
+            self._trigger = None
+            self._ticket_trigger = None
+            self._helper_cookie = ""
+            self._helper_refresh_token = ""
+            self._config = {}
+            self._config_error = ""
+            self._once_pending = False
+            self._auth_failed = False
+            self._last_referer = None
+            config = dict(config or {})
+            original_config = dict(config)
             try:
-                if self.update_config(restored) is False:
-                    raise RuntimeError("配置未保存")
-                self._config = dict(restored)
-            except Exception as exc:
-                self._config_error = "立即运行开关复位失败，已取消执行"
-                logger.error(f"{self.LOG_TAG}{self._config_error}: {exc.__class__.__name__}")
-            else:
-                self._once_pending = True
-                self._onlyonce = False
+                self._helper_auth.initialize(config)
+                if config != original_config and self.update_config(config) is False:
+                    raise HelperLoginError("登录配置清理失败，请检查 MP 存储。")
+            except HelperLoginError:
+                self._enabled = False
+                self._config_error = "辅助站凭据初始化失败，请检查 Token 格式和 MP 存储。"
+                return
+            self._config = dict(config)
+            self._enabled = bool(config.get("enabled"))
+            self._notify = bool(config.get("notify"))
+            self._onlyonce = bool(config.get("onlyonce"))
+            self._cron = (config.get("cron") or "*/5 * * * *").strip()
+            try:
+                self._ticket_check_interval = max(10, min(1440, int(config.get("ticket_check_interval", 60) or 60)))
+            except (TypeError, ValueError):
+                self._ticket_check_interval = 60
+            self._site_id = self._normalize_site_id(config.get("site_id"))
+            self._bet_mode = config.get("bet_mode") or "smart"
+            self._fixed_types = self._parse_fixed_types(config)
+            self._bet_amount = self._clamp_amount(config.get("bet_amount", 100))
+            self._amount_by_type = self._parse_amount_by_type(config)
+            self._reply_interval = self._clamp_interval(config.get("reply_interval", 30))
+            self._max_daily_bets = self._to_optional_int(config.get("max_daily_bets"))
+            self._max_daily_tickets = self._to_optional_int(config.get("max_daily_tickets"))
+            self._stop_profit = self._to_optional_int(config.get("stop_profit"))
+            self._stop_loss = self._to_optional_int(config.get("stop_loss"))
+            self._smart_history_rounds = max(10, int(config.get("smart_history_rounds") or 50))
+            self._smart_allow_shunzi = bool(config.get("smart_allow_shunzi"))
+            self._smart_allow_baozi = bool(config.get("smart_allow_baozi"))
+            side = (config.get("martingale_start_side") or "大").strip()
+            self._martingale_start_side = side if side in ("大", "小") else "大"
+            self._cleanup_rating_pm = bool(config.get("cleanup_rating_pm", True))
+            self._history_days = max(7, int(config.get("history_days") or 90))
+            self._humanize = bool(config.get("humanize", True))
+            self._scan_jitter_sec = max(0, int(config.get("scan_jitter_sec") or 90))
+            self._bet_before_draw_min = max(0, int(config.get("bet_before_draw_min") or 8))
+            self._bet_before_draw_max = max(
+                self._bet_before_draw_min,
+                int(config.get("bet_before_draw_max") or 25),
+            )
+            self._pre_bet_delay_min = max(0, int(config.get("pre_bet_delay_min") or 8))
+            self._pre_bet_delay_max = max(
+                self._pre_bet_delay_min,
+                int(config.get("pre_bet_delay_max") or 45),
+            )
+            try:
+                self._reply_jitter_ratio = min(
+                    0.9, max(0.0, float(config.get("reply_jitter_ratio") or 0.4))
+                )
+            except (TypeError, ValueError):
+                self._reply_jitter_ratio = 0.4
+            try:
+                self._skip_bet_prob = min(
+                    0.8, max(0.0, float(config.get("skip_bet_prob") or 0.15))
+                )
+            except (TypeError, ValueError):
+                self._skip_bet_prob = 0.15
+            try:
+                self._amount_jitter_pct = min(
+                    0.3, max(0.0, float(config.get("amount_jitter_pct") or 0.05))
+                )
+            except (TypeError, ValueError):
+                self._amount_jitter_pct = 0.05
+            try:
+                self._smart_epsilon = min(
+                    0.5, max(0.0, float(config.get("smart_epsilon") or 0.1))
+                )
+            except (TypeError, ValueError):
+                self._smart_epsilon = 0.1
+            self._idle_hours = (config.get("idle_hours") or "2-7").strip()
+            self._pm_cleanup_every_n = max(1, int(config.get("pm_cleanup_every_n") or 5))
+            self._fake_browse_max = max(0, int(config.get("fake_browse_max") or 2))
+            self._one_topic_per_run = bool(config.get("one_topic_per_run", True))
+            self._username = (self.get_data("username") or "").strip()
+    
+            # 未配置时，若站点管理里只有一个天空站，则自动选中
+            if not self._site_id:
+                hdsky_sites = self._list_hdsky_sites()
+                if len(hdsky_sites) == 1:
+                    self._site_id = int(hdsky_sites[0].get("id"))
+                    config["site_id"] = self._site_id
+                    self._config = dict(config)
+                    self.update_config(config)
+                    logger.info(f"{self.LOG_TAG}自动选中站点: {hdsky_sites[0].get('name')}#{self._site_id}")
+    
+            # 过滤已删除站点
+            if self._site_id:
+                valid_ids = {int(s.get("id")) for s in self._list_hdsky_sites() if s.get("id") is not None}
+                if valid_ids and self._site_id not in valid_ids:
+                    logger.warning(f"{self.LOG_TAG}已选站点 {self._site_id} 不在可用天空站列表中，请重新选择")
+    
+    
+            # V3 定时全部注册到 MP 宿主，避免私有调度器重复运行。
+            try:
+                self._trigger = CronTrigger.from_crontab(self._cron, timezone=settings.TZ)
+                self._ticket_trigger = IntervalTrigger(minutes=self._ticket_check_interval, timezone=settings.TZ)
+            except (TypeError, ValueError) as exc:
+                self._config_error = "Cron 表达式无效，请填写五段表达式"
+                logger.warning(f"{self.LOG_TAG}{self._config_error}: {exc.__class__.__name__}")
+            if self._onlyonce and self._enabled and not self._config_error:
+                restored = dict(config)
+                restored["onlyonce"] = False
+                try:
+                    if self.update_config(restored) is False:
+                        raise RuntimeError("配置未保存")
+                    self._config = dict(restored)
+                except Exception as exc:
+                    self._config_error = "立即运行开关复位失败，已取消执行"
+                    logger.error(f"{self.LOG_TAG}{self._config_error}: {exc.__class__.__name__}")
+                else:
+                    self._once_pending = True
+                    self._onlyonce = False
 
     def _is_cancelled(self) -> bool:
         # Reload 时旧线程保留原 cancel/event generation，新任务不能使旧线程复活。
@@ -303,7 +314,34 @@ class HdskyDiceBetNatural(_PluginBase):
         return []
 
     def get_api(self) -> List[Dict[str, Any]]:
-        return []
+        return [{
+            "path": "/helper/auth", "endpoint": self.helper_login_action,
+            "methods": ["POST"], "auth": "bear",
+            "summary": "辅助站验证码登录（不运行下注）",
+            "response_model": HelperAuthResult,
+        }]
+
+    def helper_login_action(self, request: HelperAuthRequest) -> HelperAuthResult:
+        return self._helper_auth.perform(request)
+
+    def _helper_login_post(self, action, payload, site_id=None):
+        # Only two fixed authentication endpoints; no Cookie/old Bearer is sent.
+        paths = {"send": "/api/user/send-code", "login": "/api/user/login"}
+        ua, proxies = self._ua or self.DEFAULT_UA, self._proxies()
+        selected = self._normalize_site_id(site_id) or self._site_id
+        site = next((s for s in self._list_hdsky_sites()
+                     if self._normalize_site_id(s.get("id")) == selected), None)
+        if site:
+            ua = str(site.get("ua") or ua)
+            proxies = settings.PROXY if site.get("proxy") else None
+        return RequestUtils(
+            proxies=proxies, timeout=15, headers={
+                "User-Agent": ua, "Accept": "application/json",
+                "Content-Type": "application/json", "Origin": "https://helper.hdsky.me",
+                "Referer": "https://helper.hdsky.me/login",
+            },
+        ).post_res(url="https://helper.hdsky.me" + paths[action],
+                   json=payload, allow_redirects=False)
 
     def get_service(self) -> List[Dict[str, Any]]:
         if self._is_cancelled() or self._config_error:
@@ -485,6 +523,7 @@ class HdskyDiceBetNatural(_PluginBase):
                     "text": "未在站点管理中找到天空（hdsky.me）。请先添加并配置 Cookie 后再选择。",
                 },
             }
+        helper_card, helper_defaults = login_form(self.__class__.__name__, self._helper_auth.state())
         form_content = [
             {
                 "component": "VRow",
@@ -560,6 +599,7 @@ class HdskyDiceBetNatural(_PluginBase):
         ]
         if site_alert:
             form_content.append({"component": "VRow", "content": [{"component": "VCol", "props": {"cols": 12}, "content": [site_alert]}]})
+        form_content.append(helper_card)
         form_content.extend(
             [
                 {
@@ -1187,7 +1227,7 @@ class HdskyDiceBetNatural(_PluginBase):
                         "label": "Emby 订阅 Access Token",
                         "placeholder": "粘贴辅助站 accessToken，不是主站 Cookie",
                         "type": "password",
-                        "hint": "有效期约15分钟；到期后插件会使用 Refresh Token 自动续期。请从辅助站本地存储复制 accessToken。",
+                        "hint": "可选手动导入；有效期约15分钟。已保存值不回显，留空保留；也可直接使用上方验证码登录。",
                         "persistent-hint": True,
                     },
                 }],
@@ -1204,11 +1244,19 @@ class HdskyDiceBetNatural(_PluginBase):
                         "label": "Emby 订阅 Refresh Token",
                         "placeholder": "粘贴辅助站 refreshToken",
                         "type": "password",
-                        "hint": "与 Access Token 一起从辅助站 Local Storage 复制。刷新后服务端可能轮换两个 Token，插件会自动保存新值。",
+                        "hint": "可选手动导入；与 Access Token 配对填写。已保存值不回显，插件会自动保存续期后的 Token。",
                         "persistent-hint": True,
                     },
                 }],
             }],
+        })
+        form_content.append({
+            "component": "VBtn", "props": {
+                "type": "button", "text": "保存手动 Token", "color": "primary",
+                "variant": "tonal", "class": "mb-4",
+                "disabled": "{{ helper_busy || !helper_cookie || !helper_refresh_token }}",
+                "onClick": click_handler("import"),
+            },
         })
         form_content.append({
             "component": "VRow",
@@ -1232,6 +1280,7 @@ class HdskyDiceBetNatural(_PluginBase):
                 "content": form_content,
             }
         ], {
+            **helper_defaults,
             "enabled": False,
             "notify": True,
             "onlyonce": False,
@@ -3757,20 +3806,12 @@ class HdskyDiceBetNatural(_PluginBase):
             return False
 
     def _persist_helper_tokens(self, access_token: str, refresh_token: str) -> None:
-        """Persist rotated credentials without logging their values."""
-        config = dict(getattr(self, "_config", {}) or {})
-        config["helper_cookie"] = access_token
-        config["helper_refresh_token"] = refresh_token
-        self._helper_cookie = access_token
-        self._helper_refresh_token = refresh_token
-        self._config = config
-        try:
-            if self.update_config(config) is False:
-                raise RuntimeError("config save returned false")
-        except Exception as exc:
-            logger.warning(
-                f"{self.LOG_TAG}辅助站 Token 已刷新，但配置持久化失败：{exc.__class__.__name__}"
-            )
+        """Persist rotated credentials outside the editable form model."""
+        with self._helper_auth.lock:
+            try:
+                self._helper_auth.save_tokens(access_token, refresh_token)
+            except HelperLoginError as exc:
+                raise TicketInboxError(str(exc)) from None
 
     def _refresh_helper_access_token(self) -> str:
         """Rotate helper access/refresh tokens through the official refresh API."""
@@ -3840,77 +3881,78 @@ class HdskyDiceBetNatural(_PluginBase):
         ).get_res(url=self.HELPER_REWARD_URL, allow_redirects=False)
 
     def _scan_helper_reward_count(self) -> int:
-        """Read today's reward count, refreshing short-lived access tokens as needed."""
-        if not self._helper_cookie:
-            raise TicketInboxError("未填写 Emby 订阅 Access Token")
-        credential = self._helper_cookie.strip()
-        if "\r" in credential or "\n" in credential:
-            raise TicketInboxError("Emby 订阅 Access Token 格式无效：请粘贴 accessToken 原文")
-        if ";" in credential or re.match(r"(?i)^(?:c_secure_[^=]*|cf_clearance|session|cookie)=\s*", credential):
-            raise TicketInboxError(
-                "你填写的是 Cookie；辅助站奖励接口要求 Bearer accessToken，不能使用主站 c_secure Cookie"
-            )
-        token = credential
-        if token.lower().startswith("bearer "):
-            token = token[7:].strip()
-        elif token.startswith("accessToken="):
-            token = token.split("=", 1)[1].strip()
-        if not token:
-            raise TicketInboxError("Emby 订阅 Access Token 为空")
-
-        if self._helper_token_expiring(token):
-            if not getattr(self, "_helper_refresh_token", ""):
+        with self._helper_auth.lock:
+            """Read today's reward count, refreshing short-lived access tokens as needed."""
+            if not self._helper_cookie:
+                raise TicketInboxError("未填写 Emby 订阅 Access Token")
+            credential = self._helper_cookie.strip()
+            if "\r" in credential or "\n" in credential:
+                raise TicketInboxError("Emby 订阅 Access Token 格式无效：请粘贴 accessToken 原文")
+            if ";" in credential or re.match(r"(?i)^(?:c_secure_[^=]*|cf_clearance|session|cookie)=\s*", credential):
                 raise TicketInboxError(
-                    "accessToken 已过期（有效期约15分钟）；请补填 Emby 订阅 Refresh Token 以启用自动续期"
+                    "你填写的是 Cookie；辅助站奖励接口要求 Bearer accessToken，不能使用主站 c_secure Cookie"
                 )
-            token = self._refresh_helper_access_token()
-
-        try:
-            response = self._helper_reward_api_get(token)
-        except Exception as exc:
-            logger.warning(f"{self.LOG_TAG}辅助奖励 API 请求失败：{exc.__class__.__name__}")
-            raise TicketInboxError("Emby 订阅奖励 API 请求失败；请检查网络") from None
-        if response is None:
-            raise TicketInboxError("Emby 订阅奖励 API 无响应")
-        if response.status_code in (301, 302, 303, 307, 308):
-            raise TicketInboxError("Emby 订阅 Access Token 未通过认证或需要重新登录")
-        if response.status_code == 401:
-            if not getattr(self, "_helper_refresh_token", ""):
-                raise TicketInboxError(
-                    "辅助站返回 HTTP 401：accessToken 无效或已过期；请补填 Refresh Token 启用自动续期"
-                )
-            token = self._refresh_helper_access_token()
+            token = credential
+            if token.lower().startswith("bearer "):
+                token = token[7:].strip()
+            elif token.startswith("accessToken="):
+                token = token.split("=", 1)[1].strip()
+            if not token:
+                raise TicketInboxError("Emby 订阅 Access Token 为空")
+    
+            if self._helper_token_expiring(token):
+                if not getattr(self, "_helper_refresh_token", ""):
+                    raise TicketInboxError(
+                        "accessToken 已过期（有效期约15分钟）；请补填 Emby 订阅 Refresh Token 以启用自动续期"
+                    )
+                token = self._refresh_helper_access_token()
+    
             try:
                 response = self._helper_reward_api_get(token)
             except Exception as exc:
-                logger.warning(f"{self.LOG_TAG}辅助奖励 API 重试失败：{exc.__class__.__name__}")
-                raise TicketInboxError("Token 刷新后读取奖励接口失败") from None
+                logger.warning(f"{self.LOG_TAG}辅助奖励 API 请求失败：{exc.__class__.__name__}")
+                raise TicketInboxError("Emby 订阅奖励 API 请求失败；请检查网络") from None
             if response is None:
-                raise TicketInboxError("Token 刷新后奖励 API 无响应")
+                raise TicketInboxError("Emby 订阅奖励 API 无响应")
+            if response.status_code in (301, 302, 303, 307, 308):
+                raise TicketInboxError("Emby 订阅 Access Token 未通过认证或需要重新登录")
             if response.status_code == 401:
-                raise TicketInboxError("刷新后的 accessToken 仍未通过认证，请重新登录并更新两个 Token")
-        if response.status_code == 403:
-            raise TicketInboxError("辅助站返回 HTTP 403：当前 Token 无权读取奖励信息")
-        if response.status_code != 200:
-            raise TicketInboxError(f"Emby 订阅奖励 API HTTP {response.status_code}")
-        try:
-            payload = response.json()
-        except Exception:
-            raise TicketInboxError("辅助站奖励 API 未返回 JSON；请确认接口地址和登录状态") from None
-        if isinstance(payload, dict) and payload.get("success") is not True:
-            message = str(payload.get("message") or "").lower()
-            if any(word in message for word in ("登录", "过期", "unauth", "login", "token")):
                 if not getattr(self, "_helper_refresh_token", ""):
-                    raise TicketInboxError("辅助站未认证：请配置 Refresh Token 以自动续期")
+                    raise TicketInboxError(
+                        "辅助站返回 HTTP 401：accessToken 无效或已过期；请补填 Refresh Token 启用自动续期"
+                    )
                 token = self._refresh_helper_access_token()
-                response = self._helper_reward_api_get(token)
-                if response is None or response.status_code != 200:
-                    raise TicketInboxError("Token 刷新后仍无法读取奖励接口")
                 try:
-                    payload = response.json()
-                except Exception:
-                    raise TicketInboxError("Token 刷新后接口未返回 JSON") from None
-        return parse_helper_reward_response(payload)
+                    response = self._helper_reward_api_get(token)
+                except Exception as exc:
+                    logger.warning(f"{self.LOG_TAG}辅助奖励 API 重试失败：{exc.__class__.__name__}")
+                    raise TicketInboxError("Token 刷新后读取奖励接口失败") from None
+                if response is None:
+                    raise TicketInboxError("Token 刷新后奖励 API 无响应")
+                if response.status_code == 401:
+                    raise TicketInboxError("刷新后的 accessToken 仍未通过认证，请重新登录并更新两个 Token")
+            if response.status_code == 403:
+                raise TicketInboxError("辅助站返回 HTTP 403：当前 Token 无权读取奖励信息")
+            if response.status_code != 200:
+                raise TicketInboxError(f"Emby 订阅奖励 API HTTP {response.status_code}")
+            try:
+                payload = response.json()
+            except Exception:
+                raise TicketInboxError("辅助站奖励 API 未返回 JSON；请确认接口地址和登录状态") from None
+            if isinstance(payload, dict) and payload.get("success") is not True:
+                message = str(payload.get("message") or "").lower()
+                if any(word in message for word in ("登录", "过期", "unauth", "login", "token")):
+                    if not getattr(self, "_helper_refresh_token", ""):
+                        raise TicketInboxError("辅助站未认证：请配置 Refresh Token 以自动续期")
+                    token = self._refresh_helper_access_token()
+                    response = self._helper_reward_api_get(token)
+                    if response is None or response.status_code != 200:
+                        raise TicketInboxError("Token 刷新后仍无法读取奖励接口")
+                    try:
+                        payload = response.json()
+                    except Exception:
+                        raise TicketInboxError("Token 刷新后接口未返回 JSON") from None
+            return parse_helper_reward_response(payload)
 
     def _scan_ticket_mailboxes(self, today: str) -> Tuple[int, set, set, List[str]]:
         """Scan inbox + dedicated archives; one confirmed award PM counts once.

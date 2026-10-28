@@ -2,7 +2,7 @@
 
 此插件移植自 [Kuanghom/MoviePilot-Plugins · hdskydicebetnatural](https://github.com/Kuanghom/MoviePilot-Plugins/tree/main/plugins.v2/hdskydicebetnatural)，原作者 **Kuanghom**，上游 V2 版本 1.0.3。
 
-- **当前版本**：2.4.0（MoviePilot V3 专用）
+- **当前版本**：2.5.0（MoviePilot V3 专用）
 - **宿主要求**：MoviePilot >= 3.0.0
 - **V3 适配维护**：xchenya，保留原作者署名和原插件类名 HdskyDiceBetNatural
 - **状态**：仅静态与模拟环境测试，尚未进行真实 HDSky 账号登录、下注或开奖联调
@@ -25,7 +25,7 @@
 
 https://github.com/xchenya/MoviePilot-Plugins
 
-刷新插件列表，安装「空论坛掷骰子（拟人）」，选择站点管理中的 HDSky（hdsky.me）。主站 Cookie、User-Agent 与代理选项从站点管理读取；若使用辅助奖励来源需要填写「Emby 订阅 Access Token」和「Emby 订阅 Refresh Token」。
+刷新插件列表，安装「空论坛掷骰子（拟人）」，选择站点管理中的 HDSky（hdsky.me）。主站 Cookie、User-Agent 与代理选项从站点管理读取；若使用辅助奖励来源，可在配置页「Emby 订阅登录」区域直接输入 UID、主站邮箱和站内信验证码登录，无需手动复制 Token。
 
 **首次安装建议先不开启自动下注。** 先确认已正确选择站点、Cron、下注策略、魔力余额和每日次数上限。建议设置当日止盈、止损并从最小允许下注金额开始；自动下注不会保证正收益，倍投同样存在风险。
 
@@ -39,20 +39,37 @@ https://github.com/xchenya/MoviePilot-Plugins
 - 读取短讯详情可能触发 HDSky 站点自身的“标记已读”，本插件不会主动删除或移动短讯；原有“评分短讯自动归档”仍由独立开关决定。
 - **未进行真实账户联调**。如果站点使用了与 NexusPHP 通用页面不同的短讯 DOM / 奖励文本格式，需用脱敏后的收件箱 HTML 调整解析规则，不能把模拟测试视为真实计数验证。
 
-## 辅助奖励来源（v2.4.0）
+## 配置页直接登录辅助站（v2.5.0）
 
-辅助站前端使用只读 JSON API `/api/user/emby`，通过 `Authorization: Bearer accessToken` 认证。Access Token 的有效期约为 15 分钟，不能长期手动复用。
+在配置页选择天空站点后，使用「Emby 订阅登录」：
 
-配置页现在有两个独立字段：
+1. 填写 **主站数字 UID** 和 **主站资料中的邮箱**，点击「发送验证码」。
+2. 到 HDSky **主站私信**获取六位验证码。验证码不是通过邮箱投递。
+3. 保持配置页打开，填入验证码并点击「登录」。看到成功提示后，凭据已经保存并立即生效，**不需要保存、关闭或重新打开配置页**。
 
-- **Emby 订阅 Access Token**：填写本地存储中的 `accessToken`。
-- **Emby 订阅 Refresh Token**：填写本地存储中的 `refreshToken`。
+登录按钮只执行辅助站认证，不启动下注或观影券扫描。即使插件尚未启用，也可以先完成登录。连接使用当前选择站点的 User-Agent 和代理设置。主站 Cookie 仍由 MP 站点管理提供；辅助站登录不能替代主站 Cookie。
 
-获取方法：在已登录辅助页面打开浏览器开发者工具（F12）→ **Application / 应用** → **Local Storage / 本地存储** → 辅助站域名，分别复制这两个键的值。不要填写主站 `c_secure_*` Cookie，也不要把 Token 发到聊天、Issue 或日志里。
+- 验证码发送间隔至少 60 秒，登录尝试间隔至少 5 秒；HTTP 429 按 Retry-After 冷却，无有效值时默认 5 分钟。
+- 输入 UID 或邮箱变化后，应重新发送验证码。请求超时不会自动重发，可以点击「刷新登录状态」核对插件已保存的状态；该按钮只读取本地认证状态。
+- 验证码提交后清空，不写入插件配置、日志或持久化数据。若未提交就使用 MP 的保存按钮，初始化时也会清除临时验证码。
+- Token 保存在实例独立的数据中，不在表单回显。随后保存其他设置不会用页面里的空值覆盖新 Token。
+- 老版本手动填写的 Access/Refresh Token 会自动迁移。仍可在页面下方配对填写两个 Token，点击「保存手动 Token」直接保存；手动导入的有效性由独立观影券检查核验。留空保留已有凭据。
 
-插件在 Access Token 即将过期时会尝试刷新；若请求返回 HTTP 401，也会使用 Refresh Token 刷新后重试一次。辅助站可能在刷新时轮换两个 Token，插件会自动保存新的值。Token 不写入日志。若 Refresh Token 也已失效，需要重新登录辅助页面并重新填入两个 Token。
+辅助站公开登录页使用 `POST /api/user/send-code` 和 `POST /api/user/login`，字段为 `userId`、`email`、`code`；登录成功返回 `accessToken` 与 `refreshToken`。只向固定辅助站 HTTPS 地址提交，禁止自动重定向。
 
-只调用查询和刷新认证接口，不会调用取消订阅、恢复订阅或重置密码接口。若未填写辅助站 Token，则继续使用主站收件箱统计方案。
+辅助奖励读取继续使用 `GET /api/user/emby` 与 Bearer Access Token。Access Token 有效期约 15 分钟，插件会使用 Refresh Token 自动续期，并持久化轮换后的两个 Token。Refresh Token 也失效时，在本配置页重新获取验证码登录即可。未配置辅助站凭据时，继续使用主站收件箱统计方案。
+
+其他策略和调度设置仍由 MP 原有的保存按钮保存；认证按钮不会提交尚未保存的下注设置。
+
+## 验证
+
+本次认证改动完成 70 项 Python 回归与 7 项原生表单按钮交互测试，使用 SDK/HTTP 替身，未发送真实验证码、登录真实账号或执行下注。按钮测试按 MP V3 的 FormRender 事件合同执行，覆盖同页发送/登录、防双击、错误反馈、输入清空和实例路由。真实 MP 宿主及账号仍待安装后验证。
+
+```bash
+python -m pip install pytest pydantic beautifulsoup4 pytz 'APScheduler>=3.10,<4'
+python -m pytest tests/v3/hdskydicebetnatural -q
+node --test tests/v3/hdskydicebetnatural/test_form.mjs
+```
 
 ## 独立观影券检查（v2.1.0）
 
