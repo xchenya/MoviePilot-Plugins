@@ -27,7 +27,10 @@ const invoke = (handler, form, api) => new Function('model', 'event', 'window',
 
 test('configuration buttons do not submit the outer form', () => {
   for (const label of ['发送验证码', '登录', '刷新登录状态']) assert.ok(handlers[label])
-  for (const button of nodes.filter(n => n.component === 'VBtn')) assert.equal(button.props.type, 'button')
+  for (const button of nodes.filter(n => n.component === 'VBtn')) {
+    assert.equal(button.props.type, 'button')
+    assert.equal(button.text, button.props.text, 'FormRender supplies a default slot: labels must be explicit slot text')
+  }
   const inputs = nodes.filter(n => n.component === 'VTextField')
   assert.deepEqual(inputs.map(n => n.props.model), ['helper_uid', 'helper_email', 'helper_code'])
   assert.equal(inputs[2].props.type, 'password')

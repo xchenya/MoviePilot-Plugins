@@ -1251,7 +1251,7 @@ class HdskyDiceBetNatural(_PluginBase):
             }],
         })
         form_content.append({
-            "component": "VBtn", "props": {
+            "component": "VBtn", "text": "保存手动 Token", "props": {
                 "type": "button", "text": "保存手动 Token", "color": "primary",
                 "variant": "tonal", "class": "mb-4",
                 "disabled": "{{ helper_busy || !helper_cookie || !helper_refresh_token }}",

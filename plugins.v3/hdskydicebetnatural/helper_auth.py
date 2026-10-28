@@ -259,7 +259,7 @@ def login_form(plugin_id, state):
         return {"component": "VTextField", "props": {"model": model, "label": label,
                 "disabled": "{{ helper_busy }}", **props}}
     def button(action, text, disabled):
-        return {"component": "VBtn", "props": {"type": "button", "color": "primary",
+        return {"component": "VBtn", "text": text, "props": {"type": "button", "color": "primary",
                 "variant": "tonal", "class": "mr-2 mb-2", "text": text,
                 "disabled": disabled, "loading": "{{ helper_busy }}",
                 "onClick": click_handler(action)}}
