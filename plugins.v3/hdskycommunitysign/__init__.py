@@ -151,7 +151,7 @@ class HdskyCommunitySign(_PluginBase):
     plugin_name = "天空社区客户端签到"
     plugin_desc = "HDSky 社区客户端每日签到，支持直接登录、余额查询、Cookie 连通性检测及自定义签到重试。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     plugin_author = "xchenya"
     author_url = "https://github.com/xchenya"
     plugin_config_prefix = "hdskycommunitysign_"
@@ -743,6 +743,9 @@ class HdskyCommunitySign(_PluginBase):
         if previous.get("time", 0) > row.get("time", 0):
             return
         merged = {name: row.get(name) for name in ("day", "uid", "status", "message", "time")}
+        # 已签到时间固定为首次确认成功的时间，后续查询只更新状态与数值。
+        if previous.get("status") in SIGNED and previous.get("time"):
+            merged["time"] = previous["time"]
         for name in ("amount", "balance"):
             value = self._number(row.get(name))
             if value is None and previous.get("status") in SIGNED:
@@ -757,6 +760,14 @@ class HdskyCommunitySign(_PluginBase):
         if self._runtime.get("last"):
             rows.append(self._runtime["last"])
         for row in sorted(rows, key=lambda item: item.get("time", 0)):
+            key = str(row.get("uid") or "") + ":" + str(row.get("day") or "")
+            if before.get(key, {}).get("status") in SIGNED:
+                # 修复旧版被刷新覆盖的时间；不以历史快照覆盖当前余额等统计。
+                previous = self._runtime["daily_stats"][key]
+                if (row.get("status") in SIGNED and row.get("time", 0) > 0
+                        and (not previous.get("time") or row["time"] < previous["time"])):
+                    previous["time"] = row["time"]
+                continue
             self._merge_daily(row)
         self._prune_daily()
         if before != self._runtime.get("daily_stats", {}):

@@ -75,7 +75,7 @@ const currentImports = {};
 
         const curUrl = metaUrl.substring(0, metaUrl.lastIndexOf('remoteEntry.js'));
         const base = '/';
-        'assets-v1.2.0';
+        'assets-v1.2.1';
 
         cssFilePaths.forEach(cssPath => {
          let href = '';

@@ -588,7 +588,7 @@ class InteractiveApiTests(unittest.TestCase):
             self.assertNotIn(secret, text)
         self.assertTrue(state.auth.cookie_configured)
         self.assertEqual(state.auth.pending_uid, "123")
-        self.assertEqual(self.plugin.get_render_mode(), ("vue", "dist/assets-v1.2.0"))
+        self.assertEqual(self.plugin.get_render_mode(), ("vue", f"dist/assets-v{self.plugin.plugin_version}"))
 
     def test_bad_candidate_cookie_via_api_keeps_active_session(self):
         self.seed_active()
@@ -665,6 +665,68 @@ class DailyStatisticsTests(unittest.TestCase):
         self.assertEqual(stats.today.balance, 100.5)
         self.assertEqual(len(self.plugin.storage["checkins"]["history"]), 1)
         self.assertEqual(len(stats.days), 30)
+
+    def test_success_time_survives_refresh_repeated_sign_and_restart(self):
+        with patch.object(module.time, "time", return_value=1000):
+            self.invoke((daily(), []), (daily(True), []))
+        reply = daily(True)
+        reply["profile"]["wallet"]["balance"] = 200
+        with patch.object(module.time, "time", return_value=2000), \
+                patch.object(module, "build_opener", side_effect=Network((reply, [])).build):
+            refreshed = self.plugin.api_auth(module.AuthRequest(action="check"))
+        self.assertEqual(refreshed.state.statistics.today.time, 1000)
+        self.assertEqual(refreshed.state.auth.balance_at, 2000)
+        self.assertEqual(refreshed.state.statistics.today.balance, 200)
+        with patch.object(module.time, "time", return_value=3000):
+            self.invoke((reply, []))
+        self.restart()
+        self.restart()
+        state = self.plugin.api_state()
+        self.assertEqual(state.statistics.today.time, 1000)
+        self.assertEqual(state.statistics.today.balance, 200)
+        self.assertEqual(state.statistics.completed_days, 1)
+        self.assertEqual(state.statistics.reward_total, 20)
+        self.assertEqual(state.history[0].time, 1000)
+        self.assertEqual(self.plugin._runtime["last"]["time"], 3000)
+
+    def test_readonly_confirmation_time_replaces_unsigned_query_then_stays_fixed(self):
+        for at, checked in ((1000, False), (2000, True), (3000, True)):
+            with patch.object(module.time, "time", return_value=at), \
+                    patch.object(module, "build_opener", side_effect=Network((daily(checked), [])).build):
+                state = self.plugin.api_auth(module.AuthRequest(action="check")).state
+            self.assertEqual(state.statistics.today.time, 1000 if not checked else 2000)
+        self.restart()
+        self.assertEqual(self.plugin.api_state().statistics.today.time, 2000)
+
+    def test_failed_and_uncertain_times_do_not_replace_success_time(self):
+        for at, status in ((1000, "failed"), (2000, "uncertain"), (3000, "success"),
+                           (4000, "already"), (5000, "failed")):
+            with patch.object(module.time, "time", return_value=at):
+                self.plugin._finish_sign(status, "fixture", "123")
+        self.restart()
+        self.assertEqual(self.plugin.api_state().statistics.today.time, 3000)
+
+    def test_upgrade_recovers_success_time_without_replaying_old_balance(self):
+        today = self.plugin._day()
+        success = {"day": today, "uid": "123", "status": "success", "time": 1000,
+                   "message": "签到成功。", "amount": 20, "balance": 100}
+        latest = {**success, "status": "already", "time": 3000, "balance": 900}
+        other = {**success, "uid": "456", "time": 500}
+        self.plugin._runtime = {
+            "daily_stats": {"123:" + today: latest, "456:" + today: other},
+            "history": [{**success, "status": "failed", "time": 100}, success],
+            "last": {**success, "status": "already", "time": 2000, "balance": 200},
+        }
+        self.plugin._save_runtime()
+        self.restart()
+        saved = copy.deepcopy(self.plugin.storage["checkins"])
+        self.restart()
+        self.assertEqual(self.plugin.storage["checkins"], saved)
+        stats = self.plugin.api_state().statistics
+        self.assertEqual(stats.today.time, 1000)
+        self.assertEqual(stats.today.balance, 900)
+        self.assertEqual(stats.reward_total, 20)
+        self.assertEqual(saved["daily_stats"]["456:" + today]["time"], 500)
 
     def test_upgrade_backfills_history_and_last_idempotently_per_account(self):
         from datetime import date, timedelta
