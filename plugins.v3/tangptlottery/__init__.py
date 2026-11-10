@@ -37,7 +37,7 @@ class TangptLottery(_PluginBase):
     plugin_name = "不可躺自动抽奖"
     plugin_desc = "躺平每日定时抽奖、魔力保留、每日奖品统计与汇总通知。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.1.1"
+    plugin_version = "1.1.2"
     plugin_author = "xchenya"
     author_url = "https://github.com/xchenya"
     plugin_config_prefix = "tangptlottery_"
@@ -82,7 +82,7 @@ class TangptLottery(_PluginBase):
             try:
                 for key in ("enabled", "notify", "run_once", "diagnose_only", "use_proxy", "acknowledge_pending"):
                     values[key] = self._bool(values[key])
-                for key, lo, hi in (("daily_target", 1, 1000), ("batch", 1, 100), ("interval", 5, 900)):
+                for key, lo, hi in (("daily_target", 1, 2000), ("batch", 1, 100), ("interval", 5, 900)):
                     values[key] = integer(values[key])
                     if not lo <= values[key] <= hi:
                         raise LotteryError(f"{key} 须在 {lo}–{hi} 之间")

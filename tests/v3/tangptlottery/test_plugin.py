@@ -128,6 +128,23 @@ def test_scheduled_batches_tail_and_daily_idempotence(module, plugin, monkeypatc
     assert "fixture-secret" not in plugin._path().read_text()
 
 
+@pytest.mark.parametrize("remaining", [2000, 1250])
+def test_event_target_2000_respects_site_quota_and_daily_idempotence(module, plugin, monkeypatch, remaining):
+    plugin.init_plugin({"enabled": True, "daily_target": 2000, "batch": 100, "interval": 5})
+    site = connect(plugin, FakeSession(balance=50000000, remaining=remaining), monkeypatch)
+    plugin.run()
+    posts = len(site.posts)
+    plugin.run()
+    state = saved(module, plugin)
+    daily = state["days"]["7:" + plugin._day()]
+    assert daily["draws"] == daily["attempted"] == remaining
+    assert daily["spent"] == remaining * 20000
+    assert sum(daily["prizes"].values()) == remaining
+    assert sum(int(args["data"]["count"]) for _, args in site.posts) == remaining
+    assert len(site.posts) == posts and site.remaining == 0
+    assert state["pending"] is None
+
+
 @pytest.mark.parametrize("balance,remaining,expected", [(150000, 1000, 2), (1000000, 11, 11),
                                                         (100000, 1000, 0), (1000000, 0, 0)])
 def test_balance_reserve_and_remaining(module, plugin, monkeypatch, balance, remaining, expected):

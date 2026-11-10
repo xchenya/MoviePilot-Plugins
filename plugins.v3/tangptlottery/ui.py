@@ -64,7 +64,7 @@ def form():
             note("默认每天 08:00。也可设为 0 8,18 * * *，每天 08:00 和 18:00 执行，共用当日目标。"),
         ]),
         card("抽奖策略", [
-            row([field("daily_target", "每日目标（抽）", type="number", min=1, max=1000),
+            row([field("daily_target", "每日目标（抽）", type="number", min=1, max=2000),
                  component("VSelect", model="batch", label="每批优先抽数", variant="outlined", density="comfortable",
                            **{"hide-details": "auto"}, items=[
                      {"title": f"{count} 抽", "value": count} for count in (1, 10, 20, 50, 100)])]),
