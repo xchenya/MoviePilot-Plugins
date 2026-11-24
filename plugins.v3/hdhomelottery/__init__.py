@@ -1,7 +1,9 @@
 import threading
 import time
 from datetime import datetime, timedelta
-from html import escape
+from hashlib import sha256
+
+from lxml.etree import LxmlError
 
 import requests
 from apscheduler.triggers.date import DateTrigger
@@ -16,6 +18,8 @@ try:
 except ImportError:  # Earlier V3 hosts used the old enum name.
     from app.schemas.types import NotificationType as MessageType
 
+from .history import HISTORY_URL, parse_history
+from .ui import page as details_page
 from .protocol import COST, END, HOME, PRIZES, START, TZ, PrizeSoldOut, cooldown, inspect_page, receipt
 
 
@@ -23,13 +27,14 @@ class HdhomeLottery(_PluginBase):
     plugin_name = "家园站庆抽奖"
     plugin_desc = "使用站点 Cookie 参与家园十二周年抽奖，按活动冷却和预算执行。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.3.0"
+    plugin_version = "1.4.0"
     plugin_author = "xchenya"
     author_url = "https://github.com/xchenya"
     plugin_config_prefix = "hdhomelottery_"
     plugin_order = 30
     auth_level = 2
     _lock = threading.RLock()
+    _history_lock = threading.Lock()
     defaults = dict(enabled=False, prize="", limit=1, reserve=0, resume=False,
                     cooldown_seconds=61, notify_on_win=False, run_once=False)
 
@@ -81,13 +86,39 @@ class HdhomeLottery(_PluginBase):
             *[dict(component=name, props=props) for name, props in fields]])], self.defaults.copy()
 
     def get_page(self):
-        s = self.get_data("event202611") or {}
-        return [dict(component="VCardText", text=escape(line)) for line in (
-            f"累计提交 {s.get('count', 0)} / {self.cfg['limit']} 次",
-            self.wait_reason(s, time.time()) or "等待调度检查",
-            f"最近结果：{s.get('last') or '尚无结果'}",
-            f"最近手动运行：{s.get('manual') or '尚未运行'}",
-        )]
+        state = self.get_data("event202611") or {}
+        history, synced_at, error = self.get_history()
+        return details_page(
+            self.wait_reason(state, time.time()) or "等待调度检查",
+            f"{state.get('count', 0)} / {self.cfg['limit']}",
+            state.get("last"), state.get("manual"), history, synced_at, error,
+        )
+
+    def get_history(self):
+        with self._history_lock:
+            site = SiteOper().get_by_domain("hdhome.org")
+            cookie = getattr(site, "cookie", None)
+            if not cookie:
+                return None, "", "请在 MP 站点管理更新家园 Cookie"
+            key = sha256(cookie.encode()).digest()
+            cache = getattr(self, "_history_cache", {})
+            if cache.get("key") != key:
+                cache = {"key": key}
+                self._history_cache = cache
+            if time.monotonic() >= cache.get("refresh_after", 0):
+                try:
+                    with self.site_session(site) as session:
+                        response = session.get(HISTORY_URL, timeout=8, allow_redirects=False)
+                        if response.status_code != 200:
+                            raise ValueError("站内记录页未正常打开，请检查 Cookie 与网络")
+                        history = parse_history(response.content.decode(response.apparent_encoding or "utf-8"))
+                    cache.update(history=history, synced_at=f"{datetime.now(TZ):%m-%d %H:%M:%S}", error="")
+                except (requests.RequestException, ValueError, LxmlError):
+                    cache["error"] = ("站内记录同步失败，已显示最近一次成功读取的数据"
+                                      if "history" in cache else "站内记录读取失败，请检查 MP 站点 Cookie 和网络")
+                    logger.warning("家园站庆抽奖：站内记录读取失败")
+                cache["refresh_after"] = time.monotonic() + 30
+            return cache.get("history"), cache.get("synced_at", ""), cache.get("error", "")
 
     def wait_reason(self, state, now):
         if now < START:
@@ -168,15 +199,19 @@ class HdhomeLottery(_PluginBase):
         self.save_data("event202611", self.state)
         logger.info("家园站庆抽奖：" + self.state["manual"])
 
+    @staticmethod
+    def site_session(site):
+        session = requests.Session()
+        session.headers.update({"Cookie": site.cookie, "User-Agent": getattr(site, "ua", None) or "Mozilla/5.0"})
+        if getattr(site, "proxy", False):
+            session.proxies.update(settings.PROXY or {})
+        return session
+
     def draw(self, target, reserve, delay):
         site = SiteOper().get_by_domain("hdhome.org")
-        cookie = getattr(site, "cookie", None)
-        if not cookie:
+        if not getattr(site, "cookie", None):
             raise ValueError("请在 MP 站点管理更新家园 Cookie")
-        with requests.Session() as session:
-            session.headers.update({"Cookie": cookie, "User-Agent": getattr(site, "ua", None) or "Mozilla/5.0"})
-            if getattr(site, "proxy", False):
-                session.proxies.update(settings.PROXY or {})
+        with self.site_session(site) as session:
             page = session.get(HOME, timeout=20, allow_redirects=False)
             if page.status_code != 200:
                 raise ValueError("活动页未正常打开，请检查站点登录和网络")
