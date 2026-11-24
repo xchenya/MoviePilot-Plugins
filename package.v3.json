@@ -3,7 +3,7 @@
     "name": "家园站庆抽奖",
     "description": "使用 MP 站点凭据，按奖品、次数、余额和活动冷却参与十二周年抽奖。",
     "labels": "家园,抽奖",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "icon": "Moviepilot_A.png",
     "author": "xchenya",
     "author_url": "https://github.com/xchenya",
@@ -11,6 +11,7 @@
     "system_version": ">=3.0.0",
     "release": false,
     "history": {
+      "v1.1.0": "新增自定义抽奖冷却（默认 61 秒，遵守站点冷却）与可选的仅中奖通知。",
       "v1.0.0": "2026 年站庆活动测试版，未知回执暂停。"
     }
   },
