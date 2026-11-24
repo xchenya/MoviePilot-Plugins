@@ -16,6 +16,10 @@ PRIZES = {"67": "永久VIP会员", "71": "10TB上传", "70": "100TB上传", "61"
           "69": "救命卡", "72": "CHD 邀请码"}
 
 
+class PrizeSoldOut(ValueError):
+    """The activity page explicitly lists zero stock for the selected prize."""
+
+
 def cooldown(now):
     if now < START + 1200:
         return 120
@@ -37,8 +41,10 @@ def inspect_page(markup, target):
         if PRIZES[target] not in cells[1].text_content():
             raise ValueError("奖品名称已变更")
         stock = cells[6].text_content().strip()
-        if not stock.isdecimal() or int(stock) < 1:
-            raise ValueError("目标奖品已抽完或库存未知")
+        if not stock.isdecimal():
+            raise ValueError("无法读取目标奖品库存，请核对活动页")
+        if int(stock) == 0:
+            raise PrizeSoldOut
         for a in cells[-1].xpath('.//a[@href]'):
             if a.text_content().strip() != "点击抽奖":
                 continue
