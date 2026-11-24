@@ -14,14 +14,14 @@ try:
 except ImportError:  # Earlier V3 hosts used the old enum name.
     from app.schemas.types import NotificationType as MessageType
 
-from .protocol import COST, END, HOME, PRIZES, START, TZ, cooldown, inspect_page, receipt
+from .protocol import COST, END, HOME, PRIZES, START, TZ, PrizeSoldOut, cooldown, inspect_page, receipt
 
 
 class HdhomeLottery(_PluginBase):
     plugin_name = "家园站庆抽奖"
     plugin_desc = "使用站点 Cookie 参与家园十二周年抽奖，按活动冷却和预算执行。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     plugin_author = "xchenya"
     author_url = "https://github.com/xchenya"
     plugin_config_prefix = "hdhomelottery_"
@@ -65,7 +65,7 @@ class HdhomeLottery(_PluginBase):
             ("VSwitch", dict(model="resume", label="已核对站内记录，解除暂停（保留已用次数）")),
         ]
         return [dict(component="VForm", content=[
-            dict(component="VAlert", text="北京时间 11 月 26 日 00:00 截止。中奖即停。友站邀请仅供从未拥有该站账号的本人使用。"),
+            dict(component="VAlert", text="北京时间 11 月 26 日 00:00 截止。中奖即停，目标奖品售罄会停止并发送 MP 通知。友站邀请仅供从未拥有该站账号的本人使用。"),
             *[dict(component=name, props=props) for name, props in fields]])], self.defaults.copy()
 
     def get_page(self):
@@ -110,6 +110,9 @@ class HdhomeLottery(_PluginBase):
                 return
             try:
                 self.draw(target, reserve, delay)
+            except PrizeSoldOut:
+                self.pause(f"{PRIZES[target]} 已售罄（剩余 0），自动抽奖已停止")
+                self.notify("售罄", self.state["pause"])
             except requests.RequestException:
                 self.pause("网络异常，请核对我的抽奖记录后解除暂停")
             except ValueError as exc:
@@ -151,7 +154,10 @@ class HdhomeLottery(_PluginBase):
             self.save_data("event202611", s)
             logger.info("家园站庆抽奖：" + s["last"])
             if outcome == "已中奖" and self.cfg.get("notify_on_win") is True:
-                try:
-                    self.post_message(mtype=MessageType.Plugin, title="家园站庆抽奖 · 中奖", text=s["last"])
-                except Exception:
-                    logger.warning("家园站庆抽奖：中奖通知发送失败，中奖记录已保存")
+                self.notify("中奖", s["last"])
+
+    def notify(self, reason, message):
+        try:
+            self.post_message(mtype=MessageType.Plugin, title=f"家园站庆抽奖 · {reason}", text=message)
+        except Exception:
+            logger.warning(f"家园站庆抽奖：{reason}通知发送失败，状态已保存")
