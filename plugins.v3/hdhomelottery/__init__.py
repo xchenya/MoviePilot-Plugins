@@ -27,7 +27,7 @@ class HdhomeLottery(_PluginBase):
     plugin_name = "家园站庆抽奖"
     plugin_desc = "使用站点 Cookie 参与家园十二周年抽奖，按活动冷却和预算执行。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.4.0"
+    plugin_version = "1.4.1"
     plugin_author = "xchenya"
     author_url = "https://github.com/xchenya"
     plugin_config_prefix = "hdhomelottery_"
@@ -50,9 +50,22 @@ class HdhomeLottery(_PluginBase):
                 self.run_once = False
                 logger.warning("家园站庆抽奖：一次性开关复位失败，未执行立即运行或解除暂停")
                 return
-            if resume:
+            target = str(self.cfg["prize"])
+            sold_out = self.state.get("sold_out_prize") or next(
+                (prize_id for prize_id, name in PRIZES.items()
+                 if self.state.get("pause") == self.sold_out_message(name)), None,
+            )
+            changed_target = sold_out and target in PRIZES and target != sold_out
+            if resume or changed_target:
                 self.state.pop("pause", None)
+                self.state.pop("sold_out_prize", None)
                 self.save_data("event202611", self.state)
+                if changed_target:
+                    logger.info(f"家园站庆抽奖：目标已切换为 {PRIZES[target]}，已解除原奖品的售罄暂停")
+
+    @staticmethod
+    def sold_out_message(name):
+        return f"{name} 已售罄（剩余 0），自动抽奖已停止"
 
     def get_state(self):
         return self.cfg.get("enabled") is True or self.run_once
@@ -89,7 +102,8 @@ class HdhomeLottery(_PluginBase):
         state = self.get_data("event202611") or {}
         history, synced_at, error = self.get_history()
         return details_page(
-            self.wait_reason(state, time.time()) or "等待调度检查",
+            f"目标奖品：{PRIZES.get(str(self.cfg['prize']), '未设置')} · "
+            f"{self.wait_reason(state, time.time()) or '等待调度检查'}",
             f"{state.get('count', 0)} / {self.cfg['limit']}",
             state.get("last"), state.get("manual"), history, synced_at, error,
         )
@@ -185,7 +199,8 @@ class HdhomeLottery(_PluginBase):
             try:
                 self.draw(target, reserve, delay)
             except PrizeSoldOut:
-                self.pause(f"{PRIZES[target]} 已售罄（剩余 0），自动抽奖已停止")
+                self.state["sold_out_prize"] = target
+                self.pause(self.sold_out_message(PRIZES[target]))
                 self.notify("售罄", self.state["pause"])
             except requests.RequestException:
                 self.pause("网络异常，请核对我的抽奖记录后解除暂停")
