@@ -1,8 +1,10 @@
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
+from html import escape
 
 import requests
+from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from app.db.oper.site import SiteOper
 from app.sdk.config import settings
@@ -21,7 +23,7 @@ class HdhomeLottery(_PluginBase):
     plugin_name = "家园站庆抽奖"
     plugin_desc = "使用站点 Cookie 参与家园十二周年抽奖，按活动冷却和预算执行。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.0"
     plugin_author = "xchenya"
     author_url = "https://github.com/xchenya"
     plugin_config_prefix = "hdhomelottery_"
@@ -29,28 +31,36 @@ class HdhomeLottery(_PluginBase):
     auth_level = 2
     _lock = threading.RLock()
     defaults = dict(enabled=False, prize="", limit=1, reserve=0, resume=False,
-                    cooldown_seconds=61, notify_on_win=False)
+                    cooldown_seconds=61, notify_on_win=False, run_once=False)
 
     def init_plugin(self, config=None):
         with self._lock:
             self.cfg = {**self.defaults, **(config or {})}
             self.stopped = False
             self.state = self.get_data("event202611") or {}
-            if self.cfg.get("resume"):
-                self.cfg["resume"] = False
-                self.update_config(self.cfg)
+            self.run_once = self.cfg["run_once"] is True
+            resume = self.cfg["resume"] is True
+            self.cfg["run_once"] = self.cfg["resume"] = False
+            if (self.run_once or resume) and self.update_config(self.cfg) is False:
+                self.run_once = False
+                logger.warning("家园站庆抽奖：一次性开关复位失败，未执行立即运行或解除暂停")
+                return
+            if resume:
                 self.state.pop("pause", None)
                 self.save_data("event202611", self.state)
 
     def get_state(self):
-        return self.cfg.get("enabled") is True
+        return self.cfg.get("enabled") is True or self.run_once
 
     def get_service(self):
-        if not self.get_state() or time.time() >= END:
+        if not self.get_state() or (time.time() >= END and not self.run_once):
             return []
+        if self.cfg["enabled"] is True and time.time() < END:
+            trigger = IntervalTrigger(seconds=1, end_date=datetime.fromtimestamp(END, TZ))
+        else:
+            trigger = DateTrigger(run_date=datetime.now(TZ) + timedelta(seconds=2))
         return [dict(id="HdhomeLottery.draw", name=self.plugin_name, func=self.tick,
-                     trigger=IntervalTrigger(seconds=1, end_date=datetime.fromtimestamp(END, TZ)),
-                     kwargs={"max_instances": 1, "coalesce": True})]
+                     trigger=trigger, kwargs={"max_instances": 1, "coalesce": True})]
 
     def get_form(self):
         fields = [
@@ -61,6 +71,8 @@ class HdhomeLottery(_PluginBase):
             ("VTextField", dict(model="reserve", label="抽奖后至少保留魔力", type="number", min=0)),
             ("VTextField", dict(model="cooldown_seconds", label="抽奖冷却（秒）", type="number",
                                 min=1, step=1, hint="默认 61 秒，实际等待至少满足站点冷却", persistent_hint=True)),
+            ("VSwitch", dict(model="run_once", label="保存后立即运行一次",
+                             hint="可在自动抽奖关闭时使用，保存后自动复位", persistent_hint=True)),
             ("VSwitch", dict(model="notify_on_win", label="中奖时发送 MP 通知")),
             ("VSwitch", dict(model="resume", label="已核对站内记录，解除暂停（保留已用次数）")),
         ]
@@ -70,8 +82,32 @@ class HdhomeLottery(_PluginBase):
 
     def get_page(self):
         s = self.get_data("event202611") or {}
-        return [dict(component="VCardText", text=f"累计提交 {s.get('count', 0)} 次 · "
-                     f"{s.get('pause') or s.get('last') or '等待运行'}")]
+        return [dict(component="VCardText", text=escape(line)) for line in (
+            f"累计提交 {s.get('count', 0)} / {self.cfg['limit']} 次",
+            self.wait_reason(s, time.time()) or "等待调度检查",
+            f"最近结果：{s.get('last') or '尚无结果'}",
+            f"最近手动运行：{s.get('manual') or '尚未运行'}",
+        )]
+
+    def wait_reason(self, state, now):
+        if now < START:
+            return "活动尚未开始"
+        if now >= END:
+            return "活动已结束"
+        if state.get("pause"):
+            return state["pause"]
+        try:
+            limit = int(self.cfg["limit"])
+        except (ValueError, TypeError):
+            limit = 0
+        if limit > 0 and state.get("count", 0) >= limit:
+            return f"已达本期总次数上限（{limit} 次）"
+        if now < state.get("next", 0):
+            until = datetime.fromtimestamp(state["next"], TZ)
+            return f"冷却中，下次可抽时间 {until:%m-%d %H:%M:%S}（北京时间）"
+        if not self.get_state():
+            return "自动抽奖已关闭"
+        return ""
 
     def get_api(self):
         return []
@@ -83,6 +119,7 @@ class HdhomeLottery(_PluginBase):
     def stop_service(self):
         with self._lock:
             self.stopped = True
+            self.run_once = False
 
     def pause(self, reason):
         self.state["pause"] = reason
@@ -93,9 +130,17 @@ class HdhomeLottery(_PluginBase):
         with self._lock:
             now = time.time()
             s = self.state
-            if (self.stopped or not self.get_state() or not START <= now < END
-                    or s.get("pause") or now < s.get("next", 0)):
+            if self.stopped or not self.get_state():
                 return
+            once = self.run_once
+            reason = self.wait_reason(s, now)
+            self.run_once = False
+            if reason:
+                if once:
+                    self.record_manual(reason)
+                return
+            if once:
+                self.record_manual("已开始检查活动页")
             target = str(self.cfg.get("prize"))
             try:
                 limit, reserve = int(self.cfg["limit"]), int(self.cfg["reserve"])
@@ -105,8 +150,6 @@ class HdhomeLottery(_PluginBase):
                     raise ValueError
             except (TypeError, ValueError):
                 self.pause("请设置目标奖品、正整数次数、非负保留魔力和正整数冷却秒数，再解除暂停")
-                return
-            if s.get("count", 0) >= limit:
                 return
             try:
                 self.draw(target, reserve, delay)
@@ -119,6 +162,11 @@ class HdhomeLottery(_PluginBase):
                 self.pause(str(exc))
             except Exception as exc:
                 self.pause("运行异常（" + type(exc).__name__ + "），请核对站内记录")
+
+    def record_manual(self, message):
+        self.state["manual"] = f"{datetime.now(TZ):%m-%d %H:%M:%S} {message}"
+        self.save_data("event202611", self.state)
+        logger.info("家园站庆抽奖：" + self.state["manual"])
 
     def draw(self, target, reserve, delay):
         site = SiteOper().get_by_domain("hdhome.org")
